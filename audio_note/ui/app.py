@@ -50,7 +50,8 @@ DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 #: config sections / keys the settings page may change (anything else is rejected)
 EDITABLE: dict[str, set[str]] = {
     "mimo": {"api_key", "base_url", "chat_model", "analysis_model", "asr_model", "asr_language", "asr_concurrency"},
-    "audio": {"device", "vad_threshold", "min_silence_s", "min_speech_s", "max_segment_s", "gain", "codec"},
+    "audio": {"device", "vad_threshold", "min_silence_s", "min_speech_s", "max_segment_s", "gain", "codec",
+              "system_audio", "system_device", "system_gain"},
     "storage": {"cleanup_enabled", "keep_audio_days", "max_disk_gb"},
     "speakers": {"identify_threshold", "cluster_threshold", "unknown_label", "num_threads"},
     "correction": {"enabled"},
@@ -75,7 +76,7 @@ _CHOICES: dict[tuple[str, ...], tuple[str, ...]] = {
 }
 _RANGES: dict[tuple[str, ...], tuple[float, float]] = {
     ("audio", "vad_threshold"): (0.0, 1.0), ("audio", "min_silence_s"): (0.2, 60.0), ("audio", "min_speech_s"): (0.0, 10.0),
-    ("audio", "max_segment_s"): (10.0, 3600.0), ("audio", "gain"): (0.05, 50.0),
+    ("audio", "max_segment_s"): (10.0, 3600.0), ("audio", "gain"): (0.05, 50.0), ("audio", "system_gain"): (0.05, 50.0),
     ("storage", "keep_audio_days"): (0, 100000), ("storage", "max_disk_gb"): (0, 100000),
     ("speakers", "identify_threshold"): (0.0, 1.0), ("speakers", "cluster_threshold"): (0.0, 1.0), ("speakers", "num_threads"): (1, 64),
     ("pipeline", "process_interval_min"): (1, 1440), ("pipeline", "min_segment_age_s"): (0, 3600),
@@ -121,11 +122,11 @@ def coerce_setting(path: tuple[str, ...], value: Any) -> Any:
         if not isinstance(value, list):
             raise HTTPException(400, f"{dotted} 必须是列表")
         return [str(v) for v in value]
-    if path == ("audio", "device"):
+    if path in (("audio", "device"), ("audio", "system_device")):
         if value is None or value == "":
             return None
         if isinstance(value, bool) or isinstance(value, (dict, list)):
-            raise HTTPException(400, "audio.device 应为设备序号或名称")
+            raise HTTPException(400, f"{dotted} 应为设备序号或名称")
         if isinstance(value, int) or (isinstance(value, str) and value.strip().isdigit()):
             return int(value)
         return str(value)
@@ -887,6 +888,19 @@ def create_app(rt_or_holder: Runtime | RuntimeHolder) -> FastAPI:
         except Exception as e:  # noqa: BLE001
             log.warning("list devices failed: %s", e)
             return []
+
+    @app.get("/api/devices/system")
+    def system_devices() -> dict[str, Any]:
+        try:
+            from ..audio.loopback import available, list_loopback_devices
+
+            ok = available()
+            devs = list_loopback_devices() if ok else []
+            return {"available": ok, "devices": [{"index": d.index, "name": d.name, "channels": d.channels,
+                                                   "default_sr": d.default_sr, "is_default": d.is_default} for d in devs]}
+        except Exception as e:  # noqa: BLE001
+            log.warning("list system devices failed: %s", e)
+            return {"available": False, "devices": [], "error": str(e)}
 
     @app.get("/api/config")
     def config_get() -> dict[str, Any]:

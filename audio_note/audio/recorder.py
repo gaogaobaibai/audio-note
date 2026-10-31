@@ -20,12 +20,13 @@ import logging
 import threading
 import time
 from datetime import datetime, timedelta
+from typing import Any
 
 import numpy as np
 
 from ..config import Config
 from ..db import DB
-from .capture import MicCapture
+from .capture import MicCapture, open_capture
 from .storage import PartialWriter, finalize_segment, recover_partials, stale_partials
 from .vad import SAMPLE_RATE, WINDOW, GateConfig, SileroVAD, SpeechGate
 
@@ -64,6 +65,7 @@ class Recorder:
         self.is_speaking = False
         self._recover_vad: SileroVAD | None = None   # separate instance: recovery must not reset the live VAD state
         self.partials_recovered = 0
+        self.capture: Any = None                  # the open MicCapture / MixedCapture while run() is inside it
 
     # wall-clock time of an absolute sample index
     def _time_of(self, sample: int) -> datetime:
@@ -76,7 +78,12 @@ class Recorder:
         recover_partials(cfg, self.db, self.vad)
         self.started_at = datetime.now()
         carry = np.zeros(0, dtype=np.float32)
-        with MicCapture(cfg.audio.device, int(cfg.audio.block_ms), float(cfg.audio.gain)) as mic:
+        with open_capture(cfg, MicCapture(cfg.audio.device, int(cfg.audio.block_ms), float(cfg.audio.gain))) as mic:
+            self.capture = mic
+            if getattr(mic, "system_error", None):
+                log.warning("system audio: %s", mic.system_error)
+            elif getattr(mic, "system_active", False):
+                log.info("recording microphone + system audio (%s)", getattr(mic, "system_name", "?"))
             self.stream_t0 = datetime.now()
             self._consumed = 0
             self._delivered = 0

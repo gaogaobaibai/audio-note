@@ -13,6 +13,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import sounddevice as sd
@@ -177,3 +178,120 @@ class MicCapture:
             return None
         self.last_block_wall = wall
         return block
+
+
+class MixedCapture:
+    """Microphone + system audio (WASAPI loopback of what the speakers / headphones play) summed into
+    one float32 mono 16 kHz stream, so a meeting's remote participants land in the same recording as
+    the user. Drives the loop with the microphone blocks (steady 32 ms cadence); whatever loopback
+    audio arrived meanwhile is added on top, zeros when nothing is playing (Windows sends no loopback
+    data during silence). The two clocks drift a little, so the loopback backlog is capped: more than
+    `max_lead_s` queued means a hiccup, and the oldest part is dropped.
+
+    If the system-audio stream cannot be opened the capture degrades to microphone only and records
+    the reason in `system_error` (the service keeps recording; the UI shows the problem)."""
+
+    def __init__(self, mic: "MicCapture", system: Any, system_gain: float = 1.0, max_lead_s: float = 2.0):
+        self.mic = mic
+        self.system = system
+        self.system_gain = float(system_gain)
+        self.max_lead = int(max_lead_s * TARGET_SR)
+        self.system_error: str | None = None
+        self._buf = np.zeros(0, dtype=np.float32)
+        self.system_samples = 0      # loopback samples mixed in so far (diagnostics)
+        self.lead_drops = 0
+
+    # the recorder only looks at these
+    @property
+    def overflows(self) -> int:
+        return self.mic.overflows
+
+    @property
+    def dropped(self) -> int:
+        return self.mic.dropped + (self.system.dropped if self.system is not None else 0)
+
+    @property
+    def last_callback_at(self) -> float:
+        return self.mic.last_callback_at
+
+    @property
+    def last_block_wall(self) -> float:
+        return self.mic.last_block_wall
+
+    @property
+    def system_active(self) -> bool:
+        return self.system is not None and self.system_error is None
+
+    @property
+    def system_name(self) -> str | None:
+        d = getattr(self.system, "device", None)
+        return d.name if d is not None else None
+
+    def is_active(self) -> bool:
+        return self.mic.is_active()
+
+    def __enter__(self) -> "MixedCapture":
+        self.mic.__enter__()
+        if self.system is not None:
+            try:
+                self.system.__enter__()
+            except Exception as e:  # noqa: BLE001 - mic-only is better than nothing
+                self.system_error = f"{type(e).__name__}: {e}"
+                log.error("system audio capture unavailable (%s); recording microphone only", e)
+                self.system = None
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        try:
+            if self.system is not None:
+                self.system.__exit__(*exc)
+        finally:
+            self.mic.__exit__(*exc)
+
+    def read(self, timeout: float = 1.0) -> np.ndarray | None:
+        block = self.mic.read(timeout)
+        if block is None or self.system is None:
+            return block
+        fresh = self.system.read_available()
+        if len(fresh):
+            self._buf = np.concatenate([self._buf, fresh]) if len(self._buf) else fresh
+        if len(self._buf) > self.max_lead:
+            # the loopback side ran ahead (clock drift / a stall on the mic side): keep only the newest part
+            self.lead_drops += 1
+            self._buf = self._buf[-self.max_lead // 2:]
+        n = len(block)
+        if len(self._buf) == 0:
+            return block
+        take = min(n, len(self._buf))
+        mixed = block.copy()
+        part = self._buf[:take]
+        if self.system_gain != 1.0:
+            part = part * self.system_gain
+        mixed[:take] += part
+        self._buf = self._buf[take:]
+        self.system_samples += take
+        np.clip(mixed, -1.0, 1.0, out=mixed)
+        return mixed
+
+
+def open_capture(cfg: Any, mic: Any = None) -> "MicCapture | MixedCapture":
+    """The capture the recorder should use for this config: microphone only, or microphone + system
+    audio when audio.system_audio is on (the loopback backend is imported lazily). `mic` lets the
+    caller supply the microphone capture (the recorder builds it from its own MicCapture name so tests
+    can substitute a fake)."""
+    a = cfg.audio
+    if mic is None:
+        mic = MicCapture(a.device, int(a.block_ms), float(a.gain))
+    if not bool(a.get("system_audio", False)):
+        return mic
+    try:
+        from .loopback import LoopbackCapture, _pa
+
+        _pa()   # import the backend now: a missing PyAudioWPatch is reported here, not inside the recorder loop
+        system: Any = LoopbackCapture(a.get("system_device"), float(a.get("system_gain", 1.0)))
+    except Exception as e:  # noqa: BLE001 - PyAudioWPatch missing: mixed capture reports it
+        mixed = MixedCapture(mic, None, float(a.get("system_gain", 1.0)))
+        mixed.system_error = f"{type(e).__name__}: {e}"
+        log.error("system audio requested but unavailable: %s", e)
+        return mixed
+    return MixedCapture(mic, system, float(a.get("system_gain", 1.0)))

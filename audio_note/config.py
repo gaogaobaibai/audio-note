@@ -50,6 +50,9 @@ DEFAULTS: dict[str, Any] = {
         "codec": "opus",               # opus | flac | wav
         "opus_bitrate": 24000,
         "gain": 1.0,
+        "system_audio": False,         # also capture what the speakers / headphones play (meetings, calls): WASAPI loopback
+        "system_device": None,         # None = default output device; or an output device index / name substring
+        "system_gain": 1.0,            # level of the system audio in the mix
     },
     "storage": {
         "cleanup_enabled": True,

@@ -303,15 +303,18 @@
       const utts = recent ? recent.sessions.flatMap((x) => x.utterances).slice(-8).reverse() : [];
       const stateCls = s.recording ? (s.is_speaking ? "state on speaking" : "state on") : "state";
       const stateTxt = s.read_only ? "只读模式" : s.recording ? (s.is_speaking ? "正在录音 · 有人说话" : "正在录音 · 安静") : "未在录音";
+      const srcLine = `声音来源：麦克风${s.system_audio ? `＋系统声音${s.recording && s.system_name ? `（${esc(s.system_name)}）` : ""}` : ""}`
+        + ` <button class="chip ${s.system_audio ? "on" : ""}" data-act="${s.system_audio ? "sys-off" : "sys-on"}" title="开会 / 通话时把对方的声音（扬声器或耳机里放出来的）一起录下来；用耳机效果最好，外放时对方的声音会被麦克风和系统声音各录一次">${s.system_audio ? "系统声音：开" : "系统声音：关"}</button>`;
       const detail = s.read_only
         ? `服务正在另一个进程运行（pid ${s.other_pid}）。这里可以看记录和问答，录音和处理请在那个进程的界面操作。`
         : s.recording
-          ? `${fmtTime(s.recorder_started_at)} 开始 · 本次已保存 ${s.segments_written} 段，${fmtMin(s.speech_total_s / 60)} 语音 · 设备：${s.device == null ? "系统默认" : esc(String(s.device))}`
-          : `开始后只保存有人说话的片段；每 ${st.process_interval_min} 分钟自动转写一次，${esc(st.daily_time)} 生成日报${s.scheduler ? "" : "（后台处理未运行）"}。`;
+          ? `${fmtTime(s.recorder_started_at)} 开始 · 本次已保存 ${s.segments_written} 段，${fmtMin(s.speech_total_s / 60)} 语音 · 麦克风：${s.device == null ? "系统默认" : esc(String(s.device))}<br>${srcLine}`
+          : `开始后只保存有人说话的片段；每 ${st.process_interval_min} 分钟自动转写一次，${esc(st.daily_time)} 生成日报${s.scheduler ? "" : "（后台处理未运行）"}。<br>${srcLine}`;
       const alerts = [];
       if (st.models_missing.length) alerts.push(`<div class="alert danger">模型文件缺失：${st.models_missing.join("、")}。运行 <code>scripts/download_models.ps1</code> 下载。</div>`);
       if (!st.api_key) alerts.push(`<div class="alert warn">还没有配置 MiMo API key：录音会保存，但不会转写、也不能问答。<span class="right"><a class="btn sm" href="#/settings">去设置</a></span></div>`);
       if (s.last_error && !s.recording) alerts.push(`<div class="alert danger">录音线程出错：${esc(s.last_error)}<span class="right"><a class="btn sm" href="#/settings">检查麦克风设置</a></span></div>`);
+      if (s.recording && s.system_audio && s.system_error) alerts.push(`<div class="alert warn">系统声音没有录上（只录麦克风）：${esc(s.system_error)}<span class="right"><a class="btn sm" href="#/settings">检查设置</a></span></div>`);
       if (st.failed) alerts.push(`<div class="alert warn">${st.failed} 段转写失败。<span class="right"><button class="btn sm" data-act="retry">重试失败的段</button><a class="btn sm" href="#/transcript">查看</a></span></div>`);
       if (st.pending && st.api_key && !st.jobs.process.running) alerts.push(`<div class="alert info">${st.pending} 段录音等待转写${s.scheduler ? `（每 ${st.process_interval_min} 分钟自动处理一次）` : ""}。<span class="right"><button class="btn sm primary" data-act="process">立即转写</button></span></div>`);
       const cap = st.disk.cap_gb ? st.disk.cap_gb * 1024 ** 3 : 0;
@@ -356,6 +359,12 @@
           else if (act === "stop") { if (await confirmModal("停止录音", "停止后不再保存新的语音片段；后台转写和日报仍会继续。", "停止")) { await api("/api/recording/stop", { method: "POST" }); toast("已停止录音"); } }
           else if (act === "process") return runJob("process");
           else if (act === "retry") return runJob("process", { retry_failed: true });
+          else if (act === "sys-on" || act === "sys-off") {
+            const on = act === "sys-on";
+            const r = await api("/api/config", { method: "PUT", json: { audio: { system_audio: on } } });
+            toast(on ? `已开启系统声音${r.restarted_recorder ? "，录音已重启" : ""}` : `已关闭系统声音${r.restarted_recorder ? "，录音已重启" : ""}`, "ok");
+            await sleep(600);
+          }
           await refreshStatus(); await render();
         } catch (err) { toastErr(err); await refreshStatus(); await render(); }
       };
@@ -803,8 +812,11 @@
 
   // ------------------------------------------------------------------ settings
   async function pageSettings(arg, my) {
-    const [cfg, devices] = await Promise.all([api("/api/config"), api("/api/devices")]);
+    const [cfg, devices, sysDevices] = await Promise.all([api("/api/config"), api("/api/devices"), api("/api/devices/system").catch(() => ({ available: false, devices: [] }))]);
     if (stale(my)) return;
+    // device names, not indices: PortAudio renumbers devices when something is plugged in
+    const sysOpts = [["", "默认输出设备"], ...sysDevices.devices.map((d) => [d.name, `${d.name}${d.is_default ? "（默认）" : ""}`])];
+    { const cur = cfg.values.audio.system_device; if (cur != null && cur !== "" && !sysOpts.some(([k]) => k === String(cur))) sysOpts.push([String(cur), `${cur}（当前配置，未在列表中）`]); }
     const v = cfg.values; const sec = cfg.secrets;
     const secretField = (path, label, help = "", placeholder = "") => {
       const s = sec[path] || { set: false, hint: "" };
@@ -831,7 +843,11 @@
           <div class="form-grid">${sel("audio.device", "麦克风", devVal, devOpts, "拔插设备后重新打开这页会刷新列表")}
             ${num("audio.vad_threshold", "语音检测阈值", v.audio.vad_threshold, "0–1，越高越保守（环境嘈杂时调高）", "0.05", "0")}
             ${num("audio.min_silence_s", "结束片段的静音秒数", v.audio.min_silence_s, "", "0.5", "0.5")}${num("audio.max_segment_s", "单片段最长秒数", v.audio.max_segment_s, "", "30", "30")}
-            ${num("audio.gain", "输入增益", v.audio.gain, "录得太小声就调大，如 2", "0.1", "0.1")}</div></div>
+            ${num("audio.gain", "输入增益", v.audio.gain, "录得太小声就调大，如 2", "0.1", "0.1")}</div>
+          <div class="mt" style="border-top:1px solid var(--border);padding-top:12px"><h3 class="mb">系统声音（会议 / 通话对方的声音）</h3>
+          <div class="form-grid">${bool("audio.system_audio", "同时录系统声音", v.audio.system_audio, "把扬声器 / 耳机里放出来的声音和麦克风混在一起录；总览页也有开关。用耳机效果最好，外放时对方的声音会被录两次")}
+            ${sel("audio.system_device", "录哪个输出设备", v.audio.system_device == null ? "" : String(v.audio.system_device), sysOpts, sysDevices.available ? "" : "当前环境没有可用的系统声音源（需要 Windows 和 PyAudioWPatch）")}
+            ${num("audio.system_gain", "系统声音音量倍数", v.audio.system_gain ?? 1, "对方声音太小就调大", "0.1", "0.1")}</div></div></div>
         <div class="card"><div class="card-head"><h2>存储</h2></div>
           <div class="form-grid">${num("storage.keep_audio_days", "音频保留天数", v.storage.keep_audio_days, "到期删除已转写的音频；0 = 永久。文字永不删除", "1", "0")}
             ${num("storage.max_disk_gb", "音频占用上限 (GB)", v.storage.max_disk_gb, "超过后从最旧的已转写音频开始删", "1", "0")}${bool("storage.cleanup_enabled", "定时清理无语音片段", v.storage.cleanup_enabled)}</div></div>
@@ -872,6 +888,7 @@
         else if (el.type === "password") { if (!el.value) continue; val = el.value; }
         else val = el.value;
         if (el.dataset.path === "audio.device") val = val === "" ? null : (/^\d+$/.test(val) ? Number(val) : val);
+        if (el.dataset.path === "audio.system_device") val = val === "" ? null : val;
         out[a] = out[a] || {};
         if (c) { out[a][b] = out[a][b] || {}; out[a][b][c] = val; } else out[a][b] = val;
       }

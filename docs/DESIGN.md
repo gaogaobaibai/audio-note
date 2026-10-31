@@ -194,6 +194,12 @@ class Notifier: def __init__(cfg); def send(msg) -> dict[str, str|None]   # chan
 - 前端：无框架、无构建、无外部资源（离线可用），hash 路由七个页面（总览 / 记录 / 日报 / 问答 / 说话人 / 设置 / 日志），总览每 4 s、侧栏每 5 s 轮询 `/api/status`；深色模式跟随系统。界面只监听 `ui.host`（默认 127.0.0.1），没有鉴权。
 - 日志：`audio-note ui` 与 `run` 一样写 `data/audio_note.log`（`logging_setup.SERVICE_COMMANDS` 含 `ui`）。
 
+### 10.1.1 系统声音（audio/loopback.py, capture.MixedCapture）
+
+- `audio.system_audio: true` 时 `open_capture(cfg)` 返回 `MixedCapture(MicCapture, LoopbackCapture)`：loopback 走 PyAudioWPatch（PortAudio 的 WASAPI loopback 补丁版，每个输出设备多出一个 "<name> [Loopback]" 输入设备；sounddevice 自带的 PortAudio 19.7 没有这个功能）。`LoopbackCapture` 回调里把多声道取均值、`StreamResampler` 连续相位重采样到 16 kHz（逐块各自重采样会在每块边界丢 1/3 个样本，VAD/ASR 听起来是嗡嗡声）、自动增益（loopback 拿到的是经过系统音量的信号，2% 音量时峰值只有 0.007；按慢衰减峰值跟踪放大到 0.5，上限 40 倍）。
+- `MixedCapture.read()` 以麦克风块为节拍，把期间到达的 loopback 样本叠加（没有播放时 Windows 不回调，视为静音），积压超过 2 s 丢旧的；loopback 打不开则退化为只录麦克风并把原因放进 `system_error`，状态接口和总览页显示。本机验证：麦克风静音、以 2% 系统音量播放 8 s 语音 → 录到 7.3 s 片段、VAD 语音 5.5 s。
+- 限制：外放时对方的声音被麦克风和 loopback 各录一次；只有 Windows；`audio-note devices` 列出可抓取的输出设备，`/api/devices/system` 给界面用。
+
 ### 10.2 档案（config.py profiles / runtime.RuntimeHolder）
 
 - 档案 = `profiles/<name>/config.yaml` + 其 `paths.data_dir`（默认 `profiles/<name>/data`，相对项目根目录）。加载时三层合并：`DEFAULTS` ← 根 `config.yaml`（共享设置）← 档案文件；`cfg["_profile"]`、`_config_path`、`_base_config_path` 记录来源，`Runtime.reload_config()` 用同样的 base 重读。根 `config.yaml` + `data/` 就是名为 `default` 的档案（不分层）。`--config` / `AUDIO_NOTE_CONFIG` 指定的文件不分层、不属于档案（`_profile = None`），测试全部走这条路，所以永远不会读到真实的 `config.yaml`。

@@ -325,6 +325,23 @@ def cmd_devices(cfg: Config, args: argparse.Namespace) -> int:
         t.add_row(str(d.index), d.name, d.hostapi, str(d.channels), f"{d.default_sr:.0f}")
     console.print(t)
     console.print(f"配置 audio.device = {cfg.audio.device!r}（null = 系统默认）")
+    from .audio.loopback import list_loopback_devices
+
+    lbs = list_loopback_devices()
+    if lbs:
+        t2 = Table(title="系统声音源（录会议 / 通话对方的声音：audio.system_audio: true）")
+        t2.add_column("#", justify="right")
+        t2.add_column("输出设备")
+        t2.add_column("声道", justify="right")
+        t2.add_column("采样率", justify="right")
+        t2.add_column("默认")
+        for d in lbs:
+            t2.add_row(str(d.index), d.name, str(d.channels), f"{d.default_sr:.0f}", "✓" if d.is_default else "")
+        console.print(t2)
+        console.print(f"配置 audio.system_audio = {bool(cfg.audio.get('system_audio', False))}，"
+                      f"audio.system_device = {cfg.audio.get('system_device')!r}（null = 默认输出设备）")
+    else:
+        console.print("[yellow]系统声音源不可用（需要 Windows 和 PyAudioWPatch：uv pip install PyAudioWPatch）[/yellow]")
     return 0
 
 

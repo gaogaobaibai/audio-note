@@ -36,6 +36,9 @@ audio:
   codec: opus                    # 存储编码：opus | flac | wav
   opus_bitrate: 24000            # Opus 码率（bps）；24k ≈ 11 MB/小时语音
   gain: 1.0                      # 输入增益倍数
+  system_audio: false            # 同时录系统声音（会议 / 通话里对方的声音，WASAPI loopback）；界面总览可一键开关
+  system_device: null            # null = 默认输出设备；或输出设备序号 / 名称子串（`audio-note devices` 查看）
+  system_gain: 1.0               # 系统声音混入时的音量倍数
 
 storage:
   cleanup_enabled: true          # 是否定时清理
