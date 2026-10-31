@@ -27,8 +27,8 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "search_transcripts",
-            "description": "在全部录音转写记录中按关键词检索（中文分词 + 全文索引），返回匹配的句子及其时间、说话人、utterance_id。"
-                           "可多次调用、换不同关键词；可按日期范围和说话人过滤。找不到时会自动做子串匹配。",
+            "description": "在全部录音转写记录中检索（关键词全文索引 + 语义向量，自动融合），返回匹配的句子及其时间、说话人、utterance_id。"
+                           "可用自然语言短语或关键词；可多次调用、换说法；可按日期范围和说话人过滤。找不到时会自动做子串匹配。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -179,18 +179,21 @@ def _hour_of(abs_start: str) -> float:
 
 
 # --- tool implementations ----------------------------------------------------
-def search_transcripts(args: dict, db: DB, cfg) -> str:
+def search_transcripts(args: dict, db: DB, cfg, retriever: Any = None) -> str:
     query = str(args.get("query") or "").strip()
     if not query:
         raise ValueError("缺少参数 query")
     day_from, day_to = _day_arg(args, "day_from"), _day_arg(args, "day_to")
     speaker = (args.get("speaker") or None) or None
     limit = _int_arg(args, "limit", int(cfg.memory.top_k), 1, 100)
-    hits = index.search(db, query, day_from, day_to, speaker, limit)
-    how = "全文检索"
-    if not hits:
-        hits = index.like_search(db, query, day_from, day_to, speaker, limit)
-        how = "子串匹配"
+    if retriever is None:
+        from .retrieval import Retriever
+
+        retriever = Retriever(cfg, db, mode="fts")
+    res = retriever.search(query, day_from, day_to, speaker, limit)
+    hits, how = res.hits, res.how_label
+    if res.expansions:
+        how += "，已扩展：" + "、".join(res.expansions)
     if not hits:
         scope = ""
         if day_from or day_to:
@@ -318,7 +321,7 @@ def get_context(args: dict, db: DB, cfg) -> str:
     return _cap("\n".join(lines))
 
 
-_DISPATCH: dict[str, Callable[[dict, DB, Any], str]] = {
+_DISPATCH: dict[str, Callable[..., str]] = {
     "search_transcripts": search_transcripts,
     "get_transcript": get_transcript,
     "get_daily_summary": get_daily_summary,
@@ -329,8 +332,9 @@ _DISPATCH: dict[str, Callable[[dict, DB, Any], str]] = {
 }
 
 
-def run_tool(name: str, args: dict | str | None, db: DB, cfg) -> str:
-    """Execute a tool call. Always returns a string <= MAX_CHARS; errors become 'ERROR: ...'."""
+def run_tool(name: str, args: dict | str | None, db: DB, cfg, retriever: Any = None) -> str:
+    """Execute a tool call. Always returns a string <= MAX_CHARS; errors become 'ERROR: ...'.
+    `retriever` (memory.retrieval.Retriever) backs search_transcripts; None = plain keyword search."""
     fn = _DISPATCH.get(name)
     if fn is None:
         return f"ERROR: 未知工具 {name!r}，可用工具: {', '.join(TOOL_NAMES)}"
@@ -344,7 +348,7 @@ def run_tool(name: str, args: dict | str | None, db: DB, cfg) -> str:
     if not isinstance(args, dict):
         return "ERROR: 参数必须是 JSON 对象"
     try:
-        out = fn(args, db, cfg)
+        out = fn(args, db, cfg, retriever) if name == "search_transcripts" else fn(args, db, cfg)
     except ValueError as e:
         return f"ERROR: {e}"
     except Exception as e:  # noqa: BLE001

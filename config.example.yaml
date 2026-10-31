@@ -71,6 +71,15 @@ memory:
   max_context_chars: 16000       # 送入模型的上下文字符上限
   max_tool_rounds: 8             # 问答时每个问题最多的工具调用轮数
   chat_model: ""                 # 问答模型；留空 = mimo.chat_model
+  retrieval: hybrid              # 检索方式：fts 关键词 | vector 语义向量 | hybrid 两者融合（向量需本地模型，首次自动下载约 90 MB）
+  embedding_model: BAAI/bge-small-zh-v1.5   # 句向量模型（fastembed 模型名）；写 hash 可用无模型的测试向量
+  embedding_threads: 2
+  query_expansion: false         # 检索前让模型补同义词/品牌名（每次检索多 1 次调用，约 2-5 s；评测收益小，默认关）
+  strategy: prefetch             # 问答策略：prefetch 先自动检索再按需调工具（默认）| agentic 只靠工具 | rag 只用预检索、单次调用
+  prefetch_k: 12                 # 预检索条数
+  rrf_k: 60                      # 混合检索 RRF 常数
+  fts_weight: 1.0                # 混合检索里关键词结果的权重（向量为 1.0）
+  hybrid_fts_strict: true        # 混合检索时关键词只取全部命中的精确结果
 
 analysis:
   daily_time: "22:30"            # 每日分析触发时间（本地时间 HH:MM）

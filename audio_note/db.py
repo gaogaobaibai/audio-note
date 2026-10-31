@@ -6,6 +6,7 @@ segments           one row per stored audio file (speech-gated recording or impo
 transcripts        raw + corrected ASR output per segment
 utterances         speaker-attributed sentences with absolute timestamps (the unit of memory)
 utterance_tokens   jieba-segmented text, mirrored into the FTS5 index utterances_fts
+utterance_vectors  sentence embeddings (float32 blobs) for vector / hybrid retrieval
 speakers           enrolled people
 speaker_embeddings enrollment embeddings (float32 blobs)
 daily_summaries    per-day LLM digest
@@ -109,6 +110,14 @@ CREATE TRIGGER IF NOT EXISTS utt_tok_au AFTER UPDATE ON utterance_tokens BEGIN
   INSERT INTO utterances_fts(rowid, text_seg) VALUES (new.utterance_id, new.text_seg);
 END;
 
+CREATE TABLE IF NOT EXISTS utterance_vectors (
+    utterance_id INTEGER PRIMARY KEY REFERENCES utterances(id) ON DELETE CASCADE,
+    model TEXT NOT NULL,
+    dim INTEGER NOT NULL,
+    vec BLOB NOT NULL                    -- float32, L2-normalised
+);
+CREATE INDEX IF NOT EXISTS idx_utt_vec_model ON utterance_vectors(model);
+
 CREATE TABLE IF NOT EXISTS daily_summaries (
     day TEXT PRIMARY KEY,
     summary_md TEXT NOT NULL,
@@ -161,8 +170,32 @@ class DB:
             c = sqlite3.connect(self.path, timeout=30, isolation_level=None, check_same_thread=False)
             c.row_factory = sqlite3.Row
             c.execute("PRAGMA foreign_keys=ON")
+            self._load_vec(c)
             self._local.conn = c
         return c
+
+    #: True once the sqlite-vec extension loaded on this process (vector search in SQL); None = untried
+    vec_available: bool | None = None
+
+    @classmethod
+    def _load_vec(cls, c: sqlite3.Connection) -> None:
+        """Load sqlite-vec (vec_distance_cosine etc.) into the connection. Optional: without it the
+        vector store falls back to numpy, so failures only log once."""
+        if cls.vec_available is False:
+            return
+        try:
+            import sqlite_vec
+
+            c.enable_load_extension(True)
+            sqlite_vec.load(c)
+            c.enable_load_extension(False)
+            cls.vec_available = True
+        except Exception as e:  # noqa: BLE001 - missing wheel / extension loading disabled
+            if cls.vec_available is None:
+                import logging
+
+                logging.getLogger(__name__).info("sqlite-vec unavailable (%s); vector search uses numpy", e)
+            cls.vec_available = False
 
     # --- generic helpers -------------------------------------------------
     def execute(self, sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:
@@ -265,6 +298,38 @@ class DB:
 
     def delete_utterances_for_segment(self, seg_id: int) -> None:
         self.execute("DELETE FROM utterances WHERE segment_id=?", (seg_id,))
+
+    # --- utterance vectors ---------------------------------------------------
+    def add_vectors(self, model: str, pairs: Iterable[tuple[int, np.ndarray]]) -> int:
+        """Upsert (utterance_id, vector) pairs for `model`. Vectors are stored L2-normalised float32."""
+        n = 0
+        c = self.conn()
+        with _Tx(c):
+            for uid, v in pairs:
+                v = np.asarray(v, dtype=np.float32).ravel()
+                norm = float(np.linalg.norm(v))
+                if norm > 0:
+                    v = v / norm
+                c.execute(
+                    "INSERT INTO utterance_vectors(utterance_id, model, dim, vec) VALUES (?,?,?,?)"
+                    " ON CONFLICT(utterance_id) DO UPDATE SET model=excluded.model, dim=excluded.dim, vec=excluded.vec",
+                    (int(uid), model, int(v.shape[0]), v.tobytes()),
+                )
+                n += 1
+        return n
+
+    def utterances_without_vectors(self, model: str, limit: int = 1000) -> list[sqlite3.Row]:
+        """Utterances that have no vector for `model` yet (rows embedded by another model count as missing)."""
+        return self.query(
+            "SELECT u.id, u.text FROM utterances u LEFT JOIN utterance_vectors v ON v.utterance_id = u.id"
+            " WHERE v.utterance_id IS NULL OR v.model != ? ORDER BY u.id LIMIT ?",
+            (model, limit),
+        )
+
+    def vector_count(self, model: str | None = None) -> int:
+        if model is None:
+            return int(self.one("SELECT COUNT(*) AS n FROM utterance_vectors")["n"])
+        return int(self.one("SELECT COUNT(*) AS n FROM utterance_vectors WHERE model=?", (model,))["n"])
 
     # --- kv ----------------------------------------------------------------
     def get_kv(self, key: str, default: Any = None) -> Any:

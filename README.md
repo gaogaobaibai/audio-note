@@ -6,7 +6,7 @@
 2. **自动瘦身**：定时复检，删除没有语音的片段；已转写的音频到期自动删除（文字记录永久保留）；磁盘上限可配。
 3. **带身份的文字记录**：本地说话人分离（pyannote + 3D-Speaker CAM++，CPU 可跑），注册过的人会被自动识别出来；MiMo `mimo-v2.5-asr` 转文字；再用 `mimo-v2.6-flash` 做同音/人名/术语纠错（只输出编辑对，有守卫，不整篇重写），保存成 Markdown。
 4. **每日分析 + 推送**：每天定时用大模型总结当天内容（话题 / 决定 / 待办 / 人物 / 情绪 / 未闭环），通过 飞书机器人 / Windows 通知 / ntfy / Server酱 / PushPlus / WxPusher / 企微机器人 推送。
-5. **记忆问答**：本地 FTS5 全文检索 + jieba 分词 + LLM 工具调用的迭代检索循环，直接问"上周三和张三聊了什么"。
+5. **记忆问答**：本地关键词（FTS5 + jieba）与语义向量（bge-small-zh，CPU，90 MB）混合检索，先自动预检索再让模型按需调工具追查，直接问"上周三和张三聊了什么"、"扫地机买的什么牌子"。
 
 除了 ASR 和 LLM 调用之外，所有东西都在本地。
 
@@ -27,7 +27,7 @@ Silero VAD 门控 ──► 只存语音片段 data/audio/YYYY-MM-DD/HHMMSS_mmm.
                                        ┌──────────────────────────────────┴──────────────────┐
                                        ▼                                                     ▼
                        transcripts/YYYY-MM-DD.md                            每日 daily_time: map→reduce 日报
-                       记忆问答 chat (FTS 检索 + 工具调用循环)               daily/YYYY-MM-DD.md → 推送渠道
+                       记忆问答 chat (关键词+向量混合预检索 + 工具调用循环)    daily/YYYY-MM-DD.md → 推送渠道
 ```
 
 完整技术方案（选型理由、API 细节、流水线规范、数据模型、风险）见 [docs/DESIGN.md](docs/DESIGN.md)。
@@ -42,7 +42,7 @@ Silero VAD 门控 ──► 只存语音片段 data/audio/YYYY-MM-DD/HHMMSS_mmm.
 | 导入 | libsndfile 直读，其他格式走内置 ffmpeg | `audio_note/audio/importer.py` |
 | 说话人 | sherpa-onnx 分离 + CAM++ 声纹注册/识别 | `audio_note/speech/speakers.py` |
 | ASR / 纠错 | MiMo `mimo-v2.5-asr`；`mimo-v2.6-flash` JSON 编辑对纠错 | `audio_note/speech/asr.py` `correct.py` `pipeline.py` |
-| 记忆 | SQLite FTS5 + jieba + function-calling 检索循环 | `audio_note/memory/` |
+| 记忆 | SQLite FTS5 + jieba 关键词、bge-small-zh 向量（sqlite-vec）RRF 混合、相对日期解析、预检索 + function-calling 检索循环 | `audio_note/memory/` |
 | 日报 / 推送 | map-reduce 日报；多渠道推送 | `audio_note/analysis/` `audio_note/push/` |
 | 服务 | 录音线程 + 调度线程，单实例锁，可选托盘 | `audio_note/cli.py` `service.py` `scheduler.py` |
 
@@ -138,7 +138,8 @@ audio-note init             # 生成 config.yaml（若不存在）、检查模�
 | `audio-note speakers calibrate` | 用已注册样本计算相似度分布，建议识别阈值 |
 | `audio-note daily [--day YYYY-MM-DD] [--push] [--force]` | 生成某天日报（默认今天）；`--push` 推送；`--force` 已存在也重新生成 |
 | `audio-note push-test "文本"` | 向所有已配置渠道发一条测试消息 |
-| `audio-note chat [question]` | 记忆问答；不带参数进入交互式 REPL |
+| `audio-note chat [question] [--strategy prefetch\|agentic\|rag] [--retrieval hybrid\|vector\|fts] [--expand]` | 记忆问答；不带参数进入交互式 REPL |
+| `audio-note reindex [--no-vectors]` | 重建关键词索引（改了词表/人名后）并补齐向量索引 |
 | `audio-note cleanup` | 立即执行一次清理（复检无语音片段 / 过期音频 / 磁盘上限） |
 
 调度参数：`pipeline.process_interval_min`（默认 10 分钟处理一次新片段）、`storage.cleanup_interval_min`（30 分钟）、`analysis.daily_time`（22:30 跑日报并推送；跑之前会先处理一遍新片段）。22:30 之后还在说话的内容会在第二天补进前一天的日报并重新推送一次；某天的片段还没处理完（没填 key、API 故障）时不会把那天标成"已完成"，处理完后自动补报。
@@ -257,10 +258,39 @@ MiMo 限制 100 RPM / 10K TPM，客户端默认 `mimo.rpm: 90` 并对 429 指数
 **import 报 ffmpeg 错误**
 非 wav/flac/ogg/mp3 的格式走 `imageio-ffmpeg` 自带的 ffmpeg；首次使用会解压二进制，杀毒软件拦截的话加白名单。
 
+## 记忆问答：架构与评测
+
+记录分三层：原始层 `utterances`（每句一条，时间 + 说话人 + 文本）→ 摘要层（日报 + `memory_notes` 决定/待办/人物）→ 检索层。检索层是可插拔的，`config.yaml` 的 `memory` 段切换：
+
+| 配置 | 选项 | 说明 |
+|---|---|---|
+| `retrieval` | `fts` / `vector` / **`hybrid`** | 关键词（FTS5 + jieba）/ 本地句向量（bge-small-zh，CPU，首次下载 90 MB）/ 两者 RRF 融合 |
+| `strategy` | `agentic` / **`prefetch`** / `rag` | 只靠工具迭代检索 / 先自动预检索再按需调工具 / 只用预检索、单次调用 |
+| `query_expansion` | `true` / **`false`** | 检索前让模型补同义词、品牌名（每次多 1 次调用） |
+
+默认值是用 `scripts/memory_bench.py` 在 3 天合成数据（`scripts/fake_days.py`）上的 24 道题（含改述、多跳、相对日期、否定题）选出来的：
+
+**检索层**（前 10 条里找到足够证据的题数，共 23 题）：关键词 10 → 关键词 + 查询扩展 12 → 向量 17 → 混合 17。向量把"扫地机→科沃斯""回退→回滚"这类改述问题的召回翻倍；混合检索在此基础上保留人名、数字、代号的精确匹配；查询扩展收益小且每题多 2–5 s，默认关。
+
+**问答层**（24 题，mimo-v2.6-flash，混合检索）：
+
+| 策略 | 答对 | 总耗时 | LLM 调用 | 工具调用 | prompt token |
+|---|---|---|---|---|---|
+| rag（预检索 + 单次调用） | 22 | 190 s | 24 | 0 | 3.3 万 |
+| **prefetch（默认）** | 24 | 325 s | 50 | 42 | 17.4 万 |
+| agentic（只靠工具） | 23 | 579 s | 73 | 90 | 22.5 万 |
+
+prefetch 的预检索会把问题里的相对日期（"昨天晚上""上周三"）解析成日期范围优先检索，并把命中的记忆笔记一起放进上下文；加上这两步之前它是 22/24（rag 20/24），"昨天晚上聊了什么"和"李强几点到公司"（答案在前一天的"明天我十点到"，要按说话人追查）靠工具补查答对。rag 最省，适合简单事实查询；agentic 最贵，单题可能跑十几次工具。模型回答有随机性，同一配置两次跑会差 1–2 题。换数据集复测：
+
+```powershell
+$env:AUDIO_NOTE_CONFIG="config.yaml"; .\.venv\Scripts\python.exe scripts\memory_bench.py retrieval
+.\.venv\Scripts\python.exe scripts\memory_bench.py chat --strategies rag,prefetch,agentic
+```
+
 ## 开发
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests -q      # 测试不联网，MimoClient 均为 mock
+.\.venv\Scripts\python.exe -m pytest tests -q      # 测试不联网，MimoClient 均为 mock；向量用无模型的哈希嵌入
 ```
 
 代码：Python 3.12，类型标注，`logging.getLogger(__name__)`，UTF-8 / LF（见 `.editorconfig`）。

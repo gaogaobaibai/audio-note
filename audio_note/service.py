@@ -281,8 +281,16 @@ def _recorder_loop(cfg: Config, db: DB, stop_event: threading.Event, ref: dict[s
     """Run the Recorder; on crash, wait and restart until stop_event is set."""
     from .audio.recorder import Recorder
 
+    restarts = 0
     while not stop_event.is_set():
         try:
+            if restarts:
+                # PortAudio's device table is a snapshot from process start: without a refresh a mic that
+                # was unplugged/replugged or a headset that became the default is never found again
+                from .audio.capture import refresh_devices
+
+                refresh_devices()
+            restarts += 1
             rec = Recorder(cfg, db, stop_event)
             ref["recorder"] = rec
             rec.run()

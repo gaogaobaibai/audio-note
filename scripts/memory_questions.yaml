@@ -1,0 +1,113 @@
+# Evaluation set for the memory layer, written against the 3-day fake dataset produced by
+# scripts/fake_days.py --start 2026-10-27 --days 3 (星河 App 灰度上线故事线).
+#
+# Each item:
+#   q         the question (as a user would ask; several deliberately paraphrase the transcript)
+#   evidence  substrings that identify the utterances a correct answer must rest on (resolved to
+#             utterance ids with LIKE at run time; recall@k counts an item as found when at least
+#             `min_evidence` of them are in the top k)
+#   expect    answer keyword groups: every group must be matched by at least one alternative
+#   now       optional fixed "current time" for relative dates
+#   tags      lexical | paraphrase | multi-hop | temporal | negative
+default_now: "2026-10-30T21:00"
+questions:
+  - q: 妈的生日礼物买的是什么？多少钱？
+    tags: [paraphrase]
+    evidence: ["科沃斯T30", "到手价两千八百九十九"]
+    expect: [["科沃斯"], ["2899", "两千八百九十九", "2,899"]]
+  - q: 扫地机器人到货了吗？什么时候拆的？
+    tags: [lexical]
+    evidence: ["扫地机器人儿到了", "扫地机器人我今天拆了"]
+    expect: [["到了", "到货", "拿回来"], ["29", "周三", "二十九"]]
+  - q: 星河灰度发布定在哪天？是谁定的？
+    tags: [lexical, multi-hop]
+    evidence: ["灰度日期定在十月三十号", "本周五先做灰度发布"]
+    expect: [["30", "三十"], ["李强", "强哥"]]
+  - q: 王敏想报的培训课多少钱？批了没有？
+    tags: [lexical]
+    evidence: ["大概五千块钱", "五千块批了"]
+    expect: [["五千", "5000", "5,000"], ["批了", "批准", "已批", "同意"]]
+  - q: 周日家里的聚餐订在哪个饭店？几点？几个人的包间？
+    tags: [paraphrase]
+    evidence: ["海底捞的包间", "中关村那家，六点我订的四人包间"]
+    expect: [["海底捞"], ["六点", "18:00", "6点"], ["四人", "4人", "四个人"]]
+  - q: 压测峰值 QPS 多少？目标是多少？
+    tags: [lexical]
+    evidence: ["QPS峰值一千二百", "至少要撑到一千QPS"]
+    expect: [["一千二百", "1200", "1,200"], ["一千", "1000", "1,000"]]
+  - q: 市场投放预算总共多少？灰度当天先投多少？
+    tags: [lexical, multi-hop]
+    evidence: ["总计三十五万", "明天先投十万"]
+    expect: [["三十五万", "35万", "350000"], ["十万", "10万", "100000"]]
+  - q: 生日蛋糕订的什么样的？
+    tags: [paraphrase]
+    evidence: ["订的八寸黑森林", "蛋糕买八寸的就行"]
+    expect: [["八寸", "8寸"], ["黑森林"]]
+  - q: 最后剩下的那个致命 bug 是什么问题？
+    tags: [lexical]
+    evidence: ["优惠券叠加的计算逻辑会导致负数订单"]
+    expect: [["优惠券"], ["负数"]]
+  - q: 灰度第一批放多少用户？几点开始？
+    tags: [lexical]
+    evidence: ["明天早上九点开始灰度，第一批五百人"]
+    expect: [["五百", "500"], ["九点", "9点", "09:00", "9:00"]]
+  - q: 如果上线出问题，多久能回退？
+    tags: [paraphrase]
+    evidence: ["三分钟内可以回滚"]
+    expect: [["三分钟", "3分钟", "3 分钟"]]
+  - q: 推送文案最后选了哪一版？理由是什么？
+    tags: [lexical]
+    evidence: ["选B版，语气更直接"]
+    expect: [["B"], ["直接"]]
+  - q: 这三天中午分别吃的什么？
+    tags: [multi-hop, paraphrase]
+    min_evidence: 3
+    evidence: ["兰州拉面", "黄焖鸡", "麻辣香锅"]
+    expect: [["兰州拉面", "拉面"], ["黄焖鸡"], ["麻辣香锅", "香锅"]]
+  - q: 王敏的培训什么时候开课？上课要请假怎么安排的？
+    tags: [lexical, multi-hop]
+    evidence: ["培训课下周一开课", "每周五下午请半天假"]
+    expect: [["下周一", "周一"], ["周五"], ["半天"]]
+  - q: 灰度那天李强几点到公司？
+    tags: [lexical]
+    evidence: ["明天我十点到"]
+    expect: [["十点", "10点", "10:00"]]
+  - q: 客服安排了几个人值班？
+    tags: [lexical]
+    evidence: ["客服有三个人值班"]
+    expect: [["三个", "3个", "三人", "3人"]]
+  - q: bug 数量这几天是怎么变化的？
+    tags: [temporal, multi-hop]
+    min_evidence: 3
+    evidence: ["还剩二十三个bug", "现在还剩十四个", "bug数降到九个了", "bug还剩四个"]
+    expect: [["二十三", "23"], ["十四", "14"], ["九", "9"], ["四", "4"]]
+  - q: 全量上线定在什么时候？
+    tags: [lexical]
+    evidence: ["下周一全量"]
+    expect: [["下周一", "周一", "11-02", "11月2"]]
+  - q: 数据库索引优化是谁负责的，预计提速多少？
+    tags: [lexical]
+    evidence: ["数据库的索引优化，我明天提PR"]
+    expect: [["王敏"], ["百分之三十", "30%", "30 %"]]
+  - q: 有人来送快递的时候，签收的是什么东西？
+    tags: [paraphrase]
+    evidence: ["签好了，是对我妈的生日礼物"]
+    expect: [["生日礼物", "礼物"]]
+  - q: 昨天晚上在家聊了什么？
+    tags: [temporal]
+    now: "2026-10-29T21:30"
+    min_evidence: 2
+    evidence: ["扫地机器人儿到了", "订的八寸黑森林", "中关村那家"]
+    expect: [["扫地机器人", "科沃斯"], ["蛋糕", "黑森林", "海底捞"]]
+  - q: 我们有没有讨论过去日本旅游的事？
+    tags: [negative]
+    evidence: []
+    expect: [["没有", "未找到", "没找到", "无"]]
+  - q: 周六打算干什么？
+    tags: [lexical, temporal]
+    evidence: ["周六可能要去公司看一下数据", "周六上午去公司看下数据"]
+    expect: [["公司"], ["数据"]]
+  - q: 小雨让我吃完饭帮忙做什么？
+    tags: [lexical]
+    evidence: ["吃完帮我看看科沃斯滤网", "吃完把快递箱子扔了"]
+    expect: [["滤网"], ["箱子", "快递"]]

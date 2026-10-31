@@ -1,9 +1,14 @@
-"""Memory chat: iterative retrieval (function calling) over the transcript database.
+"""Memory chat over the transcript database. Three strategies (memory.strategy):
 
-MemoryChat.ask() runs an agentic loop: the model sees a system prompt with today's date and the
-tools in memory/tools.py, calls tools as it likes (up to cfg.memory.max_tool_rounds rounds), each
-result is appended as a role=tool message, and the final text answer is returned. repl() wraps it
-in a rich console loop that keeps conversation history.
+agentic   the model sees only the tools (memory/tools.py) and retrieves iteratively, up to
+          cfg.memory.max_tool_rounds rounds; each tool result is appended as a role=tool message.
+prefetch  the question is first run through the Retriever (memory.retrieval); the top prefetch_k
+          hits are put into the system prompt, then the agentic loop runs as above. Most questions
+          are answered in one turn, hard ones can still drill down.   (default)
+rag       prefetch only, no tools: one model call. Cheapest, for simple fact lookups.
+
+ask() returns the final text; last_stats records llm/tool call counts. repl() is a rich console
+loop that keeps conversation history.
 """
 from __future__ import annotations
 
@@ -15,10 +20,13 @@ from typing import Any, Callable
 from ..config import Config
 from ..db import DB
 from ..llm.client import LLMError, parse_json_loose
-from . import index
+from . import index, temporal
+from .retrieval import Retriever, rrf_fuse
 from .tools import TOOLS, run_tool
 
 log = logging.getLogger(__name__)
+
+STRATEGIES = ("agentic", "prefetch", "rag")
 
 _WEEKDAYS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 _FINAL_NUDGE = "工具调用次数已用完。请根据目前已经获得的信息直接回答用户的问题；信息不足就如实说明。"
@@ -26,47 +34,143 @@ _TRIM_KEEP = 200  # chars kept from an old tool result when the context budget i
 
 
 class MemoryChat:
-    def __init__(self, cfg: Config, db: DB, client: Any):
+    def __init__(self, cfg: Config, db: DB, client: Any, retriever: Retriever | None = None,
+                 strategy: str | None = None):
         self.cfg = cfg
         self.db = db
         self.client = client
         self.model: str = cfg.memory.chat_model or cfg.mimo.chat_model
         self.max_rounds = max(0, int(cfg.memory.max_tool_rounds))
         self.max_context_chars = int(cfg.memory.max_context_chars)
+        self.strategy = (strategy or str(cfg.memory.get("strategy", "prefetch"))).lower()
+        if self.strategy not in STRATEGIES:
+            log.warning("unknown memory.strategy %r, using prefetch", self.strategy)
+            self.strategy = "prefetch"
+        self.prefetch_k = max(1, int(cfg.memory.get("prefetch_k", 12)))
+        self.retriever = retriever or Retriever(cfg, db, client)
+        self.now: datetime | None = None       # fixed "current time" (benchmarks); None = wall clock
         self.on_tool: Callable[[str, dict, str], None] | None = None  # (name, args, result) observer
+        self.last_stats: dict[str, Any] = {}
         try:
             index.register_from(cfg, db)
         except Exception as e:  # noqa: BLE001
             log.warning("register speaker/glossary terms failed: %s", e)
 
     # --- prompt ---------------------------------------------------------------
-    def system_prompt(self, now: datetime | None = None) -> str:
-        now = now or datetime.now()
+    def system_prompt(self, now: datetime | None = None, prefetched: str | None = None, with_tools: bool = True) -> str:
+        now = now or self.now or datetime.now()
         unknown = self.cfg.speakers.unknown_label
-        return (
+        head = (
             "你是用户的个人记忆助手。用户全天录音，录音已被转写成带时间戳和说话人的文字记录（utterance），"
-            "存在本地数据库里。你只能通过提供的工具查找这些记录，不能凭空编造内容。\n"
+            "存在本地数据库里。你只能依据这些记录回答，不能凭空编造内容。\n"
             f"现在是 {now.strftime('%Y-%m-%d %H:%M')}（{_WEEKDAYS[now.weekday()]}）。\n\n"
-            "工作方式：\n"
-            "1. 先判断问题涉及的时间范围和人物；把“昨天 / 上周 / 周一”等相对日期换算成 YYYY-MM-DD。\n"
-            "2. 用 search_transcripts 按关键词检索（可以多次调用、换同义词、加日期或说话人过滤）；"
-            "需要前后文用 get_context；要看某段时间的完整内容用 get_transcript（配合 hour_from/hour_to）；"
-            "想了解某一天整体情况先看 get_daily_summary；不确定哪些天有记录用 list_days；"
-            "人名不确定用 list_speakers；待办、决定、人物笔记用 search_notes。\n"
+        )
+        if with_tools:
+            how = (
+                "工作方式：\n"
+                "1. 先判断问题涉及的时间范围和人物；把“昨天 / 上周 / 周一”等相对日期换算成 YYYY-MM-DD。\n"
+                "2. 用 search_transcripts 检索（关键词或短语都行；可以多次调用、换说法、加日期或说话人过滤）；"
+                "需要前后文用 get_context；要看某段时间的完整内容用 get_transcript（配合 hour_from/hour_to）；"
+                "想了解某一天整体情况先看 get_daily_summary；不确定哪些天有记录用 list_days；"
+                "人名不确定用 list_speakers；待办、决定、人物笔记用 search_notes。\n"
+            )
+            if prefetched:
+                how += "   下面「预检索结果」是系统按问题自动检索到的记录：够用就直接回答；不够或需要上下文再调用工具。\n"
+        else:
+            how = ("工作方式：\n1. 只根据下面「预检索结果」回答；记录里没有的信息就明确说没有找到。\n"
+                   "2. 把相对日期换算成具体日期后再判断。\n")
+        tail = (
             "3. 回答时引用依据：写明时间（月-日 时:分）和说话人，例如「10-31 08:19 张三说：……」。"
             f"说话人是「{unknown}」时如实说明是未识别的说话人。转写可能有错别字，引用时可按上下文理解但不要臆造。\n"
             "4. 检索不到就明确说没有找到，不要猜测；可以建议用户换个说法或时间范围。\n"
             "5. 用用户提问所用的语言回答（中文提问用中文）。简洁、直接、有条理；长答案用要点。"
         )
+        out = head + how + tail
+        if prefetched:
+            out += "\n\n## 预检索结果（按相关度，[#编号] 可用于 get_context）\n" + prefetched
+        return out
+
+    def prefetch(self, question: str, k: int | None = None) -> str:
+        """Retriever hits for the question, formatted for the system prompt ('' when nothing found).
+        A relative date in the question ("昨天晚上", "上周三") becomes a day filter: those hits come
+        first, a global search fills the rest."""
+        k = k or self.prefetch_k
+        try:
+            span = temporal.parse_range(question, self.now or datetime.now())
+            res = self.retriever.search(question, limit=k)
+            hits = list(res.hits)
+            if span:
+                scoped = self.retriever.search(question, day_from=span[0], day_to=span[1], limit=k)
+                if scoped.hits:
+                    hits = rrf_fuse([scoped.hits, hits], self.retriever.rrf_k, [1.0, 0.5])[:k]
+        except Exception as e:  # noqa: BLE001 - never block the answer on retrieval
+            log.warning("prefetch failed: %s", e)
+            return ""
+        notes = self.related_notes(question)
+        if not hits and not notes:
+            return ""
+        lines = [index.fmt_row(h) for h in hits]
+        note = f"（{res.how_label}"
+        if res.expansions:
+            note += "，扩展词：" + "、".join(res.expansions)
+        if span:
+            note += "，问题里的日期按 " + (span[0] if span[0] == span[1] else f"{span[0]}~{span[1]}") + " 优先"
+        out = note + "）\n" + "\n".join(lines)
+        if notes:
+            out += "\n\n相关记忆笔记（每日分析整理，可能过时，以记录为准）：\n" + "\n".join(notes)
+        return out
+
+    def related_notes(self, question: str, limit: int = 3) -> list[str]:
+        """memory_notes (decisions / todos / people / facts from the daily analysis) whose title or
+        content contains a content token of the question; newest first."""
+        toks = index.content_tokens(index.tokenize(question).split())
+        toks = [t for t in toks if len(t) > 1][:8]
+        if not toks:
+            return []
+        where = " OR ".join("(title LIKE ? OR content LIKE ?)" for _ in toks)
+        params: list[str] = []
+        for t in toks:
+            pat = "%" + t.replace("%", "").replace("_", "") + "%"
+            params += [pat, pat]
+        try:
+            rows = self.db.query(
+                f"SELECT kind, title, content, day_from, day_to FROM memory_notes WHERE {where}"
+                " ORDER BY updated_at DESC, id DESC LIMIT ?", [*params, int(limit)])
+        except Exception as e:  # noqa: BLE001
+            log.debug("related_notes failed: %s", e)
+            return []
+        out = []
+        for r in rows:
+            span = r["day_from"] or ""
+            if r["day_to"] and r["day_to"] != r["day_from"]:
+                span += f"~{r['day_to']}"
+            content = " ".join((r["content"] or "").split())[:200]
+            out.append(f"[{r['kind']}] {r['title']}{(' (' + span + ')') if span else ''}: {content}")
+        return out
 
     # --- agentic loop -----------------------------------------------------------
     def ask(self, question: str, history: list[dict[str, Any]] | None = None) -> str:
         """Answer one question. `history` = prior user/assistant messages (not mutated)."""
-        messages: list[dict[str, Any]] = [{"role": "system", "content": self.system_prompt()}]
+        stats = {"strategy": self.strategy, "llm_calls": 0, "tool_calls": 0, "rounds": 0, "prefetched": 0}
+        self.last_stats = stats
+        prefetched = ""
+        if self.strategy in ("prefetch", "rag"):
+            prefetched = self.prefetch(question, self.prefetch_k * (2 if self.strategy == "rag" else 1))
+            stats["prefetched"] = prefetched.count("\n[#")
+        with_tools = self.strategy != "rag"
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": self.system_prompt(prefetched=prefetched or None, with_tools=with_tools)}
+        ]
         messages += list(history or [])
         messages.append({"role": "user", "content": question})
 
+        if not with_tools:
+            stats["llm_calls"] += 1
+            return _content(self._call(messages, tools=None))
+
         for rnd in range(self.max_rounds):
+            stats["llm_calls"] += 1
+            stats["rounds"] = rnd + 1
             msg = self._call(messages, tools=TOOLS)
             tool_calls = list(getattr(msg, "tool_calls", None) or [])
             if not tool_calls:
@@ -77,7 +181,8 @@ class MemoryChat:
             messages.append(_assistant_message(msg, tool_calls, ids))
             for tc, tc_id in zip(tool_calls, ids):
                 name, args = _parse_call(tc)
-                result = run_tool(name, args, self.db, self.cfg)
+                stats["tool_calls"] += 1
+                result = run_tool(name, args, self.db, self.cfg, self.retriever)
                 log.info("tool round %d: %s(%s) -> %d chars", rnd + 1, name, json.dumps(args, ensure_ascii=False)[:200], len(result))
                 if self.on_tool:
                     try:
@@ -89,6 +194,7 @@ class MemoryChat:
 
         # budget exhausted: force a final answer without tools
         messages.append({"role": "user", "content": _FINAL_NUDGE})
+        stats["llm_calls"] += 1
         return _content(self._call(messages, tools=None))
 
     def _call(self, messages: list[dict[str, Any]], tools: list[dict] | None) -> Any:
@@ -120,7 +226,7 @@ class MemoryChat:
         console = Console()
         history: list[dict[str, Any]] = []
         console.print(Panel.fit(
-            f"记忆问答  模型 {self.model}  最多 {self.max_rounds} 轮检索\n"
+            f"记忆问答  模型 {self.model}  策略 {self.strategy}  检索 {self.retriever.mode}  最多 {self.max_rounds} 轮工具调用\n"
             "输入问题回车；/clear 清空对话；/quit 退出", title="audio-note chat"))
 
         def show_tool(name: str, args: dict, result: str) -> None:

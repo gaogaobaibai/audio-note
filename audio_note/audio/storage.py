@@ -25,6 +25,26 @@ log = logging.getLogger(__name__)
 
 RATIO_MIN_DURATION_S = 10.0   # min_speech_ratio only applies to segments at least this long (short replies are fine)
 
+#: substrings (case-insensitive) of a segment's `error` text that mean "the API / network failed, the audio is
+#: fine": such failures are re-queued by the scheduler and their audio is never expired while untranscribed.
+TRANSIENT_ERROR_MARKERS = (
+    "giving up", "timeout", "timed out", "connection", "connect", "temporarily", "overloaded", "rate limit",
+    "ratelimit", "http 5", "http 429", "http 402", "http 408", "http 409", "status 5", "winerror 10", "eof occurred",
+    "remote", "unreachable", "service unavailable", "bad gateway", "gateway", "network", "ssl", "429", "502", "503", "504",
+)
+
+
+def is_transient_error_text(err: str | None) -> bool:
+    """True when a segment's stored error looks like a transient API/network failure (worth retrying)."""
+    if not err:
+        return False
+    s = str(err).lower()
+    return any(m in s for m in TRANSIENT_ERROR_MARKERS)
+
+
+def has_transcript(db: DB, seg_id: int) -> bool:
+    return db.one("SELECT 1 FROM transcripts WHERE segment_id=? LIMIT 1", (int(seg_id),)) is not None
+
 
 def opus_compression_level(bitrate_bps: int) -> float:
     """libsndfile maps compression_level (0..1) to an Opus VBR bitrate roughly linearly:
@@ -129,20 +149,43 @@ def finalize_segment(cfg: Config, db: DB, audio: np.ndarray, started_at: datetim
             partial.unlink()
         return None
     path = write_segment_file(cfg, audio, started_at, db)
-    seg_id = db.add_segment(path, started_at, dur, SAMPLE_RATE, source=source, origin=origin, speech_s=speech_s)
+    try:
+        seg_id = db.add_segment(path, started_at, dur, SAMPLE_RATE, source=source, origin=origin, speech_s=speech_s)
+    except Exception:
+        # never leave an unregistered file behind (it would be invisible to processing and cleanup);
+        # the partial, when there is one, stays on disk so recover_partials() can retry later
+        _delete_file(str(path))
+        raise
     if partial and partial.exists():
         partial.unlink()
     log.info("segment #%d %s %.1fs (speech %.1fs, %d KB)", seg_id, path.name, dur, speech_s, path.stat().st_size // 1024)
     return seg_id
 
 
-def recover_partials(cfg: Config, db: DB, vad: SileroVAD) -> int:
-    """Finish *_partial.wav files left behind by a crash."""
-    n = 0
+PARTIAL_FRESH_S = 5.0   # a partial modified more recently than this may still be written by a live recorder
+
+
+def stale_partials(cfg: Config, exclude: Path | str | None = None) -> list[Path]:
+    """*_partial.wav files that are not being written right now (mtime older than PARTIAL_FRESH_S)."""
+    out: list[Path] = []
+    ex = str(exclude) if exclude is not None else None
     for p in sorted(cfg.audio_dir.glob("*/*_partial.wav")):
+        if ex is not None and str(p) == ex:
+            continue
         try:
-            if time.time() - p.stat().st_mtime < 5:
-                continue  # may still be written by another instance
+            if time.time() - p.stat().st_mtime < PARTIAL_FRESH_S:
+                continue
+        except OSError:
+            continue
+        out.append(p)
+    return out
+
+
+def recover_partials(cfg: Config, db: DB, vad: SileroVAD, exclude: Path | str | None = None) -> int:
+    """Finish *_partial.wav files left behind by a crash (``exclude``: the partial a live recorder owns)."""
+    n = 0
+    for p in stale_partials(cfg, exclude):
+        try:
             audio = read_segment(p)
             if len(audio) == 0:
                 p.unlink()
@@ -185,8 +228,10 @@ def cleanup(cfg: Config, db: DB, vad: SileroVAD | None = None) -> dict[str, int]
     1. VAD re-check of segments without speech_s, plus 'new' segments whose stored speech ratio is
        already below min_speech_ratio -> delete those with (almost) no speech.
     2. Delete audio of transcribed (or permanently failed) segments older than keep_audio_days
-       (transcripts are kept).
-    3. If audio dir exceeds max_disk_gb, delete oldest transcribed audio first.
+       (transcripts are kept). A 'failed' segment whose error looks transient (API down, timeout)
+       and that has no transcript is kept: the scheduler re-queues it and expiring it would be data loss.
+    3. If audio dir exceeds max_disk_gb, delete oldest transcribed audio first; when that is not
+       enough, oldest 'failed' audio, then unprocessed audio older than keep_audio_days (last resort).
     4. Remove empty day folders.
     """
     stats = {"rechecked": 0, "no_speech": 0, "expired": 0, "disk_cap": 0}
@@ -220,7 +265,10 @@ def cleanup(cfg: Config, db: DB, vad: SileroVAD | None = None) -> dict[str, int]
     keep_days = int(st.keep_audio_days or 0)
     if keep_days > 0:
         cutoff = (datetime.now() - timedelta(days=keep_days)).isoformat(timespec="seconds")
-        for row in db.query("SELECT id, path FROM segments WHERE status IN ('done','failed') AND started_at < ?", (cutoff,)):
+        for row in db.query("SELECT id, path, status, error FROM segments WHERE status IN ('done','failed') AND started_at < ?", (cutoff,)):
+            if row["status"] == "failed" and is_transient_error_text(row["error"]) and not has_transcript(db, row["id"]):
+                log.debug("keeping failed segment #%d (transient error, no transcript): %s", row["id"], row["error"])
+                continue
             _delete_file(row["path"])
             db.set_segment_status(row["id"], "deleted")
             stats["expired"] += 1
@@ -230,17 +278,28 @@ def cleanup(cfg: Config, db: DB, vad: SileroVAD | None = None) -> dict[str, int]
     if cap > 0:
         used = dir_size_bytes(cfg.audio_dir)
         if used > cap:
-            for row in db.query("SELECT id, path FROM segments WHERE status='done' ORDER BY started_at"):
-                try:
-                    sz = os.path.getsize(row["path"])
-                except OSError:
-                    sz = 0
-                _delete_file(row["path"])
-                db.set_segment_status(row["id"], "deleted")
-                stats["disk_cap"] += 1
-                used -= sz
+            tiers: list[tuple[str, tuple]] = [("SELECT id, path FROM segments WHERE status='done' ORDER BY started_at", ())]
+            # untranscribed audio only goes when transcribed audio alone cannot bring us under the cap
+            tiers.append(("SELECT id, path FROM segments WHERE status='failed' ORDER BY started_at", ()))
+            if keep_days > 0:
+                old = (datetime.now() - timedelta(days=keep_days)).isoformat(timespec="seconds")
+                tiers.append(("SELECT id, path FROM segments WHERE status='new' AND started_at < ? ORDER BY started_at", (old,)))
+            for tier, (sql, params) in enumerate(tiers):
                 if used <= cap * 0.9:
                     break
+                for row in db.query(sql, params):
+                    try:
+                        sz = os.path.getsize(row["path"])
+                    except OSError:
+                        sz = 0
+                    _delete_file(row["path"])
+                    db.set_segment_status(row["id"], "deleted", None if tier == 0 else "evicted by max_disk_gb before transcription")
+                    stats["disk_cap"] += 1
+                    if tier > 0:
+                        log.warning("disk cap: evicted untranscribed segment #%d (%s)", row["id"], row["path"])
+                    used -= sz
+                    if used <= cap * 0.9:
+                        break
 
     # 4. empty folders
     for d in cfg.audio_dir.glob("*"):

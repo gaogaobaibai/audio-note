@@ -84,6 +84,15 @@ DEFAULTS: dict[str, Any] = {
         "max_context_chars": 16000,
         "max_tool_rounds": 8,          # agentic retrieval loop budget per question
         "chat_model": "",              # empty = mimo.chat_model
+        "retrieval": "hybrid",         # fts | vector | hybrid   (vector/hybrid need the local embedding model)
+        "embedding_model": "BAAI/bge-small-zh-v1.5",   # fastembed model id (downloaded into models_dir/embeddings)
+        "embedding_threads": 2,
+        "query_expansion": False,      # ask the LLM for synonyms before keyword search (1 extra call per query)
+        "strategy": "prefetch",        # agentic | prefetch | rag   (see docs/DESIGN.md §7)
+        "prefetch_k": 12,              # hits injected before the first model turn (prefetch / rag)
+        "rrf_k": 60,                   # reciprocal-rank-fusion constant for hybrid retrieval
+        "fts_weight": 1.0,             # weight of the keyword list in hybrid fusion (vector list = 1.0)
+        "hybrid_fts_strict": True,     # hybrid: keyword list = exact AND matches only (the loose OR list adds noise)
     },
     "analysis": {
         "daily_time": "22:30",
@@ -184,6 +193,10 @@ class Config(Section):
     @property
     def speakers_dir(self) -> Path:
         return self.data_dir / "speakers"
+
+    @property
+    def embeddings_dir(self) -> Path:
+        return self.models_dir / "embeddings"
 
     @property
     def glossary_path(self) -> Path:

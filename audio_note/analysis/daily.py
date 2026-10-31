@@ -238,6 +238,10 @@ def render_markdown(day: str, summary_json: dict[str, Any]) -> str:
         stats.append("说话人：" + "、".join(str(s) for s in meta["speakers"]))
     if stats:
         lines += ["> " + " · ".join(stats), ""]
+    failed = meta.get("failed_blocks") or []
+    if meta.get("partial") and failed:
+        ranges = "、".join(str(f.get("time_range") or f.get("index") or "?") for f in failed if isinstance(f, dict))
+        lines += [f"> ⚠ 不完整：{len(failed)} 个时段分析失败（{ranges}），稍后会自动重新生成。", ""]
 
     lines += ["## 概览", d["overview"] or "（无）", ""]
     lines += ["## 主要话题", _bullets(d["topics"]), ""]
@@ -280,6 +284,8 @@ class DailyAnalyzer:
         self.session_gap_min = float(a.get("session_gap_min", DEFAULT_SESSION_GAP_MIN))
         self.max_block_chars = int(a.get("max_block_chars", DEFAULT_MAX_BLOCK_CHARS))
         self.unknown_label = str(cfg.speakers.get("unknown_label") or "未知")
+        self.last_run_cached = False   # True when the last run() returned the stored digest without an LLM call
+        self.last_run_partial = False  # True when the last run() wrote a digest with failed map blocks
 
     @property
     def client(self) -> Any:
@@ -369,6 +375,8 @@ class DailyAnalyzer:
     def run(self, day: str | date, force: bool = False) -> tuple[str, dict[str, Any]]:
         """Analyse one day. Returns (summary_md, summary_json). Without utterances no LLM call is made."""
         day = _day_str(day)
+        self.last_run_cached = False
+        self.last_run_partial = False
         sessions = self.sessions(day)
         rows = [r for s in sessions for r in s]
         if not rows:
@@ -382,7 +390,9 @@ class DailyAnalyzer:
         existing = self.db.one("SELECT summary_md, summary_json, utterance_count FROM daily_summaries WHERE day=?", (day,))
         if existing and not force and int(existing["utterance_count"] or 0) == len(rows) and existing["summary_json"]:
             try:
-                return existing["summary_md"], json.loads(existing["summary_json"])
+                js_cached = json.loads(existing["summary_json"])
+                self.last_run_cached = True
+                return existing["summary_md"], js_cached
             except (TypeError, ValueError):
                 pass
 
@@ -390,6 +400,7 @@ class DailyAnalyzer:
         speakers = sorted({_speaker(r, self.unknown_label) for r in rows} - {self.unknown_label})
         results: list[dict[str, Any]] = []
         kept_blocks: list[Block] = []
+        failed_blocks: list[dict[str, Any]] = []
         for b in blocks:
             try:
                 results.append(self.map_block(day, b, len(blocks)))
@@ -398,8 +409,13 @@ class DailyAnalyzer:
                 raise  # configuration problem, not a transient failure of this block
             except LLMError as e:
                 log.warning("daily %s: block %d/%d failed: %s", day, b.index, len(blocks), e)
+                failed_blocks.append({"index": b.index, "session": b.session, "time_range": b.time_range, "error": str(e)[:300]})
         if not results:
             raise LLMError(f"daily {day}: all {len(blocks)} blocks failed")
+        partial = bool(failed_blocks)
+        # utterances actually summarised: stored as utterance_count so the cache check / yesterday-recheck
+        # see a mismatch and regenerate an incomplete digest instead of treating it as final
+        covered = len({uid for b in kept_blocks for uid in b.utterance_ids})
 
         try:
             digest = self.reduce_blocks(day, results, utterance_count=len(rows), session_count=len(sessions), speakers=speakers)
@@ -418,10 +434,18 @@ class DailyAnalyzer:
             "model": self.model,
             "blocks": results,
         })
+        if partial:
+            js["partial"] = True
+            js["failed_blocks"] = failed_blocks
+            js["covered_utterance_count"] = covered
         md = render_markdown(day, js)
-        self._write_summary(day, md, js, len(rows))
+        # a partial digest must never be stored with the full count (that is what marks it final)
+        stored_count = len(rows) if not partial else min(covered, len(rows) - 1)
+        self._write_summary(day, md, js, stored_count)
         self._upsert_notes(day, js, rows)
-        log.info("daily %s: %d utterances, %d sessions, %d blocks -> %d chars", day, len(rows), len(sessions), len(blocks), len(md))
+        self.last_run_partial = partial
+        log.info("daily %s: %d utterances, %d sessions, %d blocks%s -> %d chars", day, len(rows), len(sessions), len(blocks),
+                 f" ({len(failed_blocks)} failed, digest marked partial)" if partial else "", len(md))
         return md, js
 
     # --- persistence ----------------------------------------------------------------------

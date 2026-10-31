@@ -56,6 +56,20 @@ def resolve_device(spec: int | str | None) -> int | None:
     return cands[0].index
 
 
+def refresh_devices() -> bool:
+    """Re-enumerate PortAudio devices. PortAudio takes its device table (indices, names, default
+    device) once at initialisation, so a microphone plugged in / replugged / made default after the
+    process started is invisible until Pa_Terminate + Pa_Initialize. Returns True on success; never raises."""
+    try:
+        sd._terminate()
+        sd._initialize()
+        log.info("audio device list refreshed")
+        return True
+    except Exception as e:  # noqa: BLE001 - best effort; the old table keeps working
+        log.warning("device refresh failed: %s", e)
+        return False
+
+
 def _resample(x: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
     if sr_in == sr_out:
         return x
@@ -87,20 +101,44 @@ class MicCapture:
                               blocksize=blocksize, callback=self._cb, latency="high")
 
     def __enter__(self) -> "MicCapture":
+        # `self.sr` must be final BEFORE start(): the PortAudio thread may run _cb immediately after
+        # start() returns and reads self.sr to decide whether a block needs resampling.
         try:
+            self.sr = TARGET_SR
             self._stream = self._open(TARGET_SR)
             self._stream.start()
-            self.sr = TARGET_SR
         except Exception as e:  # device refuses 16 kHz -> open at its default and resample
+            self._close_stream()   # an opened-but-not-started stream must not leak
             info = sd.query_devices(self.device, "input")
             sr = int(info["default_samplerate"])
             log.warning("16 kHz capture failed (%s); falling back to %d Hz + resample", e, sr)
-            self._stream = self._open(sr)
-            self._stream.start()
             self.sr = sr
+            try:
+                self._stream = self._open(sr)
+                self._stream.start()
+            except Exception:
+                self._close_stream()
+                raise
         log.info("capture started on device %s (%s) @ %d Hz", self.device, sd.query_devices(self.device, "input")["name"], self.sr)
         self.last_callback_at = time.time()
         return self
+
+    def _close_stream(self) -> None:
+        """stop() + close() the current stream; a failing stop() (endpoint invalidated by unplug or
+        sleep/resume) must not prevent close(), or the PortAudio stream leaks on every restart."""
+        s = self._stream
+        self._stream = None
+        if s is None:
+            return
+        try:
+            s.stop()
+        except Exception as e:  # noqa: BLE001
+            log.warning("stream stop failed (%s); closing anyway", e)
+        finally:
+            try:
+                s.close()
+            except Exception as e:  # noqa: BLE001
+                log.warning("stream close failed: %s", e)
 
     def is_active(self) -> bool:
         """True while the PortAudio stream reports itself running."""
@@ -113,10 +151,7 @@ class MicCapture:
             return False
 
     def __exit__(self, *exc) -> None:
-        if self._stream is not None:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
+        self._close_stream()
 
     def _cb(self, indata: np.ndarray, frames: int, time_info, status) -> None:
         now = time.time()

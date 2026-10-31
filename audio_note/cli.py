@@ -50,6 +50,17 @@ class CLIError(Exception):
 
 # --- helpers --------------------------------------------------------------
 
+def _lazy_module(module: str) -> Any:
+    """Import a submodule of audio_note (e.g. "memory.index") with the same clear error as _lazy()."""
+    import importlib
+
+    full = f"audio_note.{module}"
+    try:
+        return importlib.import_module(full)
+    except ImportError as e:
+        raise CLIError(f"模块 {full} 不可用（尚未实现或导入失败）: {e}") from e
+
+
 def _lazy(module: str, attr: str) -> Any:
     """Import `attr` from `module` (relative to audio_note); clear message when it is missing."""
     import importlib
@@ -746,14 +757,40 @@ def cmd_push_test(cfg: Config, args: argparse.Namespace) -> int:
 
 def cmd_chat(cfg: Config, args: argparse.Namespace) -> int:
     MemoryChat = _lazy("memory.chat", "MemoryChat")
+    Retriever = _lazy("memory.retrieval", "Retriever")
     db = _db(cfg)
-    chat = MemoryChat(cfg, db, _client(cfg))
+    client = _client(cfg)
+    retriever = Retriever(cfg, db, client, mode=args.retrieval, expand=args.expand)
+    chat = MemoryChat(cfg, db, client, retriever=retriever, strategy=args.strategy)
     question = " ".join(args.question).strip() if args.question else ""
     if question:
         answer = _invoke(chat.ask, question=question, history=[])
         _print_result(answer)
         return 0
     chat.repl()
+    return 0
+
+
+def cmd_reindex(cfg: Config, args: argparse.Namespace) -> int:
+    """Rebuild the keyword index (after glossary / speaker changes) and embed utterances without a vector."""
+    mem_index = _lazy_module("memory.index")
+    db = _db(cfg)
+    mem_index.register_from(cfg, db)
+    n = mem_index.reindex(db)
+    console.print(f"关键词索引已重建：{n} 条。")
+    if args.no_vectors or cfg.memory.retrieval == "fts":
+        console.print("向量索引跳过（memory.retrieval = fts 或 --no-vectors）。")
+        return 0
+    vectors = _lazy_module("memory.vectors")
+    get_embedder = _lazy("memory.embed", "get_embedder")
+    emb = get_embedder(cfg)
+    missing = vectors.missing_count(db, emb.name)
+    if not missing:
+        console.print(f"向量索引已是最新（模型 {emb.name}，{db.vector_count(emb.name)} 条）。")
+        return 0
+    console.print(f"正在用 {emb.name} 嵌入 {missing} 条记录…")
+    k = vectors.index_missing(db, emb)
+    console.print(f"向量索引完成：新增 {k} 条，共 {db.vector_count(emb.name)} 条。")
     return 0
 
 
@@ -887,7 +924,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("chat", help="记忆问答（无参数进入交互模式）")
     s.add_argument("question", nargs="*")
+    s.add_argument("--strategy", choices=["agentic", "prefetch", "rag"], default=None, help="覆盖 memory.strategy")
+    s.add_argument("--retrieval", choices=["fts", "vector", "hybrid"], default=None, help="覆盖 memory.retrieval")
+    s.add_argument("--expand", dest="expand", action="store_true", default=None, help="开启 LLM 查询扩展")
+    s.add_argument("--no-expand", dest="expand", action="store_false", help="关闭 LLM 查询扩展")
     s.set_defaults(func=cmd_chat)
+
+    s = sub.add_parser("reindex", help="重建关键词索引并补齐向量索引")
+    s.add_argument("--no-vectors", action="store_true", help="只重建关键词索引")
+    s.set_defaults(func=cmd_reindex)
 
     sub.add_parser("cleanup", help="清理无语音/过期音频").set_defaults(func=cmd_cleanup)
     sub.add_parser("init", help="生成 config.yaml 并检查模型文件").set_defaults(func=cmd_init)

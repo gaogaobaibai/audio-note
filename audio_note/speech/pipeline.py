@@ -208,6 +208,7 @@ class Processor:
         self._corrector = corrector
         self._corrector_tried = corrector is not None
         self._terms_registered = False
+        self._embedder: Any = None       # memory.embed.BaseEmbedder | None (not loaded) | False (failed)
         self._lock = threading.Lock()
         self.stop_event = stop_event
         self.skipped_chunks = 0   # ASR chunks skipped because the content filter (421) rejected them
@@ -273,6 +274,23 @@ class Processor:
             log.warning("cannot build Corrector (%s); skipping correction", e)
             self._corrector = None
         return self._corrector
+
+    def _embed_new(self, ids: list[int]) -> None:
+        """Sentence embeddings for vector / hybrid retrieval. Best effort: a missing model only logs
+        (the chat's Retriever embeds whatever is missing on its first search)."""
+        if not ids or self.cfg.memory.retrieval not in ("vector", "hybrid") or self._embedder is False:
+            return
+        try:
+            if self._embedder is None:
+                from ..memory.embed import get_embedder
+
+                self._embedder = get_embedder(self.cfg)
+            from ..memory import vectors
+
+            vectors.index_missing(self.db, self._embedder)
+        except Exception as e:  # noqa: BLE001
+            log.warning("embedding skipped (%s); run `audio-note reindex` after fixing", e)
+            self._embedder = False
 
     def _register_terms(self) -> None:
         """Teach jieba the enrolled speaker names + glossary terms once, so text_seg cuts them
@@ -402,7 +420,8 @@ class Processor:
             (seg_id, self.cfg.mimo.asr_model, json.dumps(raw_items, ensure_ascii=False),
              "\n".join(r for _, r in spoken), "\n".join(corrected), edits_json, self.cfg.mimo.asr_language),
         )
-        self.db.add_utterances(rows)
+        ids = self.db.add_utterances(rows)
+        self._embed_new(ids)
 
         # 7. done + markdown
         self.db.set_segment_status(seg_id, "done")

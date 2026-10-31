@@ -108,14 +108,15 @@ class Hit:
     end_s: float
     speaker_name: str | None
     text: str
-    score: float = 0.0        # bm25 (lower is better) for FTS hits, 0 for substring hits
+    score: float = 0.0        # fts: bm25 (lower is better); vector: cosine similarity; fused: RRF score
+    source: str = "fts"       # fts | vector | like | 'fts+vector' after fusion
 
     @classmethod
-    def from_row(cls, r: sqlite3.Row, score: float = 0.0) -> "Hit":
+    def from_row(cls, r: sqlite3.Row, score: float = 0.0, source: str = "fts") -> "Hit":
         return cls(
             id=int(r["id"]), segment_id=int(r["segment_id"]), day=r["day"], abs_start=r["abs_start"],
             start_s=float(r["start_s"]), end_s=float(r["end_s"]), speaker_name=r["speaker_name"],
-            text=r["text"], score=float(score),
+            text=r["text"], score=float(score), source=source,
         )
 
 
@@ -158,20 +159,34 @@ def _fts_query(db: DB, match: str, day_from, day_to, speaker, limit: int) -> lis
 
 
 def search(db: DB, query: str, day_from: str | None = None, day_to: str | None = None,
-           speaker: str | None = None, limit: int = 20) -> list[Hit]:
+           speaker: str | None = None, limit: int = 20, strict: bool = False) -> list[Hit]:
     """FTS5 search. All tokens ANDed first; if fewer than 3 hits, retry with OR over the content
-    tokens (stopwords / single characters dropped). Ranked by bm25."""
+    tokens (stopwords / single characters dropped). Ranked by bm25. strict=True skips the OR
+    retry (used by hybrid retrieval, where the loose list only adds noise to the vector list)."""
     tokens = tokenize(query).split()
     if not tokens:
         return []
     hits = _fts_query(db, build_match(tokens, "AND"), day_from, day_to, speaker, limit)
-    if len(hits) < 3 and len(tokens) > 1:
+    if not strict and len(hits) < 3 and len(tokens) > 1:
         loose_tokens = content_tokens(tokens)
         if loose_tokens != tokens or len(loose_tokens) > 1:
             loose = _fts_query(db, build_match(loose_tokens, "OR"), day_from, day_to, speaker, limit)
             if len(loose) > len(hits):
                 hits = loose
     return hits
+
+
+def search_terms(db: DB, terms: list[str], day_from: str | None = None, day_to: str | None = None,
+                 speaker: str | None = None, limit: int = 20) -> list[Hit]:
+    """OR query over the content tokens of several phrasings (query expansion), ranked by bm25."""
+    tokens: list[str] = []
+    for t in terms:
+        for tok in content_tokens(tokenize(t).split()):
+            if tok not in tokens:
+                tokens.append(tok)
+    if not tokens:
+        return []
+    return _fts_query(db, build_match(tokens, "OR"), day_from, day_to, speaker, limit)
 
 
 def like_search(db: DB, query: str, day_from: str | None = None, day_to: str | None = None,
@@ -187,7 +202,7 @@ def like_search(db: DB, query: str, day_from: str | None = None, day_to: str | N
         " ORDER BY u.abs_start DESC LIMIT ?",
         [pat, *fparams, limit],
     )
-    return [Hit.from_row(r) for r in rows]
+    return [Hit.from_row(r, source="like") for r in rows]
 
 
 # --- context --------------------------------------------------------------

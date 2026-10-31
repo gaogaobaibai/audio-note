@@ -26,13 +26,14 @@ import numpy as np
 from ..config import Config
 from ..db import DB
 from .capture import MicCapture
-from .storage import PartialWriter, finalize_segment, recover_partials
+from .storage import PartialWriter, finalize_segment, recover_partials, stale_partials
 from .vad import SAMPLE_RATE, WINDOW, GateConfig, SileroVAD, SpeechGate
 
 log = logging.getLogger(__name__)
 
 STALL_TIMEOUT_S = 10.0          # no block for this long -> the input stream is considered dead
 REANCHOR_THRESHOLD_S = 1.0      # |wall clock - sample clock| above this -> re-anchor stream_t0
+PARTIAL_RECOVERY_INTERVAL_S = 300.0   # while running, look for crash leftovers this often (not only at start)
 
 
 def gate_config_from(cfg: Config) -> GateConfig:
@@ -61,6 +62,8 @@ class Recorder:
         self.last_block_at = 0.0                  # time.time() when the last block was read
         self.last_prob = 0.0
         self.is_speaking = False
+        self._recover_vad: SileroVAD | None = None   # separate instance: recovery must not reset the live VAD state
+        self.partials_recovered = 0
 
     # wall-clock time of an absolute sample index
     def _time_of(self, sample: int) -> datetime:
@@ -79,9 +82,13 @@ class Recorder:
             self._delivered = 0
             first_block = True
             last_log = time.time()
+            last_recover = time.time()
             self.last_block_at = time.time()
             try:
                 while not self.stop_event.is_set():
+                    if time.time() - last_recover >= PARTIAL_RECOVERY_INTERVAL_S:
+                        last_recover = time.time()
+                        self._recover_stale_partials()
                     block = mic.read(timeout=0.5)
                     if block is None:
                         self._check_stall(mic)
@@ -147,6 +154,22 @@ class Recorder:
             raise RuntimeError(f"input stream stalled: no audio for {silent_for:.0f}s (stream active={active}); reopening device")
 
     # --- partial file ----------------------------------------------------------
+    def _recover_stale_partials(self) -> int:
+        """Finish *_partial.wav leftovers that appeared (or were too fresh to touch) after start-up,
+        e.g. from a hard kill followed by a restart within seconds. Our own open partial is skipped."""
+        own = self._partial.path if self._partial is not None else None
+        try:
+            if not stale_partials(self.cfg, exclude=own):
+                return 0
+            if self._recover_vad is None:
+                self._recover_vad = SileroVAD(self.cfg.model_path("vad_model"), threads=1)
+            n = recover_partials(self.cfg, self.db, self._recover_vad, exclude=own)
+            self.partials_recovered += n
+            return n
+        except Exception as e:  # noqa: BLE001 - housekeeping must never stop the recorder
+            log.warning("partial recovery failed: %s", e)
+            return 0
+
     def _open_partial(self, start_sample: int) -> None:
         self._partial_start_sample = start_sample
         started = self._time_of(start_sample)
