@@ -234,12 +234,13 @@ def reindex(db: DB, batch: int = 500) -> int:
 
 # --- formatting helpers (shared by tools / cli) -----------------------------
 def fmt_time(abs_start: str, with_date: bool = True) -> str:
+    """Minute resolution: seconds made the model misquote times ('09:30:05' -> '09:05')."""
     s = (abs_start or "").replace("T", " ")
-    return s[:19] if with_date else s[11:19]
+    return s[:16] if with_date else s[11:16]
 
 
 def fmt_row(r: sqlite3.Row | Hit, with_date: bool = True, with_id: bool = True) -> str:
-    """'[#12] 2026-10-31 08:19:10 张三: text' (one line)."""
+    """'[#12] 2026-10-31 08:19 张三: text' (one line)."""
     if isinstance(r, Hit):
         uid, abs_start, spk, text = r.id, r.abs_start, r.speaker_name, r.text
     else:

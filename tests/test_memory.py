@@ -166,7 +166,7 @@ def test_norm_day():
 
 def test_tools_search_and_context(db, cfg):
     out = run_tool("search_transcripts", {"query": "项目进度"}, db, cfg)
-    assert "找到 2 条" in out and "张三" in out and "2026-10-30 08:19:10" in out
+    assert "找到 2 条" in out and "张三" in out and "2026-10-30 08:19" in out
     # json-string args + speaker/day filters
     out = run_tool("search_transcripts", json.dumps({"query": "预算", "speaker": "李四", "day_from": "2026-10-30"}), db, cfg)
     assert "找到 1 条" in out and "王总" in out
@@ -183,7 +183,7 @@ def test_tools_search_and_context(db, cfg):
 
 def test_tools_transcript_summary_days_speakers_notes(db, cfg):
     out = run_tool("get_transcript", {"day": "2026-10-30"}, db, cfg)
-    assert "共 3 条" in out and "08:19:10 张三" in out and "2026-10-30 09:05" not in out
+    assert "共 3 条" in out and "08:19 张三" in out and "2026-10-30 09:05" not in out
     out = run_tool("get_transcript", {"day": "2026-10-30", "hour_from": 9, "hour_to": 10}, db, cfg)
     assert "共 1 条" in out and "王总" in out
     assert "没有记录" in run_tool("get_transcript", {"day": "2026-10-30", "hour_from": 20}, db, cfg)

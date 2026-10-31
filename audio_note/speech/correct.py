@@ -31,7 +31,10 @@ log = logging.getLogger(__name__)
 MAX_EDIT_RATIO = 0.30
 """Drop all edits of an item once their summed edit distance exceeds this fraction of its length."""
 
-_DIGIT_RUN = re.compile(r"\d+")
+# ASCII digit runs, plus Chinese numeral runs of 2+ characters (五百, 二零零零, 三十五万): a correction must
+# never change a number, e.g. "五百不够" -> "全开不够" seen with a glossary containing 全开. Single numerals are
+# left alone because they are common in names and words (张三, 李四, 十分, 一下).
+_DIGIT_RUN = re.compile(r"\d+|[零〇一二两三四五六七八九十百千万亿]{2,}")
 
 
 # ---------------------------------------------------------------------------
@@ -57,7 +60,7 @@ def levenshtein(a: str, b: str) -> int:
 
 
 def digit_runs(s: str) -> list[str]:
-    """Sequence of ASCII digit runs in ``s`` (``"第3季度2024年"`` -> ``["3", "2024"]``)."""
+    """Sequence of numeral runs in ``s`` (``"第3季度2024年"`` -> ``["3", "2024"]``, ``"五百个"`` -> ``["五百"]``)."""
     return _DIGIT_RUN.findall(s)
 
 

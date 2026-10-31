@@ -76,7 +76,7 @@ def test_levenshtein():
 
 def test_digit_runs():
     assert digit_runs("第3季度2024年") == ["3", "2024"]
-    assert digit_runs("三十万") == []
+    assert digit_runs("三十万") == ["三十万"]  # Chinese numeral runs are protected too
 
 
 def test_apply_homophone_edit():
@@ -313,3 +313,16 @@ def test_corrector_disabled(cfg):
     out = Corrector(cfg, client).correct([{"i": 0, "speaker": "", "text": "在见"}], [])
     assert out == [{"i": 0, "text": "在见", "edits": []}]
     assert client.calls == []
+
+
+def test_chinese_numeral_change_is_dropped():
+    """Seen in practice: glossary term 全开 replaced the number 五百."""
+    from audio_note.speech.correct import apply_edits, digit_runs
+
+    assert digit_runs("五百不够，灰度二零零零人至少要撑到一千QPS") == ["五百", "二零零零", "一千"]
+    text = "五百不够，灰度二零零零人至少要撑到一千QPS。"
+    new, applied = apply_edits(text, [{"from": "五百", "to": "全开", "reason": "x"}])
+    assert new == text and applied == []
+    # a lone 一 inside ordinary words is not treated as a number, so this homophone fix still applies
+    new, applied = apply_edits("我们以下再说。", [{"from": "以下", "to": "一下", "reason": "同音"}])
+    assert new == "我们一下再说。" and len(applied) == 1
