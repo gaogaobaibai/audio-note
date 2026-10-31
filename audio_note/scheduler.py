@@ -179,11 +179,16 @@ class Scheduler:
     """
 
     def __init__(self, cfg: Config, db: DB, stop_event: threading.Event | None = None,
-                 jobs: dict[str, Callable] | None = None, tick_s: float = 5.0):
+                 jobs: dict[str, Callable] | None = None, tick_s: float = 5.0,
+                 engine_factory: Callable[[], Any] | None = None):
         self.cfg = cfg
         self.db = db
         self.stop_event = stop_event or threading.Event()
         self.tick_s = float(tick_s)
+        #: held while a tick or a manually triggered job runs, so the web UI's "process now" and the
+        #: periodic tick never work on the same segments at the same time
+        self.lock = threading.RLock()
+        self.engine_factory = engine_factory   # shared SpeakerEngine (the UI's label/relabel uses the same one)
         jobs = jobs or {}
         self.jobs: dict[str, Callable] = {
             "process": jobs.get("process") or self._default_process,
@@ -202,16 +207,53 @@ class Scheduler:
     def run(self) -> None:
         log.info("scheduler started: process every %s min, cleanup every %s min, daily at %s",
                  self.cfg.pipeline.process_interval_min, self.cfg.storage.cleanup_interval_min, self.cfg.analysis.daily_time)
-        while not self.stop_event.is_set():
+        # the loop owns the event it was started with: a later reset_stop_event() (service restarted in the
+        # same process while this tick was still finishing) must not revive this thread
+        stop_event = self.stop_event
+        while not stop_event.is_set():
             try:
                 self.run_once()
             except Exception as e:  # noqa: BLE001  (never let the loop die)
                 log.exception("scheduler tick failed: %s", e)
-            self.stop_event.wait(self.tick_s)
+            stop_event.wait(self.tick_s)
         log.info("scheduler stopped")
 
     def run_once(self, now: datetime | None = None) -> list[str]:
         """Run every job that is due at `now`. Returns the names of the jobs that ran."""
+        with self.lock:
+            return self._run_once(now)
+
+    def reset_stop_event(self, stop_event: threading.Event) -> None:
+        """Use a fresh stop event (the service was stopped and started again in the same process). The
+        cached Processor is dropped rather than re-pointed: a tick that is still finishing keeps the
+        processor whose stop event is set, the next tick builds a new one on the new event."""
+        self.stop_event = stop_event
+        self._processor = None
+
+    def reload_config(self, cfg: Config) -> None:
+        """Pick up an edited config: the cached Processor (and its MiMo client) is rebuilt on next use."""
+        self.cfg = cfg
+        self._processor = None
+        self._client_warned = False
+
+    def processor(self) -> Any | None:
+        """The shared speech Processor, built on first use; None while no MiMo API key is configured."""
+        if self._processor is None:
+            client = self._client()
+            if client is None:
+                return None
+            from .speech.pipeline import Processor
+
+            engine = None
+            if self.engine_factory is not None:
+                try:
+                    engine = self.engine_factory()
+                except Exception as e:  # noqa: BLE001 - the Processor builds its own when needed
+                    log.warning("shared speaker engine unavailable (%s); processor builds its own", e)
+            self._processor = Processor(self.cfg, self.db, client, engine=engine, stop_event=self.stop_event)
+        return self._processor
+
+    def _run_once(self, now: datetime | None = None) -> list[str]:
         now = now or datetime.now()
         ran: list[str] = []
         if is_due(self.db.get_kv(KV_PROCESS), float(self.cfg.pipeline.process_interval_min), now):
@@ -461,14 +503,9 @@ class Scheduler:
             return None
 
     def _default_process(self):
-        if self._processor is None:
-            client = self._client()
-            if client is None:
-                return "skipped (no api key)"
-            from .speech.pipeline import Processor
-
-            self._processor = Processor(self.cfg, self.db, client, stop_event=self.stop_event)
-        proc = self._processor
+        proc = self.processor()
+        if proc is None:
+            return "skipped (no api key)"
         for name in ("run", "run_once", "process_pending", "process_all"):
             fn = getattr(proc, name, None)
             if callable(fn):

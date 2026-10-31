@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import weakref
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
@@ -152,27 +153,73 @@ def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+class _ConnHolder:
+    """Owns one thread's connection. It lives in the DB's threading.local, so it is released (and the
+    connection closed) when its thread exits or the DB object itself is garbage collected; the DB
+    keeps only weak references to holders, which is what lets that happen."""
+
+    __slots__ = ("conn", "closed", "__weakref__")
+
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
+        self.closed = False
+
+    def close(self) -> bool:
+        if self.closed:
+            return False
+        self.closed = True
+        try:
+            self.conn.close()
+        except sqlite3.Error:
+            pass
+        return True
+
+    def __del__(self) -> None:   # pragma: no cover - timing depends on the GC
+        self.close()
+
+
 class DB:
-    """Thin wrapper; one connection per thread, autocommit unless inside transaction()."""
+    """Thin wrapper; one connection per thread, autocommit unless inside transaction().
+    Connections are closed when their thread ends, when the DB object is collected, or by close_all()."""
 
     def __init__(self, path: Path | str):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
+        self._holders: list[weakref.ref[_ConnHolder]] = []    # weak: a dead thread's holder may be collected
+        self._conns_lock = threading.Lock()
         c = self.conn()
         c.execute("PRAGMA journal_mode=WAL")
         c.execute("PRAGMA synchronous=NORMAL")
         c.executescript(SCHEMA)
 
     def conn(self) -> sqlite3.Connection:
-        c = getattr(self._local, "conn", None)
-        if c is None:
+        h: _ConnHolder | None = getattr(self._local, "holder", None)
+        if h is None:
             c = sqlite3.connect(self.path, timeout=30, isolation_level=None, check_same_thread=False)
             c.row_factory = sqlite3.Row
             c.execute("PRAGMA foreign_keys=ON")
             self._load_vec(c)
-            self._local.conn = c
-        return c
+            h = _ConnHolder(c)
+            self._local.holder = h
+            with self._conns_lock:
+                self._holders = [r for r in self._holders if r() is not None]
+                self._holders.append(weakref.ref(h))
+        return h.conn
+
+    def open_connections(self) -> int:
+        """Connections currently open on any thread (for diagnostics / tests)."""
+        with self._conns_lock:
+            return sum(1 for r in self._holders if (h := r()) is not None and not h.closed)
+
+    def close_all(self) -> int:
+        """Close every connection this DB object opened, on any thread (sqlite allows it because the
+        connections are created with check_same_thread=False). Used when a Runtime is discarded (profile
+        switch): Windows refuses to delete or move a database whose file is still open somewhere.
+        Returns the number of connections closed. Further use of this DB object raises ProgrammingError."""
+        with self._conns_lock:
+            holders, self._holders = [h for r in self._holders if (h := r()) is not None], []
+        return sum(1 for h in holders if h.close())
 
     #: True once the sqlite-vec extension loaded on this process (vector search in SQL); None = untried
     vec_available: bool | None = None

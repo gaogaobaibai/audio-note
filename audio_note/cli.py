@@ -37,7 +37,8 @@ import numpy as np
 from rich.console import Console
 from rich.table import Table
 
-from .config import PROJECT_ROOT, Config, find_config_path, load_config
+from .config import (DEFAULT_PROFILE, PROJECT_ROOT, Config, create_profile, delete_profile,
+                     list_profiles, load_config, profile_config_path, set_current_profile)
 from .db import DB
 
 log = logging.getLogger(__name__)
@@ -365,7 +366,142 @@ def cmd_record(cfg: Config, args: argparse.Namespace) -> int:
 def cmd_run(cfg: Config, args: argparse.Namespace) -> int:
     from .service import run_service
 
-    return run_service(cfg, tray=bool(args.tray))
+    if args.port:
+        cfg["ui"]["port"] = int(args.port)
+    return run_service(cfg, tray=bool(args.tray), ui=False if args.no_ui else None, open_browser=True if args.open else None)
+
+
+def cmd_ui(cfg: Config, args: argparse.Namespace) -> int:
+    """Web UI without recording (recording can be started from the page). When another process already
+    runs the service, the page works read-only (browse + chat)."""
+    from .runtime import Runtime, RuntimeHolder, profile_label
+    from .service import AlreadyRunning, _install_signal_handlers, start_ui
+
+    if args.port:
+        cfg["ui"]["port"] = int(args.port)
+    rt = Runtime(cfg)
+    try:
+        rt.start_service(record=bool(args.record))
+    except AlreadyRunning as e:
+        console.print(f"[yellow]{e}[/yellow]\n界面以只读模式启动：可以看记录和问答，录音和处理请在那个进程的界面操作。")
+    holder = RuntimeHolder(rt)
+    srv = start_ui(holder, open_browser=not args.no_browser)
+    if srv is None:
+        rt.shutdown()
+        raise CLIError("界面启动失败（端口被占用？看上面的日志）")
+    console.print(f"界面地址 [bold]{srv.url}[/bold]  档案：{profile_label(rt.profile)}"
+                  f"  （Ctrl+C 退出{'' if args.record else '；录音可在页面上开始'}）")
+    stop = threading.Event()
+    _install_signal_handlers(stop)
+    try:
+        while not stop.is_set():
+            stop.wait(0.5)
+    except KeyboardInterrupt:
+        console.print("\n正在停止…")
+    srv.stop()
+    holder.rt.shutdown()
+    return 0
+
+
+def cmd_profile_list(cfg: Config, args: argparse.Namespace) -> int:
+    from .runtime import profile_label
+
+    cur = cfg.get("_profile")
+    t = Table(title="档案（每个档案有自己的录音、记录、说话人；API key 等共享设置放根目录 config.yaml）")
+    for col in ("", "档案", "数据目录", "记录"):
+        t.add_column(col)
+    for name in list_profiles():
+        try:
+            c = load_config(profile=name)
+            n = _profile_counts(c)
+            info = f"{n['utterances']} 条 / {n['days']} 天" if n else "（还没有数据）"
+            data_dir = str(c.data_dir)
+        except Exception as e:  # noqa: BLE001
+            info, data_dir = f"[red]{e}[/red]", "?"
+        t.add_row("●" if name == cur else "", profile_label(name), data_dir, info)
+    console.print(t)
+    if cur is None:
+        console.print(f"当前使用的是自定义配置 {cfg.get('_config_path')}（--config / AUDIO_NOTE_CONFIG），不属于任何档案。")
+    else:
+        console.print("● = 当前档案。切换：audio-note profile use <名字>；一次性：audio-note --profile <名字> <命令>")
+    return 0
+
+
+def _profile_counts(c: Config) -> dict[str, int] | None:
+    """Row counts of a profile's database without creating it (None when the db does not exist)."""
+    import sqlite3
+
+    if not c.db_path.exists():
+        return None
+    con = sqlite3.connect(f"file:{c.db_path.as_posix()}?mode=ro", uri=True, timeout=5)
+    try:
+        row = con.execute("SELECT COUNT(*), COUNT(DISTINCT day), MAX(day) FROM utterances").fetchone()
+        spk = con.execute("SELECT COUNT(*) FROM speakers").fetchone()
+        return {"utterances": int(row[0] or 0), "days": int(row[1] or 0), "speakers": int(spk[0] or 0), "last_day": row[2]}
+    except sqlite3.Error:
+        return None
+    finally:
+        con.close()
+
+
+def cmd_profile_create(cfg: Config, args: argparse.Namespace) -> int:
+    src = None
+    if args.copy_from:
+        src = profile_config_path(args.copy_from)
+        if not src.exists():
+            raise CLIError(f"档案不存在: {args.copy_from}")
+    try:
+        path = create_profile(args.name, copy_from=src)
+    except (ValueError, FileExistsError, OSError) as e:
+        raise CLIError(str(e)) from e
+    console.print(f"已创建档案 [bold]{args.name}[/bold]：{path}")
+    if args.use:
+        set_current_profile(args.name)
+        console.print(f"已切换到 {args.name}。")
+    else:
+        console.print(f"切换：audio-note profile use {args.name}")
+    return 0
+
+
+def cmd_profile_use(cfg: Config, args: argparse.Namespace) -> int:
+    try:
+        set_current_profile(args.name)
+    except ValueError as e:
+        raise CLIError(str(e)) from e
+    c = load_config(profile=args.name)
+    console.print(f"当前档案：[bold]{args.name}[/bold]（数据目录 {c.data_dir}）。正在运行的服务 / 界面需要重启或在页面上切换。")
+    return 0
+
+
+def cmd_profile_delete(cfg: Config, args: argparse.Namespace) -> int:
+    from .service import running_pid
+
+    if args.name == DEFAULT_PROFILE:
+        raise CLIError("默认档案不能删除")
+    try:
+        c = load_config(profile=args.name)
+    except FileNotFoundError as e:
+        raise CLIError(str(e)) from e
+    pid = running_pid(c)
+    if pid:
+        raise CLIError(f"档案 {args.name} 的服务正在运行 (pid {pid})，先停止再删除")
+    if not args.yes:
+        n = _profile_counts(c)
+        console.print(f"将删除档案 [bold]{args.name}[/bold] 的全部数据：{c.data_dir}"
+                      + (f"（{n['utterances']} 条记录 / {n['days']} 天 / {n['speakers']} 个说话人）" if n else ""))
+        try:
+            ans = console.input("确认请输入档案名: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            ans = ""
+        if ans != args.name:
+            console.print("已取消。")
+            return 1
+    try:
+        delete_profile(args.name)
+    except (ValueError, FileNotFoundError, OSError) as e:
+        raise CLIError(str(e)) from e
+    console.print(f"已删除档案 {args.name}。")
+    return 0
 
 
 def cmd_status(cfg: Config, args: argparse.Namespace) -> int:
@@ -378,6 +514,9 @@ def cmd_status(cfg: Config, args: argparse.Namespace) -> int:
     t = Table(title="audio-note 状态", show_header=False)
     t.add_column("项")
     t.add_column("值")
+    from .runtime import profile_label
+
+    t.add_row("档案", profile_label(cfg.get("_profile")))
     t.add_row("配置文件", str(cfg.get("_config_path", "")))
     t.add_row("数据目录", str(cfg.data_dir))
     pid = running_pid(cfg)
@@ -811,7 +950,8 @@ def cmd_cleanup(cfg: Config, args: argparse.Namespace) -> int:
 
 
 def cmd_init(cfg: Config, args: argparse.Namespace) -> int:
-    path = find_config_path(args.config)
+    """Create the root config.yaml (the file every profile inherits from) unless --config names another."""
+    path = Path(args.config) if args.config else PROJECT_ROOT / "config.yaml"
     if path.exists():
         console.print(f"配置文件已存在: {path}（不覆盖）")
     else:
@@ -859,15 +999,24 @@ def cmd_init(cfg: Config, args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="audio-note", description="全天无感录音 → 说话人识别 → MiMo 转写 → 日报与记忆问答")
     p.add_argument("--config", metavar="PATH", help="config.yaml 路径（默认 $AUDIO_NOTE_CONFIG 或项目根目录 config.yaml）")
+    p.add_argument("--profile", metavar="NAME", help="用某个档案（profiles/<NAME>/）运行这一条命令；默认用 profile use 选的档案")
     p.add_argument("--verbose", "-v", action="store_true", help="DEBUG 日志")
     sub = p.add_subparsers(dest="cmd", metavar="<cmd>")
     sub.required = True
 
     sub.add_parser("devices", help="列出音频输入设备").set_defaults(func=cmd_devices)
     sub.add_parser("record", help="只录音（VAD 门控，只存语音段）").set_defaults(func=cmd_record)
-    s = sub.add_parser("run", help="常驻服务：录音 + 定时处理/清理/日报")
+    s = sub.add_parser("run", help="常驻服务：录音 + 定时处理/清理/日报 + 网页界面")
     s.add_argument("--tray", action="store_true", help="显示系统托盘图标")
+    s.add_argument("--no-ui", action="store_true", help="不提供网页界面")
+    s.add_argument("--open", action="store_true", help="启动后在浏览器打开界面")
+    s.add_argument("--port", type=int, default=None, help="界面端口（默认 ui.port = 8765）")
     s.set_defaults(func=cmd_run)
+    s = sub.add_parser("ui", help="打开网页界面（不自动录音；录音可在页面上开始）")
+    s.add_argument("--record", action="store_true", help="启动时就开始录音（等于 run --open）")
+    s.add_argument("--port", type=int, default=None, help="界面端口（默认 ui.port = 8765）")
+    s.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
+    s.set_defaults(func=cmd_ui)
     sub.add_parser("status", help="状态总览").set_defaults(func=cmd_status)
 
     s = sub.add_parser("import", help="导入已有录音文件")
@@ -935,6 +1084,22 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_reindex)
 
     sub.add_parser("cleanup", help="清理无语音/过期音频").set_defaults(func=cmd_cleanup)
+    pp = sub.add_parser("profile", help="档案：给不同的人 / 用途分开的录音、记录和说话人")
+    psub = pp.add_subparsers(dest="profile_cmd", metavar="<sub>")
+    psub.required = True
+    psub.add_parser("list", help="列出档案").set_defaults(func=cmd_profile_list)
+    s = psub.add_parser("create", help="新建档案（profiles/<名字>/，API key 等从根目录 config.yaml 继承）")
+    s.add_argument("name")
+    s.add_argument("--copy-from", default=None, metavar="NAME", help="复制某个档案的设置")
+    s.add_argument("--use", action="store_true", help="创建后立即切换过去")
+    s.set_defaults(func=cmd_profile_create)
+    s = psub.add_parser("use", help="切换当前档案（之后的命令和界面都用它）")
+    s.add_argument("name")
+    s.set_defaults(func=cmd_profile_use)
+    s = psub.add_parser("delete", help="删除档案及其全部数据")
+    s.add_argument("name")
+    s.add_argument("--yes", "-y", action="store_true", help="不询问")
+    s.set_defaults(func=cmd_profile_delete)
     sub.add_parser("init", help="生成 config.yaml 并检查模型文件").set_defaults(func=cmd_init)
     return p
 
@@ -955,7 +1120,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        cfg = load_config(args.config)
+        cfg = load_config(args.config, profile=args.profile)
     except Exception as e:  # noqa: BLE001
         console.print(f"[red]读取配置失败[/red]: {e}")
         return 2

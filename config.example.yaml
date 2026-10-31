@@ -86,6 +86,7 @@ analysis:
   push_daily: true               # 分析完成后是否推送
   session_gap_min: 20            # 两句话间隔超过此分钟数即视为新的一段对话（session）
   max_block_chars: 6000          # 每次 map 总结请求的最大字符数
+  catchup_days: 7                # 服务停了几天后，最多补生成几天的日报
 
 push:
   channels: [toast]              # 启用的推送渠道列表，可多选：toast, feishu, wecom, serverchan, pushplus, wxpusher, ntfy
@@ -105,6 +106,12 @@ push:
   ntfy:
     topic: ""                    # ntfy 主题名（任何人知道主题名即可订阅，建议用随机字符串）
     server: https://ntfy.sh      # ntfy 服务器地址（可自建）
+
+ui:
+  enabled: true                  # `audio-note run` 时一并提供网页界面（`audio-note ui` 总是提供）
+  host: 127.0.0.1                # 只监听本机；界面没有登录，不要改成 0.0.0.0 暴露到局域网
+  port: 8765                     # 浏览器打开 http://127.0.0.1:8765
+  open_browser: false            # `audio-note run` 启动时自动打开浏览器（`audio-note ui` 默认会打开）
 
 log:
   level: INFO                    # 日志级别：DEBUG | INFO | WARNING | ERROR

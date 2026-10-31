@@ -1,0 +1,1096 @@
+"""HTTP API + static files for the local web UI.
+
+    app = create_app(runtime)          # runtime: audio_note.runtime.Runtime
+
+Everything is JSON under /api; the single-page app in ui/static is served at /. The API is local
+only (no auth): ui.host must stay 127.0.0.1.
+
+Endpoints (see the handlers for parameters)
+  status / service        GET /api/status   POST /api/recording/{start,stop}   POST /api/service/{start,stop}
+  jobs                    GET /api/jobs     POST /api/jobs/{name}   (process, daily, cleanup, reindex, relabel, push)
+  transcripts             GET /api/days  /api/transcript/{day}  /api/search  /api/context/{id}  /api/segments
+  audio                   GET /api/audio/utterance/{id}  /api/audio/segment/{id}?from=&to=
+  daily digests / notes   GET /api/daily  /api/daily/{day}   GET,DELETE /api/notes
+  speakers                GET /api/speakers  POST /api/speakers/{name}/samples  POST /api/speakers/label
+                          PATCH,DELETE /api/speakers/{id}  DELETE /api/speakers/samples/{id}  POST /api/speakers/calibrate
+  memory chat             POST /api/chat   (NDJSON stream: tool / answer / error / ping events)
+  settings                GET,PUT /api/config   GET,PUT /api/glossary   GET /api/devices   POST /api/config/test-api
+                          POST /api/push/test   GET /api/logs   POST /api/import
+"""
+from __future__ import annotations
+
+import copy
+import io
+import json
+import logging
+import os
+import queue
+import re
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from fastapi import Body, FastAPI, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+
+from ..config import (DEFAULT_PROFILE, DEFAULTS, canonical_profile_name, create_profile, delete_profile, is_placeholder_key,
+                      list_profiles, load_config, profile_config_path, profile_exists, valid_profile_name)
+from ..runtime import JOBS, JobError, ReadOnly, Runtime, RuntimeHolder, profile_label
+from ..service import AlreadyRunning
+from . import yaml_edit
+
+log = logging.getLogger(__name__)
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+#: config sections / keys the settings page may change (anything else is rejected)
+EDITABLE: dict[str, set[str]] = {
+    "mimo": {"api_key", "base_url", "chat_model", "analysis_model", "asr_model", "asr_language", "asr_concurrency"},
+    "audio": {"device", "vad_threshold", "min_silence_s", "min_speech_s", "max_segment_s", "gain", "codec"},
+    "storage": {"cleanup_enabled", "keep_audio_days", "max_disk_gb"},
+    "speakers": {"identify_threshold", "cluster_threshold", "unknown_label", "num_threads"},
+    "correction": {"enabled"},
+    "pipeline": {"process_interval_min", "min_segment_age_s"},
+    "memory": {"strategy", "retrieval", "query_expansion", "prefetch_k", "chat_model", "max_tool_rounds", "embedding_model"},
+    "analysis": {"daily_time", "push_daily", "session_gap_min", "catchup_days"},
+    "push": {"channels", "feishu", "wecom", "serverchan", "pushplus", "wxpusher", "ntfy"},
+    "ui": {"port", "open_browser"},
+    "log": {"level"},
+}
+SECRET_KEYS = {("mimo", "api_key"), ("push", "feishu", "webhook"), ("push", "feishu", "secret"), ("push", "wecom", "webhook"),
+               ("push", "serverchan", "sendkey"), ("push", "pushplus", "token"), ("push", "wxpusher", "spt"),
+               ("push", "wxpusher", "app_token")}
+
+
+_CHOICES: dict[tuple[str, ...], tuple[str, ...]] = {
+    ("mimo", "asr_language"): ("auto", "zh", "en"),
+    ("audio", "codec"): ("opus", "flac", "wav"),
+    ("memory", "strategy"): ("agentic", "prefetch", "rag"),
+    ("memory", "retrieval"): ("fts", "vector", "hybrid"),
+    ("log", "level"): ("DEBUG", "INFO", "WARNING", "ERROR"),
+}
+_RANGES: dict[tuple[str, ...], tuple[float, float]] = {
+    ("audio", "vad_threshold"): (0.0, 1.0), ("audio", "min_silence_s"): (0.2, 60.0), ("audio", "min_speech_s"): (0.0, 10.0),
+    ("audio", "max_segment_s"): (10.0, 3600.0), ("audio", "gain"): (0.05, 50.0),
+    ("storage", "keep_audio_days"): (0, 100000), ("storage", "max_disk_gb"): (0, 100000),
+    ("speakers", "identify_threshold"): (0.0, 1.0), ("speakers", "cluster_threshold"): (0.0, 1.0), ("speakers", "num_threads"): (1, 64),
+    ("pipeline", "process_interval_min"): (1, 1440), ("pipeline", "min_segment_age_s"): (0, 3600),
+    ("mimo", "asr_concurrency"): (1, 32), ("memory", "prefetch_k"): (1, 100), ("memory", "max_tool_rounds"): (0, 50),
+    ("analysis", "session_gap_min"): (1, 1440), ("analysis", "catchup_days"): (1, 365), ("ui", "port"): (1024, 65535),
+}
+_PUSH_CHANNELS = ("toast", "feishu", "wecom", "serverchan", "pushplus", "wxpusher", "ntfy")
+
+
+def _default_for(path: tuple[str, ...]) -> Any:
+    node: Any = DEFAULTS
+    for k in path:
+        if not isinstance(node, dict) or k not in node:
+            return _NO_DEFAULT
+        node = node[k]
+    return node
+
+
+_NO_DEFAULT = object()
+
+
+def coerce_setting(path: tuple[str, ...], value: Any) -> Any:
+    """Validate / coerce one config leaf against the type of its DEFAULTS entry (form values arrive as
+    strings or JSON scalars). Raises HTTPException(400) with a readable message."""
+    dotted = ".".join(path)
+    default = _default_for(path)
+    if default is _NO_DEFAULT:
+        raise HTTPException(400, f"不允许修改 {dotted}")
+    if isinstance(default, dict):
+        raise HTTPException(400, f"{dotted} 是一组设置，不能整个替换")
+    if path == ("push", "channels"):
+        if isinstance(value, str):
+            value = [v.strip() for v in value.replace("，", ",").split(",") if v.strip()]
+        if not isinstance(value, list) or any(not isinstance(v, str) for v in value):
+            raise HTTPException(400, "push.channels 必须是渠道名列表")
+        bad = [v for v in value if v not in _PUSH_CHANNELS]
+        if bad:
+            raise HTTPException(400, f"未知推送渠道: {', '.join(bad)}（可选 {', '.join(_PUSH_CHANNELS)}）")
+        return list(dict.fromkeys(value))
+    if isinstance(default, list):
+        if isinstance(value, str):
+            value = [v.strip() for v in value.replace("，", ",").split(",") if v.strip()]
+        if not isinstance(value, list):
+            raise HTTPException(400, f"{dotted} 必须是列表")
+        return [str(v) for v in value]
+    if path == ("audio", "device"):
+        if value is None or value == "":
+            return None
+        if isinstance(value, bool) or isinstance(value, (dict, list)):
+            raise HTTPException(400, "audio.device 应为设备序号或名称")
+        if isinstance(value, int) or (isinstance(value, str) and value.strip().isdigit()):
+            return int(value)
+        return str(value)
+    if isinstance(default, bool):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str) and value.strip().lower() in ("true", "false", "1", "0", "yes", "no", "on", "off"):
+            return value.strip().lower() in ("true", "1", "yes", "on")
+        raise HTTPException(400, f"{dotted} 应为 true/false")
+    if isinstance(default, int) and not isinstance(default, bool):
+        if isinstance(value, bool) or isinstance(value, (dict, list)):
+            raise HTTPException(400, f"{dotted} 应为整数")
+        try:
+            iv = int(float(value)) if not isinstance(value, int) else value
+        except (TypeError, ValueError):
+            raise HTTPException(400, f"{dotted} 应为整数")
+        if isinstance(value, float) and abs(value - iv) > 1e-9:
+            raise HTTPException(400, f"{dotted} 应为整数")
+        value = iv
+    elif isinstance(default, float):
+        if isinstance(value, bool) or isinstance(value, (dict, list)):
+            raise HTTPException(400, f"{dotted} 应为数字")
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            raise HTTPException(400, f"{dotted} 应为数字")
+    elif isinstance(default, str) or default is None:
+        if value is None and default is None:
+            return None
+        if isinstance(value, (dict, list, bool)):
+            raise HTTPException(400, f"{dotted} 应为文本")
+        value = str(value).strip() if not isinstance(value, str) else value.strip()
+        if path in _CHOICES and value not in _CHOICES[path]:
+            raise HTTPException(400, f"{dotted} 只能是 {' / '.join(_CHOICES[path])}")
+        if path in (("mimo", "base_url"), ("push", "ntfy", "server")) and value and not value.startswith(("http://", "https://")):
+            raise HTTPException(400, f"{dotted} 应以 http:// 或 https:// 开头")
+        return value
+    if path in _RANGES:
+        lo, hi = _RANGES[path]
+        if not (lo <= value <= hi):
+            raise HTTPException(400, f"{dotted} 应在 {lo:g}–{hi:g} 之间")
+    return value
+
+
+def _effective(cfg: Any, path: tuple[str, ...]) -> Any:
+    node: Any = cfg
+    for k in path:
+        if not isinstance(node, dict) or k not in node:
+            return _NO_DEFAULT
+        node = node[k]
+    return node
+
+
+def _day(s: str) -> str:
+    if not DAY_RE.match(s or ""):
+        raise HTTPException(400, f"日期格式应为 YYYY-MM-DD: {s!r}")
+    return s
+
+
+def _err(status: int, msg: str) -> JSONResponse:
+    return JSONResponse({"error": msg}, status_code=status)
+
+
+def _hint(secret: str | None) -> str:
+    s = str(secret or "")
+    if not s:
+        return ""
+    return s[:3] + "…" + s[-4:] if len(s) > 10 else "…" + s[-2:]
+
+
+def _utt_dict(r: Any, unknown: str, audio_ok: bool | None = None) -> dict[str, Any]:
+    text = r["text"] or ""
+    raw = r["text_raw"] or ""
+    d = {
+        "id": int(r["id"]), "segment_id": int(r["segment_id"]), "day": r["day"], "abs_start": r["abs_start"],
+        "time": (r["abs_start"] or "")[11:19], "start_s": float(r["start_s"]), "end_s": float(r["end_s"]),
+        "speaker": r["speaker_name"] or unknown, "speaker_id": r["speaker_id"],
+        "score": round(float(r["speaker_score"]), 3) if r["speaker_score"] is not None else None,
+        "text": text, "cluster": r["cluster_label"],
+    }
+    if raw and raw != text:
+        d["text_raw"] = raw
+    if audio_ok is not None:
+        d["audio"] = audio_ok
+    return d
+
+
+def _wav_bytes(audio: Any) -> bytes:
+    import numpy as np
+    import soundfile as sf
+
+    from ..audio.vad import SAMPLE_RATE
+
+    buf = io.BytesIO()
+    sf.write(buf, np.asarray(audio, dtype=np.float32), SAMPLE_RATE, format="WAV", subtype="PCM_16")
+    return buf.getvalue()
+
+
+class _RuntimeProxy:
+    """Every handler reads `rt.<attr>` through this proxy, so a profile switch (holder.rt replaced)
+    is picked up by the next request without rebuilding the app."""
+
+    def __init__(self, holder: RuntimeHolder):
+        object.__setattr__(self, "_holder", holder)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._holder.rt, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(self._holder.rt, name, value)
+
+
+def _profile_counts(cfg: Any) -> dict[str, Any] | None:
+    """Row counts of a profile's database read-only (None when it has no database yet)."""
+    import sqlite3
+
+    if not cfg.db_path.exists():
+        return None
+    try:
+        con = sqlite3.connect(f"file:{cfg.db_path.as_posix()}?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error:
+        return None
+    try:
+        row = con.execute("SELECT COUNT(*), COUNT(DISTINCT day), MAX(day) FROM utterances").fetchone()
+        spk = con.execute("SELECT COUNT(*) FROM speakers").fetchone()
+        return {"utterances": int(row[0] or 0), "days": int(row[1] or 0), "last_day": row[2], "speakers": int(spk[0] or 0)}
+    except sqlite3.Error:
+        return None
+    finally:
+        con.close()
+
+
+def create_app(rt_or_holder: Runtime | RuntimeHolder) -> FastAPI:
+    app = FastAPI(title="audio-note", docs_url=None, redoc_url=None, openapi_url=None)
+    holder = rt_or_holder if isinstance(rt_or_holder, RuntimeHolder) else RuntimeHolder(rt_or_holder)
+    app.state.holder = holder
+    rt: Any = _RuntimeProxy(holder)
+    unknown = lambda: str(rt.cfg.speakers.unknown_label or "未知")  # noqa: E731
+
+    @app.exception_handler(JobError)
+    async def _job_error(request: Request, exc: JobError):
+        return _err(409, str(exc))
+
+    @app.exception_handler(ReadOnly)
+    async def _read_only(request: Request, exc: ReadOnly):
+        return _err(409, str(exc))
+
+    @app.exception_handler(AlreadyRunning)
+    async def _already(request: Request, exc: AlreadyRunning):
+        return _err(409, str(exc))
+
+    @app.exception_handler(HTTPException)
+    async def _http_error(request: Request, exc: HTTPException):
+        return _err(exc.status_code, str(exc.detail))
+
+    @app.exception_handler(Exception)
+    async def _any_error(request: Request, exc: Exception):
+        log.exception("api %s %s failed: %s", request.method, request.url.path, exc)
+        return _err(500, f"{type(exc).__name__}: {exc}")
+
+    # ------------------------------------------------------------------ status / service
+    @app.get("/api/status")
+    def status() -> dict[str, Any]:
+        return rt.status()
+
+    @app.post("/api/recording/start")
+    def recording_start() -> dict[str, Any]:
+        if rt.status()["models_missing"]:
+            raise HTTPException(400, "模型文件缺失，无法录音（运行 scripts/download_models.ps1）")
+        if not rt.service_running():
+            rt.start_service(record=True)
+        else:
+            rt.start_recording()
+        time.sleep(0.3)   # let the thread hit the mic so a device error shows up in this response
+        st = rt.status()["service"]
+        return {"ok": True, "recording": st["recording"], "last_error": st["last_error"]}
+
+    @app.post("/api/recording/stop")
+    def recording_stop() -> dict[str, Any]:
+        rt.stop_recording()
+        return {"ok": True, "recording": rt.recording()}
+
+    @app.post("/api/service/start")
+    def service_start(body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+        rt.start_service(record=bool(body.get("record", False)))
+        return {"ok": True, "service": rt.status()["service"]}
+
+    @app.post("/api/service/stop")
+    def service_stop() -> dict[str, Any]:
+        rt.stop_service()
+        return {"ok": True, "service": rt.status()["service"]}
+
+    # ------------------------------------------------------------------ profiles
+    def _profile_info(name: str) -> dict[str, Any]:
+        d: dict[str, Any] = {"name": name, "label": profile_label(name), "current": rt.profile == name,
+                             "config_path": str(profile_config_path(name)), "default": name == DEFAULT_PROFILE}
+        try:
+            cfg = load_config(profile=name)
+            d["data_dir"] = str(cfg.data_dir)
+            d["stats"] = _profile_counts(cfg)
+            from ..service import running_pid
+
+            pid = running_pid(cfg)
+            d["running_pid"] = pid if pid and pid != os.getpid() else None
+        except Exception as e:  # noqa: BLE001
+            d["error"] = str(e)
+        return d
+
+    @app.get("/api/profiles")
+    def profiles_list() -> dict[str, Any]:
+        return {"current": rt.profile, "current_label": profile_label(rt.profile),
+                "custom_config": str(rt.config_path) if rt.profile is None else None,
+                "profiles": [_profile_info(n) for n in list_profiles()]}
+
+    @app.post("/api/profiles")
+    def profiles_create(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        name = str(body.get("name") or "").strip()
+        if not valid_profile_name(name):
+            raise HTTPException(400, "档案名只能用中英文、数字、下划线、短横线（1–32 字），且不能叫 default / current")
+        src = None
+        copy_from = body.get("copy_from")
+        if copy_from:
+            if not profile_exists(str(copy_from)):
+                raise HTTPException(404, f"档案不存在: {copy_from}")
+            src = profile_config_path(str(copy_from))
+        try:
+            path = create_profile(name, copy_from=src)
+        except FileExistsError as e:
+            raise HTTPException(409, str(e))
+        except (ValueError, OSError) as e:
+            raise HTTPException(400, str(e))
+        out: dict[str, Any] = {"ok": True, "name": name, "config_path": str(path)}
+        if body.get("switch"):
+            holder.switch(name)
+            out["switched"] = True
+        return out
+
+    @app.post("/api/profiles/{name}/switch")
+    def profiles_switch(name: str) -> dict[str, Any]:
+        name = canonical_profile_name(name) or name
+        if not profile_exists(name):
+            raise HTTPException(404, f"档案不存在: {name}")
+        try:
+            holder.switch(name)          # JobError (a job is running) -> 409 via the handler above
+        except FileNotFoundError as e:
+            raise HTTPException(404, str(e))
+        except OSError as e:
+            raise HTTPException(500, f"无法打开档案 {name}：{e}")
+        st = rt.status()
+        return {"ok": True, "profile": st["profile"], "service": st["service"]}
+
+    @app.delete("/api/profiles/{name}")
+    def profiles_delete(name: str, body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+        name = canonical_profile_name(name) or name
+        if name == DEFAULT_PROFILE:
+            raise HTTPException(400, "默认档案不能删除")
+        if not profile_exists(name):
+            raise HTTPException(404, f"档案不存在: {name}")
+        if rt.profile == name:
+            raise HTTPException(409, "不能删除正在使用的档案，先切换到别的档案")
+        if str(body.get("confirm") or "") != name:
+            raise HTTPException(400, "需要在 confirm 里重复档案名以确认删除")
+        info = _profile_info(name)
+        if info.get("running_pid"):
+            raise HTTPException(409, f"这个档案的服务正在另一个进程运行 (pid {info['running_pid']})，先停止它")
+        try:
+            delete_profile(name)
+        except (ValueError, FileNotFoundError) as e:
+            raise HTTPException(400, str(e))
+        except OSError as e:          # ProfileInUse: nothing was deleted
+            raise HTTPException(409, str(e))
+        return {"ok": True, "deleted": name}
+
+    # ------------------------------------------------------------------ jobs
+    @app.get("/api/jobs")
+    def jobs() -> dict[str, Any]:
+        return {n: j.as_dict() for n, j in rt.jobs.items()}
+
+    @app.post("/api/jobs/{name}")
+    def job_start(name: str, body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+        if name not in JOBS:
+            raise HTTPException(404, f"未知任务 {name}")
+        kwargs: dict[str, Any] = {}
+        if name == "process":
+            kwargs = {"retry_failed": bool(body.get("retry_failed", False)), "limit": body.get("limit")}
+        elif name == "daily":
+            kwargs = {"day": _day(body.get("day") or datetime.now().strftime("%Y-%m-%d")),
+                      "force": bool(body.get("force", False)), "push": bool(body.get("push", False))}
+        elif name == "push":
+            kwargs = {"day": _day(body.get("day") or "")}
+        elif name == "relabel":
+            kwargs = {"day": _day(body["day"]) if body.get("day") else None, "segment_id": body.get("segment_id")}
+        elif name == "reindex":
+            kwargs = {"vectors": bool(body.get("vectors", True))}
+        st = rt.submit(name, **kwargs)
+        return {"ok": True, "job": st.as_dict()}
+
+    # ------------------------------------------------------------------ transcripts
+    @app.get("/api/days")
+    def days() -> list[dict[str, Any]]:
+        db = rt.db
+        out: dict[str, dict[str, Any]] = {}
+        for r in db.query("SELECT day, COUNT(*) AS n, MIN(abs_start) AS first, MAX(abs_start) AS last,"
+                          " COALESCE(SUM(end_s-start_s),0) AS speech FROM utterances GROUP BY day"):
+            out[r["day"]] = {"day": r["day"], "utterances": int(r["n"]), "first": (r["first"] or "")[11:16],
+                             "last": (r["last"] or "")[11:16], "speech_min": round(float(r["speech"]) / 60.0, 1),
+                             "segments": 0, "pending": 0, "failed": 0, "daily": None, "speakers": []}
+        for r in db.query("SELECT substr(started_at,1,10) AS d, status, COUNT(*) AS n FROM segments"
+                          " WHERE status != 'deleted' GROUP BY d, status"):
+            d = out.setdefault(r["d"], {"day": r["d"], "utterances": 0, "first": "", "last": "", "speech_min": 0.0,
+                                        "segments": 0, "pending": 0, "failed": 0, "daily": None, "speakers": []})
+            d["segments"] += int(r["n"])
+            if r["status"] in ("new", "processing"):
+                d["pending"] += int(r["n"])
+            elif r["status"] == "failed":
+                d["failed"] += int(r["n"])
+        for r in db.query("SELECT day, created_at, pushed_at, utterance_count FROM daily_summaries"):
+            if r["day"] in out:
+                out[r["day"]]["daily"] = {"created_at": r["created_at"], "pushed_at": r["pushed_at"],
+                                          "utterance_count": r["utterance_count"]}
+        for r in db.query("SELECT day, speaker_name, COUNT(*) AS n FROM utterances GROUP BY day, speaker_name ORDER BY n DESC"):
+            if r["day"] in out:
+                out[r["day"]]["speakers"].append({"name": r["speaker_name"] or unknown(), "n": int(r["n"])})
+        return sorted(out.values(), key=lambda d: d["day"], reverse=True)
+
+    @app.get("/api/transcript/{day}")
+    def transcript(day: str, speaker: str | None = None) -> dict[str, Any]:
+        from ..analysis.daily import DailyAnalyzer
+
+        _day(day)
+        db = rt.db
+        unk = unknown()
+        sessions = DailyAnalyzer(rt.cfg, db, None).sessions(day)
+        seg_ok: dict[int, bool] = {}
+
+        def audio_ok(seg_id: int) -> bool:
+            if seg_id not in seg_ok:
+                row = db.get_segment(seg_id)
+                seg_ok[seg_id] = bool(row and Path(row["path"]).exists())
+            return seg_ok[seg_id]
+
+        out_sessions = []
+        for i, rows in enumerate(sessions, start=1):
+            if speaker:
+                rows = [r for r in rows if (r["speaker_name"] or unk) == speaker]
+                if not rows:
+                    continue
+            utts = [_utt_dict(r, unk, audio_ok(int(r["segment_id"]))) for r in rows]
+            out_sessions.append({"index": i, "start": utts[0]["time"][:5], "end": utts[-1]["time"][:5], "utterances": utts})
+        segs = [dict(r) for r in db.query(
+            "SELECT id, started_at, duration_s, speech_s, status, error, source FROM segments"
+            " WHERE started_at >= ? AND started_at < ? AND status != 'deleted' ORDER BY started_at",
+            (f"{day}T00:00:00", f"{day}T23:59:59.999"))]
+        counts: dict[str, int] = {}
+        for r in db.query("SELECT speaker_name, COUNT(*) AS n FROM utterances WHERE day=? GROUP BY speaker_name", (day,)):
+            counts[r["speaker_name"] or unk] = int(r["n"])
+        md = rt.cfg.transcripts_dir / f"{day}.md"
+        return {"day": day, "sessions": out_sessions, "segments": segs, "speakers": counts,
+                "markdown_path": str(md) if md.exists() else None, "unknown_label": unk}
+
+    @app.get("/api/segments")
+    def segments(status: str | None = None, day: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
+        where, params = ["status != 'deleted'"], []
+        if status:
+            where.append("status=?")
+            params.append(status)
+        if day:
+            where.append("started_at >= ? AND started_at < ?")
+            params += [f"{_day(day)}T00:00:00", f"{day}T23:59:59.999"]
+        rows = rt.db.query(f"SELECT id, path, started_at, duration_s, speech_s, status, error, source, updated_at FROM segments"
+                           f" WHERE {' AND '.join(where)} ORDER BY started_at DESC LIMIT ?", [*params, max(1, min(int(limit), 2000))])
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["audio"] = Path(d["path"]).exists()
+            d["name"] = Path(d.pop("path")).name
+            out.append(d)
+        return out
+
+    @app.get("/api/search")
+    def search(q: str, day_from: str | None = None, day_to: str | None = None, speaker: str | None = None,
+               limit: int = 30, mode: str | None = None) -> dict[str, Any]:
+        q = (q or "").strip()
+        if not q:
+            return {"hits": [], "how": ""}
+        if day_from:
+            _day(day_from)
+        if day_to:
+            _day(day_to)
+        retr = rt.retriever(mode, False) if mode else rt.retriever(None, False)
+        res = retr.search(q, day_from=day_from, day_to=day_to, speaker=speaker, limit=max(1, min(int(limit), 200)))
+        hits = [{"id": h.id, "segment_id": h.segment_id, "day": h.day, "abs_start": h.abs_start, "time": h.abs_start[11:16],
+                 "speaker": h.speaker_name or unknown(), "text": h.text, "score": round(float(h.score), 4), "source": h.source}
+                for h in res.hits]
+        return {"hits": hits, "how": res.how_label, "expansions": res.expansions}
+
+    @app.get("/api/context/{uid}")
+    def context(uid: int, before: int = 6, after: int = 6) -> dict[str, Any]:
+        from ..memory import index
+
+        rows = index.window(rt.db, int(uid), max(0, int(before)), max(0, int(after)))
+        if not rows:
+            raise HTTPException(404, "没有这条记录")
+        return {"id": uid, "utterances": [_utt_dict(r, unknown()) for r in rows]}
+
+    # ------------------------------------------------------------------ audio
+    def _segment_audio(seg_id: int, a: float, b: float) -> bytes:
+        from ..audio.storage import read_segment
+        from ..audio.vad import SAMPLE_RATE
+
+        seg = rt.db.get_segment(seg_id)
+        if seg is None:
+            raise HTTPException(404, "录音段不存在")
+        p = Path(seg["path"])
+        if not p.exists():
+            raise HTTPException(404, "音频文件已删除（超过保留期）")
+        audio = read_segment(p)
+        i, j = int(max(0.0, a) * SAMPLE_RATE), int(max(0.0, b) * SAMPLE_RATE)
+        if j <= i:
+            j = len(audio)
+        return _wav_bytes(audio[i:j])
+
+    @app.get("/api/audio/utterance/{uid}")
+    def audio_utterance(uid: int, pad: float = 0.3) -> Response:
+        u = rt.db.one("SELECT segment_id, start_s, end_s FROM utterances WHERE id=?", (int(uid),))
+        if u is None:
+            raise HTTPException(404, "没有这条记录")
+        pad = max(0.0, min(float(pad), 5.0))
+        data = _segment_audio(int(u["segment_id"]), float(u["start_s"]) - pad, float(u["end_s"]) + pad)
+        return Response(data, media_type="audio/wav", headers={"Cache-Control": "private, max-age=3600"})
+
+    @app.get("/api/audio/segment/{seg_id}")
+    def audio_segment(seg_id: int, start: float = Query(0.0, alias="from"), end: float = Query(0.0, alias="to")) -> Response:
+        data = _segment_audio(int(seg_id), float(start), float(end))
+        return Response(data, media_type="audio/wav", headers={"Cache-Control": "private, max-age=3600"})
+
+    # ------------------------------------------------------------------ daily digests / notes
+    @app.get("/api/daily")
+    def daily_list() -> list[dict[str, Any]]:
+        rows = rt.db.query("SELECT d.day, d.created_at, d.pushed_at, d.utterance_count, d.model, d.summary_json,"
+                           " (SELECT COUNT(*) FROM utterances u WHERE u.day=d.day) AS now_count"
+                           " FROM daily_summaries d ORDER BY d.day DESC")
+        out = []
+        for r in rows:
+            partial = False
+            overview = ""
+            try:
+                js = json.loads(r["summary_json"] or "{}")
+                partial = bool(js.get("partial"))
+                overview = str(js.get("overview") or "")[:160]
+            except ValueError:
+                pass
+            out.append({"day": r["day"], "created_at": r["created_at"], "pushed_at": r["pushed_at"], "model": r["model"],
+                        "utterance_count": r["utterance_count"], "now_count": int(r["now_count"]), "partial": partial,
+                        "stale": int(r["now_count"]) != int(r["utterance_count"] or 0), "overview": overview})
+        return out
+
+    @app.get("/api/daily/{day}")
+    def daily_get(day: str) -> dict[str, Any]:
+        _day(day)
+        r = rt.db.one("SELECT * FROM daily_summaries WHERE day=?", (day,))
+        now = rt.db.one("SELECT COUNT(*) AS n FROM utterances WHERE day=?", (day,))
+        n_now = int(now["n"]) if now else 0
+        if r is None:
+            return {"day": day, "exists": False, "now_count": n_now}
+        try:
+            js = json.loads(r["summary_json"] or "{}")
+        except ValueError:
+            js = {}
+        js.pop("blocks", None)
+        return {"day": day, "exists": True, "markdown": r["summary_md"], "json": js, "created_at": r["created_at"],
+                "pushed_at": r["pushed_at"], "model": r["model"], "utterance_count": r["utterance_count"],
+                "now_count": n_now, "stale": n_now != int(r["utterance_count"] or 0)}
+
+    @app.get("/api/notes")
+    def notes(kind: str | None = None, q: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
+        where, params = [], []
+        if kind:
+            where.append("kind=?")
+            params.append(kind)
+        if q:
+            where.append("(title LIKE ? OR content LIKE ?)")
+            pat = f"%{q.strip()}%"
+            params += [pat, pat]
+        sql = "SELECT id, kind, title, content, day_from, day_to, updated_at FROM memory_notes"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY updated_at DESC, id DESC LIMIT ?"
+        return [dict(r) for r in rt.db.query(sql, [*params, max(1, min(int(limit), 2000))])]
+
+    @app.delete("/api/notes/{note_id}")
+    def note_delete(note_id: int) -> dict[str, Any]:
+        cur = rt.db.execute("DELETE FROM memory_notes WHERE id=?", (int(note_id),))
+        return {"ok": True, "deleted": int(cur.rowcount or 0)}
+
+    # ------------------------------------------------------------------ speakers
+    def _speakers() -> list[dict[str, Any]]:
+        rows = rt.db.query(
+            "SELECT s.id, s.name, s.notes, s.created_at, COUNT(e.id) AS samples, COALESCE(SUM(e.duration_s),0) AS dur"
+            " FROM speakers s LEFT JOIN speaker_embeddings e ON e.speaker_id=s.id GROUP BY s.id ORDER BY s.name")
+        counts = {r["speaker_id"]: int(r["n"]) for r in rt.db.query(
+            "SELECT speaker_id, COUNT(*) AS n FROM utterances WHERE speaker_id IS NOT NULL GROUP BY speaker_id")}
+        return [{"id": int(r["id"]), "name": r["name"], "notes": r["notes"] or "", "created_at": r["created_at"],
+                 "samples": int(r["samples"]), "duration_s": round(float(r["dur"]), 1), "utterances": counts.get(r["id"], 0)}
+                for r in rows]
+
+    def _after_enroll(seg_id: int | None = None) -> dict[str, Any]:
+        """Register the (new) name with jieba, refresh text_seg, re-identify one segment if given."""
+        from ..memory import index as mem_index
+
+        out: dict[str, Any] = {}
+        try:
+            mem_index.register_from(rt.cfg, rt.db)
+            n = rt.db.one("SELECT COUNT(*) AS n FROM utterances")
+            if n and n["n"]:
+                out["reindexed"] = mem_index.reindex(rt.db)
+        except Exception as e:  # noqa: BLE001
+            log.warning("reindex after enroll failed: %s", e)
+        if seg_id is not None:
+            try:
+                from ..speech.pipeline import Processor
+
+                out["relabeled_changed"] = Processor(rt.cfg, rt.db, engine=rt.engine()).relabel_segment(seg_id)
+            except Exception as e:  # noqa: BLE001
+                log.warning("relabel after label failed: %s", e)
+                out["relabel_error"] = str(e)
+        return out
+
+    @app.get("/api/speakers")
+    def speakers_list() -> dict[str, Any]:
+        unk = rt.db.one("SELECT COUNT(*) AS n FROM utterances WHERE speaker_id IS NULL")
+        return {"speakers": _speakers(), "unknown_utterances": int(unk["n"]) if unk else 0,
+                "identify_threshold": float(rt.cfg.speakers.identify_threshold), "unknown_label": unknown()}
+
+    @app.get("/api/speakers/{sid}/samples")
+    def speaker_samples(sid: int) -> list[dict[str, Any]]:
+        rows = rt.db.query("SELECT id, source_path, duration_s, created_at FROM speaker_embeddings WHERE speaker_id=? ORDER BY id", (int(sid),))
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["file"] = Path(str(d["source_path"]).split("#")[0]).name if d["source_path"] else ""
+            d["audio"] = bool(d["source_path"]) and Path(str(d["source_path"]).split("#")[0]).exists()
+            out.append(d)
+        return out
+
+    @app.get("/api/speakers/samples/{emb_id}/audio")
+    def speaker_sample_audio(emb_id: int) -> Response:
+        from ..audio.importer import decode_any
+
+        r = rt.db.one("SELECT source_path FROM speaker_embeddings WHERE id=?", (int(emb_id),))
+        if r is None or not r["source_path"]:
+            raise HTTPException(404, "样本不存在")
+        src = str(r["source_path"])
+        p = Path(src.split("#")[0])
+        if not p.exists():
+            raise HTTPException(404, "样本文件已不存在")
+        audio = decode_any(p)
+        if "#" in src:
+            from ..audio.vad import SAMPLE_RATE
+
+            try:
+                a, b = src.split("#")[1].split("-")
+                audio = audio[int(float(a) * SAMPLE_RATE):int(float(b) * SAMPLE_RATE)]
+            except ValueError:
+                pass
+        return Response(_wav_bytes(audio), media_type="audio/wav")
+
+    @app.delete("/api/speakers/samples/{emb_id}")
+    def speaker_sample_delete(emb_id: int) -> dict[str, Any]:
+        cur = rt.db.execute("DELETE FROM speaker_embeddings WHERE id=?", (int(emb_id),))
+        return {"ok": True, "deleted": int(cur.rowcount or 0)}
+
+    @app.post("/api/speakers/{name}/samples")
+    async def speaker_add_sample(name: str, request: Request, filename: str = "sample.webm", notes: str | None = None) -> dict[str, Any]:
+        name = name.strip()
+        if not name:
+            raise HTTPException(400, "姓名不能为空")
+        data = await request.body()
+        if len(data) < 1000:
+            raise HTTPException(400, "没有收到音频数据")
+        ext = Path(filename).suffix.lower() or ".webm"
+        if ext not in (".wav", ".webm", ".ogg", ".opus", ".mp3", ".m4a", ".flac", ".aac", ".mp4", ".wma", ".amr"):
+            raise HTTPException(400, f"不支持的音频格式 {ext}")
+        tmp_dir = rt.cfg.data_dir / "uploads"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        tmp = tmp_dir / f"enroll_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}{ext}"
+        existed = rt.db.one("SELECT id FROM speakers WHERE name=?", (name,)) is not None
+        db = rt.db
+
+        def enroll() -> tuple[int, int, int, float]:
+            tmp.write_bytes(data)
+            before = db.one("SELECT COUNT(*) AS n FROM speaker_embeddings e JOIN speakers s ON s.id=e.speaker_id WHERE s.name=?", (name,))
+            n0 = int(before["n"]) if before else 0
+            sid = rt.engine().enroll(db, name, [tmp], notes)
+            after = db.one("SELECT COUNT(*) AS n, COALESCE(MAX(duration_s),0) AS last FROM speaker_embeddings WHERE speaker_id=?", (sid,))
+            return sid, n0, int(after["n"]) if after else 0, float(after["last"]) if after else 0.0
+
+        try:
+            sid, n0, n1, last = await _to_thread(enroll)
+        finally:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        if n1 <= n0:
+            if n1 == 0 and not existed:
+                # a brand-new speaker row without samples is useless and confusing: remove it again
+                # (a pre-existing speaker keeps its row: utterances still carry its id and name)
+                rt.db.execute("DELETE FROM speakers WHERE id=?", (sid,))
+            raise HTTPException(400, "样本里检测到的语音太少（至少 1 秒，建议 10 秒以上），请重录")
+        extra = await _to_thread(_after_enroll)
+        return {"ok": True, "id": sid, "name": name, "samples": n1, "speech_s": round(last, 1), **extra}
+
+    @app.post("/api/speakers/label")
+    async def speaker_label(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        name = str(body.get("name") or "").strip()
+        if not name:
+            raise HTTPException(400, "姓名不能为空")
+        db = rt.db
+        if body.get("utterance_id") is not None:
+            u = db.one("SELECT segment_id, start_s, end_s FROM utterances WHERE id=?", (int(body["utterance_id"]),))
+            if u is None:
+                raise HTTPException(404, "没有这条记录")
+            seg_id, a, b = int(u["segment_id"]), float(u["start_s"]), float(u["end_s"])
+        else:
+            try:
+                seg_id, a, b = int(body["segment_id"]), float(body["from"]), float(body["to"])
+            except (KeyError, TypeError, ValueError):
+                raise HTTPException(400, "需要 utterance_id，或 segment_id + from + to")
+        if b <= a:
+            raise HTTPException(400, "结束时间必须大于开始时间")
+        seg = db.get_segment(seg_id)
+        if seg is None or not Path(seg["path"]).exists():
+            raise HTTPException(404, "这段音频已不存在（超过保留期），无法取声纹")
+        try:
+            seg_path = Path(seg["path"])
+            sid = await _to_thread(lambda: rt.engine().enroll_from_segment_turns(db, name, seg_path, [(a, b)]))
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        extra = await _to_thread(_after_enroll, seg_id)
+        n = db.one("SELECT COUNT(*) AS n FROM speaker_embeddings WHERE speaker_id=?", (sid,))
+        return {"ok": True, "id": sid, "name": name, "samples": int(n["n"]) if n else 0, "segment_id": seg_id, **extra}
+
+    @app.patch("/api/speakers/{sid}")
+    def speaker_update(sid: int, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        db = rt.db
+        row = db.one("SELECT id, name FROM speakers WHERE id=?", (int(sid),))
+        if row is None:
+            raise HTTPException(404, "没有这个说话人")
+        if "notes" in body:
+            db.execute("UPDATE speakers SET notes=? WHERE id=?", (str(body["notes"] or "") or None, int(sid)))
+        new_name = str(body.get("name") or "").strip()
+        renamed_days: list[str] = []
+        if new_name and new_name != row["name"]:
+            if db.one("SELECT id FROM speakers WHERE name=? AND id != ?", (new_name, int(sid))):
+                raise HTTPException(400, f"已经有叫 {new_name} 的说话人")
+            db.execute("UPDATE speakers SET name=? WHERE id=?", (new_name, int(sid)))
+            db.execute("UPDATE utterances SET speaker_name=? WHERE speaker_id=?", (new_name, int(sid)))
+            renamed_days = [r["day"] for r in db.query("SELECT DISTINCT day FROM utterances WHERE speaker_id=?", (int(sid),))]
+            _after_enroll()
+            try:
+                from ..speech.pipeline import write_day_markdown
+
+                for d in renamed_days:
+                    write_day_markdown(db, rt.cfg, d)
+            except Exception as e:  # noqa: BLE001
+                log.warning("rewrite markdown after rename failed: %s", e)
+        return {"ok": True, "renamed_days": len(renamed_days)}
+
+    @app.delete("/api/speakers/{sid}")
+    def speaker_delete(sid: int) -> dict[str, Any]:
+        db = rt.db
+        row = db.one("SELECT id, name FROM speakers WHERE id=?", (int(sid),))
+        if row is None:
+            raise HTTPException(404, "没有这个说话人")
+        unk = unknown()
+        days = [r["day"] for r in db.query("SELECT DISTINCT day FROM utterances WHERE speaker_id=?", (int(sid),))]
+        with db.transaction() as c:
+            c.execute("UPDATE utterances SET speaker_name=?, speaker_score=NULL WHERE speaker_id=?", (unk, int(sid)))
+            c.execute("DELETE FROM speakers WHERE id=?", (int(sid),))
+        try:
+            from ..speech.pipeline import write_day_markdown
+
+            for d in days:
+                write_day_markdown(db, rt.cfg, d)
+        except Exception as e:  # noqa: BLE001
+            log.warning("rewrite markdown after delete failed: %s", e)
+        return {"ok": True, "unlabeled_days": len(days)}
+
+    @app.post("/api/speakers/calibrate")
+    def speakers_calibrate() -> dict[str, Any]:
+        from ..cli import calibrate_threshold
+
+        embs = rt.db.speaker_embeddings()
+        if len(embs) < 2:
+            raise HTTPException(400, "至少需要 2 个注册样本才能校准（建议每人 2 个以上、至少 2 个人）")
+        r = calibrate_threshold(embs)
+        r["current"] = float(rt.cfg.speakers.identify_threshold)
+        return r
+
+    # ------------------------------------------------------------------ memory chat
+    @app.post("/api/chat")
+    def chat(body: dict[str, Any] = Body(...)) -> StreamingResponse:
+        question = str(body.get("question") or "").strip()
+        if not question:
+            raise HTTPException(400, "问题不能为空")
+        history = [{"role": m["role"], "content": str(m.get("content") or "")}
+                   for m in (body.get("history") or []) if m.get("role") in ("user", "assistant")][-20:]
+        strategy = body.get("strategy") or None
+        retrieval = body.get("retrieval") or None
+        expand = body.get("expand")
+        chat_obj = rt.chat(strategy, retrieval, None if expand is None else bool(expand))   # raises JobError without a key
+        q: queue.Queue = queue.Queue()
+
+        def on_tool(name: str, args: dict, result: str) -> None:
+            q.put({"type": "tool", "name": name, "args": args, "result": (result or "")[:1500],
+                   "lines": (result or "").count("\n") + 1})
+
+        chat_obj.on_tool = on_tool
+
+        def work() -> None:
+            t0 = time.monotonic()
+            try:
+                answer = chat_obj.ask(question, history)
+                stats = dict(chat_obj.last_stats)
+                stats["seconds"] = round(time.monotonic() - t0, 1)
+                q.put({"type": "answer", "text": answer, "stats": stats})
+            except Exception as e:  # noqa: BLE001
+                log.exception("chat failed: %s", e)
+                q.put({"type": "error", "message": str(e)})
+            finally:
+                q.put(None)
+
+        threading.Thread(target=work, name="chat", daemon=True).start()
+
+        def gen():
+            yield json.dumps({"type": "start", "strategy": chat_obj.strategy, "retrieval": chat_obj.retriever.mode,
+                              "model": chat_obj.model}, ensure_ascii=False) + "\n"
+            while True:
+                try:
+                    item = q.get(timeout=15.0)
+                except queue.Empty:
+                    yield json.dumps({"type": "ping"}) + "\n"
+                    continue
+                if item is None:
+                    break
+                yield json.dumps(item, ensure_ascii=False) + "\n"
+
+        return StreamingResponse(gen(), media_type="application/x-ndjson", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    # ------------------------------------------------------------------ settings
+    @app.get("/api/devices")
+    def devices() -> list[dict[str, Any]]:
+        try:
+            from ..audio.capture import list_input_devices
+
+            return [{"index": d.index, "name": d.name, "hostapi": d.hostapi, "channels": d.channels, "default_sr": d.default_sr}
+                    for d in list_input_devices()]
+        except Exception as e:  # noqa: BLE001
+            log.warning("list devices failed: %s", e)
+            return []
+
+    @app.get("/api/config")
+    def config_get() -> dict[str, Any]:
+        cfg = rt.cfg
+        values: dict[str, Any] = {}
+        for section, keys in EDITABLE.items():
+            sec = cfg.get(section) or {}
+            # deep copy: the nested push.* dicts are the live config's own objects and get their secrets blanked below
+            values[section] = copy.deepcopy({k: sec.get(k, DEFAULTS.get(section, {}).get(k)) for k in sorted(keys)})
+        values["mimo"]["api_key"] = ""
+        secrets: dict[str, Any] = {}
+        for path in SECRET_KEYS:
+            cur: Any = cfg
+            for k in path:
+                cur = (cur or {}).get(k) if isinstance(cur, dict) else None
+            secrets[".".join(path)] = {"set": bool(cur), "hint": _hint(cur) if cur else ""}
+            # never ship the secret itself to the page
+            node = values
+            for k in path[:-1]:
+                node = node.setdefault(k, {}) if isinstance(node.get(k), dict) or k not in node else node[k]
+            if isinstance(node, dict):
+                node[path[-1]] = ""
+        return {"path": str(rt.config_path), "exists": rt.config_path.exists(), "values": values, "secrets": secrets,
+                "profile": rt.profile, "profile_label": profile_label(rt.profile), "base_config_path": cfg.get("_base_config_path"),
+                "env_api_key": bool(os.environ.get("MIMO_API_KEY")), "defaults": {s: {k: DEFAULTS[s].get(k) for k in keys} for s, keys in EDITABLE.items()},
+                "glossary_path": str(cfg.glossary_path), "data_dir": str(cfg.data_dir), "models_dir": str(cfg.models_dir)}
+
+    @app.put("/api/config")
+    def config_put(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        updates: dict[tuple[str, ...], Any] = {}
+        if not isinstance(body, dict) or any(not isinstance(v, dict) for v in body.values()):
+            raise HTTPException(400, "请求体应为 {小节: {键: 值}}")
+        leaves: list[tuple[tuple[str, ...], Any]] = []
+        for path, value in yaml_edit.flatten(body).items():
+            if len(path) < 2:
+                raise HTTPException(400, f"不允许修改 {'.'.join(path)}")
+            section, key = path[0], path[1]
+            if section not in EDITABLE or key not in EDITABLE[section]:
+                raise HTTPException(400, f"不允许修改 {'.'.join(path)}")
+            if isinstance(value, dict):
+                if not isinstance(_default_for(path), dict):
+                    raise HTTPException(400, f"{'.'.join(path)} 不是一组设置")
+                for k2, v2 in value.items():
+                    leaves.append((path + (str(k2),), v2))
+            else:
+                leaves.append((path, value))
+        for path, value in leaves:
+            if path in SECRET_KEYS:
+                if value is None or str(value).strip() == "":
+                    continue   # empty secret field = keep what is there
+                if path == ("mimo", "api_key") and is_placeholder_key(value):
+                    raise HTTPException(400, "API key 看起来是占位符")
+                if isinstance(value, (dict, list, bool)):
+                    raise HTTPException(400, f"{'.'.join(path)} 应为文本")
+                updates[path] = str(value).strip()
+                continue
+            value = coerce_setting(path, value)
+            if path == ("analysis", "daily_time"):
+                from ..scheduler import parse_hhmm
+
+                try:
+                    parse_hhmm(str(value))
+                except ValueError:
+                    raise HTTPException(400, "日报时间格式应为 HH:MM")
+            # unchanged values are not written: on a profile that would pin inherited settings into
+            # profiles/<name>/config.yaml and silently cut them off from the shared root config.yaml
+            if _effective(rt.cfg, path) == value:
+                continue
+            updates[path] = value
+        if not updates:
+            return {"ok": True, "changed": [], "notes": ["没有需要保存的修改"], "saved": []}
+        p = rt.config_path
+        text = p.read_text(encoding="utf-8") if p.exists() else "# audio_note 配置（由网页界面生成）\n"
+        res = yaml_edit.set_values(text, updates)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text(res.text, encoding="utf-8")
+        os.replace(tmp, p)
+        info = rt.reload_config()
+        notes = list(info["notes"])
+        if res.comments_lost:
+            notes.append("config.yaml 里的注释无法保留，文件已按结构重写（值都在）")
+        return {"ok": True, "changed": info["changed"], "restarted_recorder": info["restarted_recorder"], "notes": notes,
+                "saved": sorted(".".join(k) for k in updates)}
+
+    @app.post("/api/config/test-api")
+    def config_test_api() -> dict[str, Any]:
+        client = rt.client()
+        t0 = time.monotonic()
+        resp = client.chat([{"role": "user", "content": "回复“ok”两个字母即可。"}], max_tokens=8)
+        text = (resp.choices[0].message.content or "").strip()
+        return {"ok": True, "model": client.chat_model, "reply": text[:50], "seconds": round(time.monotonic() - t0, 2)}
+
+    @app.post("/api/push/test")
+    def push_test(body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+        from ..push.base import Message, Notifier
+
+        text = str(body.get("text") or "这是一条来自 audio-note 的测试消息。")
+        n = Notifier(rt.cfg)
+        if not n.channels:
+            raise HTTPException(400, "没有配置可用的推送渠道（检查 push.channels 和对应的密钥）")
+        results = n.send(Message("audio-note 测试", text))
+        return {"ok": any(v is None for v in results.values()), "channels": results}
+
+    @app.get("/api/glossary")
+    def glossary_get() -> dict[str, Any]:
+        p = rt.cfg.glossary_path
+        return {"path": str(p), "text": p.read_text(encoding="utf-8") if p.exists() else ""}
+
+    @app.put("/api/glossary")
+    def glossary_put(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        p = rt.cfg.glossary_path
+        text = str(body.get("text") or "")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8", newline="\n")
+        terms = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+        extra: dict[str, Any] = {}
+        if body.get("reindex"):
+            try:
+                st = rt.submit("reindex", vectors=False)
+                extra["job"] = st.as_dict()
+            except (JobError, ReadOnly) as e:
+                extra["job_error"] = str(e)
+        return {"ok": True, "terms": len(terms), **extra}
+
+    @app.get("/api/logs")
+    def logs(lines: int = 200, which: str = "service") -> dict[str, Any]:
+        from ..logging_setup import log_file_name
+
+        role = "cli" if which == "cli" else "service"
+        p = rt.cfg.data_dir / log_file_name(rt.cfg, role)
+        if not p.exists():
+            return {"path": str(p), "lines": [], "size": 0}
+        n = max(10, min(int(lines), 5000))
+        with open(p, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            chunk = min(size, 256 * 1024 if n <= 2000 else 2 * 1024 * 1024)
+            f.seek(size - chunk)
+            data = f.read().decode("utf-8", errors="replace")
+        out = data.splitlines()[-n:]
+        return {"path": str(p), "lines": out, "size": size}
+
+    @app.post("/api/import")
+    async def import_audio(request: Request, filename: str = "import.wav", start: str | None = None) -> dict[str, Any]:
+        from ..audio.importer import import_file
+        from ..audio.vad import SileroVAD
+
+        data = await request.body()
+        if len(data) < 1000:
+            raise HTTPException(400, "没有收到音频数据")
+        safe = re.sub(r"[^\w.\-一-鿿]+", "_", Path(filename).name) or "import.wav"
+        d = rt.cfg.data_dir / "imports"
+        d.mkdir(parents=True, exist_ok=True)
+        dest = d / safe
+        k = 0
+        while dest.exists():
+            k += 1
+            dest = d / f"{Path(safe).stem}_{k}{Path(safe).suffix}"
+        await _to_thread(dest.write_bytes, data)
+        start_dt = None
+        if start:
+            try:
+                start_dt = datetime.fromisoformat(start)
+            except ValueError:
+                raise HTTPException(400, "开始时间格式应为 YYYY-MM-DD HH:MM")
+
+        def run() -> list[int]:
+            vad = SileroVAD(rt.cfg.model_path("vad_model"), threads=2)
+            return import_file(rt.cfg, rt.db, dest, start_time=start_dt, vad=vad)
+
+        ids = await _to_thread(run)
+        return {"ok": True, "file": dest.name, "segments": len(ids)}
+
+    # ------------------------------------------------------------------ static
+    if STATIC_DIR.exists():
+        app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+        @app.middleware("http")
+        async def _no_cache_static(request: Request, call_next):
+            # the page is tiny and local: always revalidate so an upgrade never shows a stale app.js
+            response = await call_next(request)
+            if request.url.path.startswith("/static/"):
+                response.headers["Cache-Control"] = "no-cache"
+            return response
+
+        @app.get("/")
+        def index() -> Response:
+            # the asset URLs carry the package version + file mtime, so an upgraded app.js / style.css is
+            # never served from a browser cache that still holds the previous one
+            try:
+                from importlib.metadata import version as _pkg_version
+
+                ver = _pkg_version("audio-note")
+            except Exception:  # noqa: BLE001
+                ver = "0"
+            stamp = f"{ver}-{int(max((STATIC_DIR / n).stat().st_mtime for n in ('app.js', 'style.css')))}"
+            html = (STATIC_DIR / "index.html").read_text(encoding="utf-8").replace("__V__", stamp)
+            return Response(html, media_type="text/html", headers={"Cache-Control": "no-cache"})
+
+    return app
+
+
+async def _to_thread(fn, *args):
+    import anyio
+
+    return await anyio.to_thread.run_sync(fn, *args)

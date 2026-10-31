@@ -27,7 +27,7 @@ CLI_ENTRY_STEMS = frozenset({"audio-note", "audio_note"})
 #: argv[0] stems of `python -m audio_note` / `python audio_note/cli.py` (only inside the package directory)
 PACKAGE_ENTRY_STEMS = frozenset({"__main__", "cli"})
 #: sub-commands that run the long-lived process and own the main log file
-SERVICE_COMMANDS = frozenset({"run", "record"})
+SERVICE_COMMANDS = frozenset({"run", "record", "ui"})
 CLI_LOG_SUFFIX = ".cli"
 
 
@@ -48,7 +48,7 @@ def detect_role(argv: list[str] | None = None) -> str:
     i = 1
     while i < len(argv):
         a = argv[i]
-        if a in ("-c", "--config"):
+        if a in ("-c", "--config", "--profile"):
             i += 2
             continue
         if a.startswith("-"):

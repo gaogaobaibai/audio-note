@@ -8,6 +8,9 @@
 4. **每日分析 + 推送**：每天定时用大模型总结当天内容（话题 / 决定 / 待办 / 人物 / 情绪 / 未闭环），通过 飞书机器人 / Windows 通知 / ntfy / Server酱 / PushPlus / WxPusher / 企微机器人 推送。
 5. **记忆问答**：本地关键词（FTS5 + jieba）与语义向量（bge-small-zh，CPU，90 MB）混合检索，先自动预检索再让模型按需调工具追查，直接问"上周三和张三聊了什么"、"扫地机买的什么牌子"。
 
+6. **网页界面**：`audio-note ui` 打开本机页面（只监听 127.0.0.1）：一键开始/停止录音、按天看记录并试听某句话、给"未知"的人贴名字、看日报与待办、问答、注册说话人（浏览器直接录音）、改设置、看日志。命令行仍然全部可用。
+7. **档案**：不同的人 / 用途各有独立的录音、记录、说话人和设置（自带一个 `demo` 示例档案），界面左上角一键切换。
+
 除了 ASR 和 LLM 调用之外，所有东西都在本地。
 
 ## 架构一览
@@ -44,7 +47,8 @@ Silero VAD 门控 ──► 只存语音片段 data/audio/YYYY-MM-DD/HHMMSS_mmm.
 | ASR / 纠错 | MiMo `mimo-v2.5-asr`；`mimo-v2.6-flash` JSON 编辑对纠错 | `audio_note/speech/asr.py` `correct.py` `pipeline.py` |
 | 记忆 | SQLite FTS5 + jieba 关键词、bge-small-zh 向量（sqlite-vec）RRF 混合、相对日期解析、预检索 + function-calling 检索循环 | `audio_note/memory/` |
 | 日报 / 推送 | map-reduce 日报；多渠道推送 | `audio_note/analysis/` `audio_note/push/` |
-| 服务 | 录音线程 + 调度线程，单实例锁，可选托盘 | `audio_note/cli.py` `service.py` `scheduler.py` |
+| 服务 | 录音线程 + 调度线程，单实例锁，可选托盘 | `audio_note/cli.py` `service.py` `scheduler.py` `runtime.py` |
+| 网页界面 | FastAPI 本地 API + 无构建的单页前端（原生 HTML/JS） | `audio_note/ui/` |
 
 ## 安装
 
@@ -85,7 +89,10 @@ Copy-Item glossary.example.txt glossary.txt
 
 ```powershell
 audio-note init             # 生成 config.yaml（若不存在）、检查模型文件、列出缺失项
+audio-note ui               # 打开网页界面：填 key、选麦克风、注册自己的声音、点「开始录音」都在页面上做
 ```
+
+`ui` 会在浏览器打开 `http://127.0.0.1:8765`（见下文「网页界面」）。不想用界面的话，下面是命令行的等价步骤：
 
 1. **填 API Key**：编辑 `config.yaml`，在 `mimo.api_key: ""` 的引号里填你的 MiMo key；或者不写进文件，设置环境变量 `MIMO_API_KEY`（优先级更高）。Key 在 [MiMo 开放平台](https://mimo.mi.com/) 申请。没填 key 时只录音不转写（`status` 会提示"未配置"），填好后待处理的片段会在下一轮自动转写。
 2. **选麦克风**：
@@ -109,22 +116,61 @@ audio-note init             # 生成 config.yaml（若不存在）、检查模�
 4. **启动**：
 
    ```powershell
-   audio-note run            # 录音 + 定时处理 / 清理 / 日报，Ctrl+C 退出
-   audio-note run --tray     # 同上，带系统托盘图标
+   audio-note run            # 录音 + 定时处理 / 清理 / 日报 + 网页界面（不自动开浏览器），Ctrl+C 退出
+   audio-note run --tray     # 同上，带系统托盘图标（托盘菜单里有「打开界面」）
    ```
 
    第一次推荐先 `audio-note record` 录几分钟，然后 `audio-note process` 手动处理一次，看看 `data/transcripts/` 下的结果，再长期 `run`。
 
+## 网页界面
+
+```powershell
+audio-note ui                 # 启动界面并打开浏览器；不自动录音，录音在页面上点「开始录音」
+audio-note ui --record        # 启动时就开始录音（等于 run --open）
+audio-note run                # 常驻服务也带界面：浏览器打开 http://127.0.0.1:8765
+```
+
+| 页面 | 能做什么 |
+|---|---|
+| 总览 | 录音状态（是否有人在说话、本次录了多少）、今日语句 / 待转写 / 磁盘占用、后台任务一键运行（立即转写、生成日报、清理、重新识别说话人、重建索引）、最近的记录、失败片段重试 |
+| 记录 | 按天看转写内容（按对话时段分组、说话人着色、可按人筛选）；悬停一句话可以 ▶ 试听、👤 标记是谁说的（补充声纹并重新识别那段录音）、↕ 看前后文；顶部搜索框跨天检索（和问答用同一套混合检索） |
+| 日报 | 结构化查看每天的概览 / 话题 / 决定 / 待办 / 人物 / 时间线，重新生成、推送；「记忆笔记」页看日报抽出的待办 / 决定 / 人物并可删除 |
+| 问答 | 对话式提问，显示检索过程（调了哪些工具）、模型调用次数和耗时；可临时切换策略 / 检索方式 |
+| 说话人 | 浏览器麦克风直接录 15–30 秒注册自己、上传文件注册、补充样本 / 试听样本 / 重命名 / 删除、校准阈值并一键采用、重新识别全部记录 |
+| 设置 | 改 API key、麦克风、阈值、保留天数、问答策略、日报时间、推送渠道等（保存即生效，改音频设置会自动重启录音；写回 `config.yaml` 时保留你的注释）；测试 API / 测试推送；编辑词表；导入录音文件 |
+| 日志 | 实时看 `audio_note.log`，可过滤 |
+
+### 档案：把不同的人 / 用途分开
+
+每个**档案**有自己独立的录音、文字记录、日报、说话人声纹和设置，互不混淆。安装后自带一个 `demo` 档案（3 天合成的对话，随时可删），自己用就另建一个，例如「我」：
+
+```powershell
+audio-note profile list                  # 列出档案及各自的记录数
+audio-note profile create 我 --use       # 新建 profiles/我/ 并切换过去
+audio-note profile use demo              # 切换当前档案（界面左上角也能切）
+audio-note --profile demo status         # 只这一条命令用某个档案
+audio-note profile delete demo           # 删除档案及其全部数据（会要求输入档案名确认）
+```
+
+- 目录：`profiles/<名字>/config.yaml` + `profiles/<名字>/data/`；根目录的 `config.yaml` + `data/` 是「默认」档案。
+- 设置分两层：根目录 `config.yaml` 是**所有档案共享**的（API key、模型名、推送渠道写一次就行），`profiles/<名字>/config.yaml` 只放这个档案不同的项（新建时只有数据目录和它自己的词表 `profiles/<名字>/glossary.txt`）。界面「设置」页保存到当前档案的文件，而且只写改动过的项，没改的继续继承。`--copy-from` / 界面的「复制当前档案的设置」只复制普通设置和词表，不复制密钥和路径。
+- 界面左上角的档案按钮可以切换、新建、删除；切换是即时的（录音若在进行会在新档案上继续）。`profiles/current` 记住上次选的档案，之后的命令和服务都用它。
+- 一个档案同一时间只能被一个进程录音 / 处理；用 `--config` 指定的自定义配置文件不属于任何档案。
+
+界面只监听本机（`ui.host: 127.0.0.1`，没有登录），不要改成 `0.0.0.0` 暴露到局域网。同一数据目录只能有一个进程在录音 / 处理：`run` 已经在跑时再开 `ui`，页面是只读的（能看记录、问答，不能录音和跑任务），请在 `run` 那个进程的界面里操作（`--tray` 的托盘菜单或直接访问 8765 端口）。
+
 ## 命令一览
 
-全局选项（放在子命令前面）：`--config PATH` 指定另一个 config.yaml（默认取环境变量 `AUDIO_NOTE_CONFIG`，再默认项目根目录的 `config.yaml`；用来维护第二套数据目录 / 测试配置很方便），`-v` / `--verbose` 打 DEBUG 日志。例如 `audio-note --config D:\test.yaml -v status`。
+全局选项（放在子命令前面）：`--profile NAME` 用某个档案；`--config PATH` 指定任意一个 config.yaml（默认取环境变量 `AUDIO_NOTE_CONFIG`，再按档案规则：`AUDIO_NOTE_PROFILE` → `profiles/current` → 根目录 `config.yaml`），`-v` / `--verbose` 打 DEBUG 日志。例如 `audio-note --profile demo -v status`。
 
 | 命令 | 作用 |
 |---|---|
 | `audio-note init` | 生成 `config.yaml`、检查模型文件、打印缺失项 |
 | `audio-note devices` | 列出音频输入设备 |
 | `audio-note record` | 只录音（VAD 分段落盘），不做处理 |
-| `audio-note run [--tray]` | 常驻服务：录音 + 定时处理 / 清理 / 日报推送；`--tray` 显示托盘图标 |
+| `audio-note run [--tray] [--no-ui] [--open] [--port N]` | 常驻服务：录音 + 定时处理 / 清理 / 日报推送 + 网页界面；`--tray` 显示托盘图标，`--open` 启动时打开浏览器，`--no-ui` 不提供界面 |
+| `audio-note ui [--record] [--port N] [--no-browser]` | 网页界面（后台处理照常跑，录音在页面上开始）；`--record` 启动即录音 |
+| `audio-note profile list\|create <名字> [--use] [--copy-from X]\|use <名字>\|delete <名字> [-y]` | 档案管理（见「档案」一节）；全局 `--profile <名字>` 让单条命令用某个档案 |
 | `audio-note status` | 片段 / 转写统计、磁盘占用、服务是否在跑 |
 | `audio-note import <files...> [--start "2026-10-31 09:00"]` | 导入已有录音（wav/mp3/m4a/… 任意格式），按 VAD 切成片段入库；`--start` 指定录音开始时间，否则从文件名或修改时间推断 |
 | `audio-note process [--retry-failed] [--limit N]` | 立即处理待转写片段（分离 → ASR → 纠错 → 写记录）；`--retry-failed` 重试失败的 |
@@ -146,7 +192,7 @@ audio-note init             # 生成 config.yaml（若不存在）、检查模�
 
 ## 数据目录
 
-默认在项目下的 `data/`（`paths.data_dir` 可改成绝对路径，例如放到 D 盘）：
+默认档案在项目下的 `data/`，其他档案在 `profiles/<名字>/data/`（`paths.data_dir` 可改成绝对路径，例如放到 D 盘）：
 
 ```
 data/
@@ -158,7 +204,9 @@ data/
   audio_note.log                     滚动日志
   service.lock                       单实例锁（pid）
 models/                              本地模型（只读）
-config.yaml                          你的配置（含密钥，已在 .gitignore）
+config.yaml                          你的配置（含密钥，已在 .gitignore），同时是所有档案的共享设置
+profiles/<名字>/config.yaml          某个档案与共享设置不同的项（通常只有 data_dir）
+profiles/<名字>/data/                该档案的数据目录（结构同上）；profiles/current 记录当前档案
 glossary.txt                         纠错词表，每行一个人名 / 术语
 ```
 
@@ -217,7 +265,7 @@ powershell -ExecutionPolicy Bypass -File scripts/register_autostart.ps1 -Tray   
 powershell -ExecutionPolicy Bypass -File scripts/register_autostart.ps1 -Remove  # 取消
 ```
 
-脚本执行的是 `schtasks /create /sc onlogon /tn AudioNote /tr "<项目>\.venv\Scripts\pythonw.exe -m audio_note run"`：`pythonw.exe` 没有控制台窗口，日志看 `data/audio_note.log`。常用操作：
+脚本执行的是 `schtasks /create /sc onlogon /tn AudioNote /tr "<项目>\.venv\Scripts\pythonw.exe -m audio_note run"`：`pythonw.exe` 没有控制台窗口，日志看 `data/audio_note.log`，或者直接在浏览器打开 `http://127.0.0.1:8765`（后台服务自带网页界面）。常用操作：
 
 ```powershell
 schtasks /run   /tn AudioNote     # 立即启动

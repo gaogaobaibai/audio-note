@@ -55,9 +55,14 @@ audio_note/                 Python 包
   analysis/daily.py         DailyAnalyzer.run(day) / push(day)                                   [已完成]
   push/base.py …            Message, Channel, Notifier + 各渠道                                   [已完成]
   cli.py service.py scheduler.py   命令行 + 常驻服务                                              [已完成]
+  runtime.py                Runtime：锁 + 录音/调度线程 + 任务队列 + 共享组件（CLI 与界面共用）  [已完成]
+  ui/app.py                 FastAPI 本地 API（/api/*）+ 静态页                                   [已完成]
+  ui/server.py ui/yaml_edit.py   uvicorn 后台线程；保留注释的 config.yaml 写回                    [已完成]
+  ui/static/                index.html / app.js / style.css 单页前端（无构建、无外部资源）        [已完成]
 tests/                      pytest（不联网，mock MimoClient）                                     [已完成]
 config.example.yaml README.md glossary.example.txt scripts/*.ps1                                 [已完成]
 data/   audio/YYYY-MM-DD/HHMMSS_mmm.opus  transcripts/YYYY-MM-DD.md  daily/YYYY-MM-DD.md  audio_note.sqlite3  speakers/
+profiles/<name>/config.yaml + data/   其他档案（§10.2）；profiles/current = 当前档案名
 models/ silero_vad.onnx  3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx  sherpa-onnx-pyannote-segmentation-3-0/model.onnx
 ```
 
@@ -169,7 +174,8 @@ class Notifier: def __init__(cfg); def send(msg) -> dict[str, str|None]   # chan
 ## 10. CLI / 服务（cli.py / service.py / scheduler.py 规范）
 
 `audio-note <cmd>`（`python -m audio_note` 同效）：
-- `devices` 列输入设备；`record` 只录音；`run [--tray]` 录音 + 调度；`status`
+- 全局 `--profile NAME` / `--config PATH`；`profile list|create|use|delete` 档案管理（§10.2）
+- `devices` 列输入设备；`record` 只录音；`run [--tray] [--no-ui] [--open] [--port]` 录音 + 调度 + 网页界面；`ui [--record]` 网页界面（录音由页面开关）；`status`
 - `import <files...> [--start "2026-10-31 09:00"]`
 - `process [--retry-failed] [--limit N]`；`transcribe <file>` 一次性转写并打印（不入库）
 - `speakers enroll <name> <wav...>` / `speakers list` / `speakers label <segment_id|path> <name> --from s --to s` / `speakers calibrate`
@@ -177,6 +183,24 @@ class Notifier: def __init__(cfg); def send(msg) -> dict[str, str|None]   # chan
 - `chat [question]`（无参进入 REPL）
 - `cleanup`；`init`（生成 config.yaml、检查模型文件、打印缺失项）
 调度：`process_interval_min` 处理新段；`cleanup_interval_min` 清理；每天 `analysis.daily_time` 跑前一天/当天日报并推送（`kv` 记录 last_daily_day 防重复）。日志：rich console + `data/audio_note.log`（RotatingFileHandler）。单实例：`data/service.lock` 写 pid + 进程创建时间，启动时检测进程存活且创建时间一致（防 pid 复用）。`process` 启动时把超过 10 min 的 `processing` 行放回 `new`；日报前先跑 `process`，次日复检前一天的 utterance 数有变化则重生成并推送。
+
+### 10.1 运行时与网页界面（runtime.py / ui/）
+
+- `Runtime(cfg)` 是进程里唯一的控制对象：持有 DB、`Scheduler`、录音线程（复用 `service._recorder_loop`）、单实例锁、后台任务队列和共享的重对象（`SpeakerEngine`、`MimoClient`、按 (mode, expand) 缓存的 `Retriever`）。`start_service(record)` = 拿锁 + 起调度线程（+ 录音线程）；录音可单独 `start_recording()/stop_recording()`，服务继续跑。`run_service()`（`audio-note run`）和 `cmd_ui`（`audio-note ui`）都建在它上面，区别只是启动时是否录音、是否自动开浏览器。
+- 任务（process / daily / cleanup / reindex / relabel / push）通过 `submit()` 进单工作线程，执行时持有 `Scheduler.lock`（`run_once` 也持有），所以界面点的「立即转写」永远不会和定时 tick 同时处理同一批片段；每个任务的 running / 上次结果 / 上次错误保存在 `JobState` 供页面轮询。`reload_config()` 重新读 config.yaml，换掉调度器 / 客户端 / 检索器的配置，`audio` 段有变化时重启录音线程。
+- 只读模式：锁被别的进程持有时（`run` 已在跑又开了 `ui`），`submit()` / `start_recording()` 抛 `ReadOnly`，页面提示去那个进程的界面操作；浏览和问答不受影响。
+- `ui/app.py`：`create_app(runtime)`，全部 JSON 接口在 `/api/*`（见模块 docstring 列表），错误统一 `{"error": msg}`；问答是 NDJSON 流（`start` / `tool` / `answer` / `error` / `ping` 事件），工具调用实时推给页面。音频片段接口把 opus 解码后按句切 wav 给 `<audio>` 试听；说话人注册接受浏览器 `MediaRecorder` 的 webm/ogg（走 `decode_any` → 内置 ffmpeg）。
+- 设置写回：`ui/yaml_edit.set_values()` 按路径改 config.yaml 里的值，保留注释和顺序（块映射、`{a: 1}` 行内映射、行尾注释都处理），写完解析回读校验；校验失败才退回结构化重写（丢注释，接口会提示）。密钥字段从不回传到页面，只给"已设置 + 尾号"。
+- 前端：无框架、无构建、无外部资源（离线可用），hash 路由七个页面（总览 / 记录 / 日报 / 问答 / 说话人 / 设置 / 日志），总览每 4 s、侧栏每 5 s 轮询 `/api/status`；深色模式跟随系统。界面只监听 `ui.host`（默认 127.0.0.1），没有鉴权。
+- 日志：`audio-note ui` 与 `run` 一样写 `data/audio_note.log`（`logging_setup.SERVICE_COMMANDS` 含 `ui`）。
+
+### 10.2 档案（config.py profiles / runtime.RuntimeHolder）
+
+- 档案 = `profiles/<name>/config.yaml` + 其 `paths.data_dir`（默认 `profiles/<name>/data`，相对项目根目录）。加载时三层合并：`DEFAULTS` ← 根 `config.yaml`（共享设置）← 档案文件；`cfg["_profile"]`、`_config_path`、`_base_config_path` 记录来源，`Runtime.reload_config()` 用同样的 base 重读。根 `config.yaml` + `data/` 就是名为 `default` 的档案（不分层）。`--config` / `AUDIO_NOTE_CONFIG` 指定的文件不分层、不属于档案（`_profile = None`），测试全部走这条路，所以永远不会读到真实的 `config.yaml`。
+- 选择顺序：`--config` > `AUDIO_NOTE_CONFIG` > `--profile` > `AUDIO_NOTE_PROFILE` > `profiles/current`（`profile use` / 界面切换写入）> `default`。`current` 指向已删除的档案时回退到 `default`。
+- 名字校验 `PROFILE_NAME_RE`（中英文、数字、`_`、`-`，≤32）且不得为 `default/current/custom/data`，因此目录只会落在 `profiles/` 下；删除整目录前要求 CLI 输入档案名 / API 传 `confirm`，且该档案没有别的进程持锁、不是当前档案。
+- 进程内切换：`RuntimeHolder.switch(name)`（持 `holder.lock`）= 旧 Runtime `shutdown()`（停录音/调度、释放锁、结束任务线程、`DB.close_all()` 关掉所有线程的 sqlite 连接——Windows 上否则删不掉文件）→ 新 Runtime → 重设日志文件 → 原来在录音就继续录。FastAPI 的处理函数通过 `_RuntimeProxy` 访问 `holder.rt`，所以不用重建 app；`run_service` 的主循环、托盘也从 holder 取当前 Runtime。
+- `profiles/demo` 是示例档案（`scripts/fake_days.py` 生成的 3 天数据复制而来，sqlite 里的绝对路径已改写到该目录），整个 `profiles/` 在 `.gitignore` 里。
 
 ## 11. 默认参数
 

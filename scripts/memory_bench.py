@@ -175,10 +175,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--ks", default="5,10,20")
     ap.add_argument("--out", type=Path, help="write full results as JSON")
     ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--profile", default=None, help="profile whose data to benchmark (default: AUDIO_NOTE_CONFIG / current profile)")
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.WARNING)
-    cfg = load_config()
+    cfg = load_config(profile=args.profile)
     db = DB(cfg.db_path)
     index.register_from(cfg, db)
     only = {int(x) for x in args.only.split(",")} if args.only else None

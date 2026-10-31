@@ -12,6 +12,7 @@ speaker identification against ground truth.
 from __future__ import annotations
 
 import argparse
+import os
 import base64
 import hashlib
 import io
@@ -32,6 +33,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from audio_note.config import load_config  # noqa: E402
+
+PROFILE: str | None = None   # set from --profile in main(); None = AUDIO_NOTE_CONFIG / explicit config only
 from audio_note.llm.client import MimoClient  # noqa: E402
 
 log = logging.getLogger("fake_days")
@@ -54,7 +57,7 @@ ENROLL_TEXT = [
 
 
 def _client() -> MimoClient:
-    return MimoClient(load_config(), rpm=90)
+    return MimoClient(load_config(profile=PROFILE), rpm=90)
 
 
 # ----------------------------------------------------------------------------- script
@@ -193,7 +196,7 @@ def run_pipeline(out: Path, questions: list[str]) -> None:
     from audio_note.speech.pipeline import Processor
     from audio_note.speech.speakers import SpeakerEngine
 
-    cfg = load_config()
+    cfg = load_config(profile=PROFILE)
     cfg.ensure_dirs()
     db = DB(cfg.db_path)
     client = MimoClient(cfg)
@@ -277,8 +280,14 @@ def main() -> int:
     ap.add_argument("--days", type=int, default=3)
     ap.add_argument("--start", default="2026-10-27")
     ap.add_argument("--run", action="store_true", help="run enrollment/import/process/daily/chat on the generated data")
+    ap.add_argument("--profile", default=None, help="profile to write into (required with --run unless AUDIO_NOTE_CONFIG is set)")
     ap.add_argument("--ask", action="append", default=[], help="memory chat question (repeatable)")
     args = ap.parse_args()
+    global PROFILE
+    PROFILE = args.profile
+    if args.run and not args.profile and not os.environ.get("AUDIO_NOTE_CONFIG"):
+        ap.error("--run writes synthetic speakers / recordings into a profile: pass --profile <name> "
+                 "(e.g. --profile demo, create it with `audio-note profile create demo`) or set AUDIO_NOTE_CONFIG")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s", datefmt="%H:%M:%S")
     for n in ("httpx", "httpx2", "httpcore", "httpcore2", "openai"):
         logging.getLogger(n).setLevel(logging.WARNING)

@@ -231,8 +231,10 @@ def _status_text(cfg: Config, db: DB, recorder: Any) -> str:
     return "\n".join(parts)
 
 
-def start_tray(cfg: Config, db: DB, stop_event: threading.Event, recorder_ref: dict[str, Any]) -> Any | None:
-    """Start a pystray icon in a daemon thread. Returns the icon (or None when unavailable)."""
+def start_tray(cfg: Config, db: DB, stop_event: threading.Event, recorder_ref: dict[str, Any],
+               ui_url: str | None = None, runtime_getter: Any = None) -> Any | None:
+    """Start a pystray icon in a daemon thread. Returns the icon (or None when unavailable).
+    `runtime_getter` (optional) returns the current Runtime so the status reflects a switched profile."""
     try:
         import pystray
     except Exception as e:  # noqa: BLE001
@@ -243,7 +245,11 @@ def start_tray(cfg: Config, db: DB, stop_event: threading.Event, recorder_ref: d
 
         def on_status(icon, item):  # noqa: ANN001
             try:
-                text = _status_text(cfg, db, recorder_ref.get("recorder"))
+                if runtime_getter is not None:
+                    cur = runtime_getter()
+                    text = _status_text(cur.cfg, cur.db, cur.recorder)
+                else:
+                    text = _status_text(cfg, db, recorder_ref.get("recorder"))
                 log.info("status:\n%s", text)
                 if getattr(icon, "HAS_NOTIFICATION", False):
                     icon.notify(text, "audio-note 状态")
@@ -258,7 +264,13 @@ def start_tray(cfg: Config, db: DB, stop_event: threading.Event, recorder_ref: d
             except Exception:  # noqa: BLE001
                 pass
 
-        menu = pystray.Menu(pystray.MenuItem("Status", on_status), pystray.MenuItem("Quit", on_quit))
+        items = []
+        if ui_url:
+            import webbrowser
+
+            items.append(pystray.MenuItem("打开界面", lambda icon, item: webbrowser.open(ui_url), default=True))
+        items += [pystray.MenuItem("Status", on_status), pystray.MenuItem("Quit", on_quit)]
+        menu = pystray.Menu(*items)
         icon = pystray.Icon("audio-note", image, "audio-note 录音中", menu)
 
         def runner() -> None:
@@ -321,52 +333,71 @@ def _install_signal_handlers(stop_event: threading.Event) -> None:
             pass  # not main thread / unsupported
 
 
+def start_ui(rt: Any, open_browser: bool = False) -> Any | None:
+    """Serve the web UI for a Runtime (or a RuntimeHolder, so the page can switch profiles) on a
+    background thread. Returns the UIServer, or None when it could not start (port taken, missing
+    dependency): the service keeps running without it."""
+    try:
+        from .runtime import RuntimeHolder
+        from .ui.app import create_app
+        from .ui.server import UIServer
+
+        holder = rt if isinstance(rt, RuntimeHolder) else RuntimeHolder(rt)
+        rt = holder.rt
+        srv = UIServer(create_app(holder), str(rt.cfg.ui.host or "127.0.0.1"), int(rt.cfg.ui.port or 8765))
+        rt.ui_url = srv.start()
+        if open_browser:
+            srv.open_browser()
+        return srv
+    except Exception as e:  # noqa: BLE001
+        log.error("web UI not started: %s", e)
+        return None
+
+
 def run_service(cfg: Config, tray: bool = False, stop_event: threading.Event | None = None,
-                record: bool = True, schedule: bool = True) -> int:
-    """Blocking service loop. Returns a process exit code."""
+                record: bool = True, schedule: bool = True, ui: bool | None = None,
+                open_browser: bool | None = None) -> int:
+    """Blocking service loop (`audio-note run`). Returns a process exit code.
+
+    Built on runtime.Runtime: lock + scheduler (+ recorder) threads, plus the web UI when
+    `ui` (default cfg.ui.enabled) is on. The recorder can be stopped and restarted from the UI
+    while the process keeps running; the loop only gives up when the service's own threads all
+    died while the service is still supposed to run."""
+    from .runtime import Runtime, RuntimeHolder
+
     stop_event = stop_event or threading.Event()
     cfg.ensure_dirs()
+    rt = Runtime(cfg)
     try:
-        acquire_lock(cfg)
+        rt.start_service(record=record, schedule=schedule)
     except AlreadyRunning as e:
         log.error("%s", e)
         print(str(e), file=sys.stderr)
+        rt.shutdown()
         return 1
 
-    db = DB(cfg.db_path)
-    ref: dict[str, Any] = {}
-    threads: list[threading.Thread] = []
+    holder = RuntimeHolder(rt)   # the UI may replace holder.rt when the user switches profiles
     icon = None
+    server = None
     try:
         _install_signal_handlers(stop_event)
-        if record:
-            t = threading.Thread(target=_recorder_loop, args=(cfg, db, stop_event, ref), name="recorder", daemon=True)
-            t.start()
-            threads.append(t)
-        if schedule:
-            from .scheduler import Scheduler
-
-            sched = Scheduler(cfg, db, stop_event)
-            t = threading.Thread(target=sched.run, name="scheduler", daemon=True)
-            t.start()
-            threads.append(t)
+        ui_enabled = bool(cfg.ui.enabled) if ui is None else bool(ui)
+        if ui_enabled:
+            server = start_ui(holder, open_browser=bool(cfg.ui.open_browser) if open_browser is None else bool(open_browser))
         if tray:
-            icon = start_tray(cfg, db, stop_event, ref)
-        log.info("service started (pid %d); Ctrl+C to stop", os.getpid())
+            icon = start_tray(cfg, rt.db, stop_event, rt._rec_ref, ui_url=rt.ui_url, runtime_getter=lambda: holder.rt)
+        log.info("service started (pid %d)%s; Ctrl+C to stop", os.getpid(), f", UI at {rt.ui_url}" if rt.ui_url else "")
         try:
             while not stop_event.is_set():
                 stop_event.wait(1.0)
-                if threads and not any(t.is_alive() for t in threads):
+                cur = holder.rt
+                if (record or schedule) and cur.service_running() and not any(t.is_alive() for t in cur.threads()):
                     log.error("all worker threads exited; stopping")
                     break
         except KeyboardInterrupt:
             log.info("Ctrl+C received; stopping")
         stop_event.set()
-        deadline = time.monotonic() + JOIN_TIMEOUT_S
-        for t in threads:
-            t.join(max(0.1, deadline - time.monotonic()))
-            if t.is_alive():
-                log.warning("thread %s did not stop in time", t.name)
+        holder.rt.stop_service()
         if icon is not None:
             try:
                 icon.stop()
@@ -376,4 +407,6 @@ def run_service(cfg: Config, tray: bool = False, stop_event: threading.Event | N
         return 0
     finally:
         stop_event.set()
-        release_lock(cfg)
+        if server is not None:
+            server.stop()
+        holder.rt.shutdown()

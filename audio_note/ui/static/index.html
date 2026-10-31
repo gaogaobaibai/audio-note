@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>audio-note</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232563eb'/%3E%3Crect x='12' y='5' width='8' height='14' rx='4' fill='white'/%3E%3Cpath d='M8 15a8 8 0 0 0 16 0' stroke='white' stroke-width='2.5' fill='none'/%3E%3Cpath d='M16 23v5M11 28h10' stroke='white' stroke-width='2.5' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css?v=__V__">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="brand-icon"></span>
+      <span class="brand-name">audio-note</span>
+    </div>
+    <button class="profile-btn" id="profile-btn" title="切换档案（不同的人 / 用途各自独立的录音、记录、说话人）"><span class="k">档案</span><span class="n" id="profile-name">…</span><span class="caret">▾</span></button>
+    <nav class="nav" id="nav">
+      <a href="#/dashboard" data-page="dashboard"><i class="ic ic-home"></i>总览</a>
+      <a href="#/transcript" data-page="transcript"><i class="ic ic-doc"></i>记录</a>
+      <a href="#/daily" data-page="daily"><i class="ic ic-sun"></i>日报</a>
+      <a href="#/chat" data-page="chat"><i class="ic ic-chat"></i>问答</a>
+      <a href="#/speakers" data-page="speakers"><i class="ic ic-people"></i>说话人</a>
+      <a href="#/settings" data-page="settings"><i class="ic ic-gear"></i>设置</a>
+      <a href="#/logs" data-page="logs"><i class="ic ic-log"></i>日志</a>
+    </nav>
+    <div class="sidebar-foot">
+      <div class="rec-pill" id="rec-pill"><span class="dot"></span><span id="rec-pill-text">连接中…</span></div>
+      <div class="sidebar-meta" id="sidebar-meta"></div>
+    </div>
+  </aside>
+  <main class="main" id="main"></main>
+</div>
+<div class="toasts" id="toasts"></div>
+<div class="modal-root" id="modal-root"></div>
+<script src="/static/app.js?v=__V__"></script>
+</body>
+</html>
