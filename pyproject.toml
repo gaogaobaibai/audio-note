@@ -1,0 +1,34 @@
+[project]
+name = "audio-note"
+version = "0.1.0"
+description = "Always-on ambient audio recorder with VAD, MiMo ASR, speaker identification, LLM correction, daily digest and memory chat"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "sounddevice>=0.5",
+    "soundfile>=0.13",
+    "numpy>=2.0",
+    "onnxruntime>=1.20",
+    "sherpa-onnx>=2.0",
+    "openai>=1.60",
+    "httpx>=0.27",
+    "pyyaml>=6.0",
+    "rich>=13.0",
+    "jieba>=0.42",
+    "sqlite-vec>=0.1.6",
+    "imageio-ffmpeg>=0.5",
+    "pystray>=0.19",
+    "pillow>=10.0",
+]
+
+[project.scripts]
+audio-note = "audio_note.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["audio_note"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

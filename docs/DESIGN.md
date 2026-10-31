@@ -1,0 +1,152 @@
+# audio_note 技术方案
+
+全天无感录音 → 本地 VAD 只存语音 → 本地说话人分离/识别 → MiMo ASR → LLM 纠错 → 带身份的文字记录 → 每日分析推送 → 记忆问答。
+
+Windows 11，CPU only，Python 3.12（uv 管理，`.venv`），所有本地模型走 sherpa-onnx（onnxruntime，不需要 torch）。
+
+## 1. 选型（已在本机验证）
+
+| 组件 | 选型 | 备注 / 备选 |
+|---|---|---|
+| 采集 | `sounddevice` 16 kHz mono, 512 样本块 | 已验证 Realtek 麦克风 16k 直采；失败时按设备默认采样率采集后 `np.interp` 重采样 |
+| VAD | Silero VAD v4 ONNX (`models/silero_vad.onnx`) 直接用 onnxruntime | 自己实现门控状态机（pre-roll 0.5s / hangover 2s / 最长 300s / 最短 0.3s）；272s 音频 0.9s 处理完 |
+| 存储 | Opus in OGG via `soundfile`(libsndfile 1.2.2)，`compression_level≈0.93` ≈ 24 kbps | 1 小时语音 ≈ 11 MB；只存语音段；写入中先落 `_partial.wav` 防崩溃丢失 |
+| 分离 | sherpa-onnx `OfflineSpeakerDiarization`：pyannote segmentation-3.0 ONNX + 3D-Speaker CAM++ zh-cn 192 维 + fast clustering(threshold 0.5) | 272s 音频 17s（约 16x 实时）；备选 pyannote community-1（需 HF token + torch） |
+| 说话人识别 | 注册样本 → CAM++ embedding 存 SQLite；聚类簇 embedding 与注册库 cosine，阈值 0.45（可调，`speakers calibrate`） | ModelScope 卡片 pairwise 阈值 0.31，sherpa 示例 0.6；需按真实数据校准 |
+| ASR | MiMo `mimo-v2.5-asr`，`POST /v1/chat/completions` + `input_audio`(wav base64 ≤10MB) | **只返回带标点文本，无时间戳、无说话人**；8K ctx / 2K 输出；100 RPM / 10K TPM；¥0.5/小时音频；单次 >2 min 质量下降 → 每次 ≤60s |
+| 纠错 | `mimo-v2.6-flash`，thinking 关闭，JSON 模式，输出 **编辑对**（不是整篇重写），每次 ≤ 3000 字 | 文献：整篇重写会让中文错误变多；JSON 编辑对减少幻觉；硬约束（编辑距离上限、不改数字、同音近音）比 prompt 更重要 |
+| 记忆/检索 | SQLite FTS5(unicode61) + jieba 预分词 + 结构化过滤(日期/说话人) + LLM function-calling 的迭代检索循环 | MiMo **没有 embedding 接口**；Letta 实验显示"文件 + grep 工具 + 多轮查询"在 LoCoMo 上胜过 Mem0；不引入 Mem0/Graphiti |
+| 每日分析 | map（按 session 分块总结）→ reduce（日报：概览/话题/决定/待办/人物/情绪/未闭环）；同时维护 `memory_notes` | 可用 `mimo.analysis_model` 切到 pro |
+| 推送 | 飞书自定义机器人 webhook（主）、Windows toast（兜底，PowerShell 零依赖）、ntfy、Server酱 Turbo、PushPlus、WxPusher、企微群机器人 | 个人微信没有官方通道，Server酱/WxPusher 走公众号 |
+| 进程 | `audio-note run`：录音线程 + 调度线程（处理/清理/日报）；单实例锁；Task Scheduler 开机自启 | 可选 pystray 托盘 |
+
+## 2. MiMo API（已核实，2026-10）
+
+- `base_url = https://api.xiaomimimo.com/v1`，openai SDK（Bearer）或 header `api-key`。
+- 聊天模型：`mimo-v2.6-flash`（¥1/¥2 每 M tokens，1M ctx）、`mimo-v2.6-pro`（¥3/¥6）。thinking 默认开 → `extra_body={"thinking":{"type":"disabled"}}`。`response_format={"type":"json_object"}` 可用。
+- ASR：`model="mimo-v2.5-asr"`，`messages=[{"role":"user","content":[{"type":"input_audio","input_audio":{"data":"data:audio/wav;base64,..."}}]}]`，`extra_body={"asr_options":{"language":"auto|zh|en"}}`。响应 `choices[0].message.content`，`usage.seconds` 为计费秒数。
+- 错误码：429 退避重试；402 余额；421 内容过滤；503 过载。
+- 未核实：单请求音频时长上限（只有 10MB base64 限制）。默认 60s 一段。
+
+## 3. 目录结构
+
+```
+audio_note/                 Python 包
+  config.py                 DEFAULTS + config.yaml 合并，Config.data_dir/models_dir/db_path/...   [已完成]
+  db.py                     SQLite schema + DB 类                                               [已完成]
+  audio/capture.py          MicCapture, list_input_devices, resolve_device                       [已完成]
+  audio/vad.py              SileroVAD, SpeechGate, GateConfig, segment_audio, speech_seconds     [已完成]
+  audio/storage.py          finalize_segment, write/read, PartialWriter, recover_partials, cleanup[已完成]
+  audio/recorder.py         Recorder.run() 常驻循环；gate_config_from(cfg)                       [已完成]
+  audio/importer.py         import_file(cfg, db, path, start_time=None), decode_any             [已完成]
+  speech/speakers.py        SpeakerEngine: diarize/identify_turns/enroll/embed; Turn dataclass   [已完成]
+  speech/asr.py             ASR(cfg, client).transcribe(audio) -> ASRResult(text, seconds, parts)[已完成]
+  llm/client.py             MimoClient: chat/text/json/transcribe_bytes；LLMError；parse_json_loose[已完成]
+  speech/correct.py         Corrector(cfg, client).correct(items, glossary) 编辑对纠错 + 守卫     [待实现 A]
+  speech/pipeline.py        Processor: 分离→分段→ASR→纠错→utterances→transcripts md             [待实现 B]
+  memory/index.py           jieba 分词、FTS 检索、上下文窗口                                     [待实现 C]
+  memory/tools.py           给 LLM 的工具定义 + 执行                                             [待实现 C]
+  memory/chat.py            MemoryChat 迭代检索问答 + REPL                                        [待实现 C]
+  analysis/daily.py         DailyAnalyzer.run(day) / push(day)                                   [待实现 D]
+  push/base.py …            Message, Channel, Notifier + 各渠道                                   [待实现 E]
+  cli.py service.py scheduler.py   命令行 + 常驻服务                                              [待实现 F]
+tests/                      pytest（不联网，mock MimoClient）                                     [待实现 G]
+config.example.yaml README.md glossary.example.txt scripts/*.ps1                                 [待实现 H]
+data/   audio/YYYY-MM-DD/HHMMSS_mmm.opus  transcripts/YYYY-MM-DD.md  daily/YYYY-MM-DD.md  audio_note.sqlite3  speakers/
+models/ silero_vad.onnx  3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx  sherpa-onnx-pyannote-segmentation-3-0/model.onnx
+```
+
+## 4. 数据模型（db.py，已建）
+
+- `segments(id, path, started_at ISO, duration_s, sample_rate, source mic|import, origin, status new|processing|done|failed|no_speech|deleted, speech_s, error)`
+- `transcripts(id, segment_id, asr_model, raw_json, text_raw, text_corrected, correction_json, language)`
+- `utterances(id, segment_id, start_s, end_s, abs_start ISO, day YYYY-MM-DD, cluster_label, speaker_id, speaker_name, speaker_score, text_raw, text)`
+- `utterance_tokens(utterance_id, text_seg)` → FTS5 `utterances_fts(text_seg)`（外部内容表，触发器同步；`text_seg` 是 jieba 分词后空格连接）
+- `speakers(id, name, notes)`、`speaker_embeddings(speaker_id, embedding float32 blob, dim, source_path, duration_s)`
+- `daily_summaries(day PK, summary_md, summary_json, model, utterance_count, pushed_at)`
+- `memory_notes(id, kind person|topic|todo|decision|fact, title, content, day_from, day_to, source_utterance_ids)`
+- `kv(key, value json)`
+
+## 5. 处理流水线（pipeline.py 规范）
+
+对每个 `status='new'` 且 `created_at` 早于 `pipeline.min_segment_age_s` 的 segment：
+
+1. `audio = read_segment(path)`；`status='processing'`。
+2. `turns = engine.diarize(audio)`；`engine.identify_turns(audio, turns, db)` → 每个 turn 有 cluster/speaker_name/score。
+   - 没有任何 turn → `status='no_speech'`，删除文件。
+3. **构造 ASR chunk**：按时间顺序合并相邻、同 cluster、间隔 ≤ 1.0s 的 turn；单 chunk 时长 ≤ `mimo.asr_max_chunk_s`（超过则在此处切开）。每个 chunk = (start_s, end_s, cluster, speaker_id, speaker_name, score, audio[start:end] 前后各留 0.15s padding)。时长 < 0.6s 的 chunk 丢弃。
+4. 每个 chunk → `asr.transcribe(chunk_audio)` → text_raw（空则跳过）。
+5. `corrector.correct(items, glossary)`：items 是整段 segment 的 chunk 列表 `[{"i":0,"speaker":"张三","text":"..."}]`，返回每条的 `text`（纠正后）和 `edits`。纠错失败（LLMError）→ text = text_raw，记日志，不阻塞。
+6. 写 `transcripts` 一行（raw_json = chunks 列表含时间与 raw/corrected 文本）；写 `utterances`（每 chunk 一行；`abs_start = started_at + start_s`，`day` 取 abs_start 的本地日期；`text_seg = memory.index.tokenize(text)`）。
+7. `status='done'`；重写当天的 `transcripts/YYYY-MM-DD.md`（从 DB 生成，格式见下）。
+8. 任一步异常 → `status='failed'`, error 记录；下一轮 `process --retry-failed` 可重试。
+
+单实例：Processor 与 Recorder 在同一进程不同线程；DB 每线程一个连接（db.py 已处理）。
+
+transcript Markdown 格式：
+```
+# 2026-10-31 记录
+
+## 08:19–08:24（会议室）  ← 段落按 segment；括号内可省略
+- **08:19:10 张三**：今天我们先过一下……
+- **08:19:32 未知**：好的。
+```
+
+## 6. 纠错（correct.py 规范）
+
+输入：items（同一 segment 内按时间排序的 chunk 文本，带说话人）、glossary（`glossary.txt` 每行一个词，另加所有已注册说话人名字）。
+Prompt 要点（中文）：这是中文/中英混合语音识别结果；只修正**同音/近音错别字、人名/术语（优先用词表）、明显的分词断句错误**；不改口语风格、不增删句子、不改数字、不翻译；不确定就不改。按 `{"edits":[{"i":0,"from":"...","to":"...","reason":"..."}]}` 返回，`from` 必须是原文中的连续子串。
+守卫（代码强制）：
+- `from` 不在原文 → 丢弃该编辑；同一条 `from` 多次出现 → 只替换第一个未替换的位置。
+- 单条 item 累计字符编辑距离 > 30% 长度 → 丢弃该 item 的所有编辑。
+- `from` 或 `to` 含数字且数字变化 → 丢弃。
+- 批次控制：按 `correction.max_chars_per_call` 分批。
+输出：`[{"i":0,"text":corrected,"edits":[...]}]`。
+
+## 7. 记忆与问答（memory/ 规范）
+
+- `index.tokenize(text) -> str`：jieba `lcut`（启动时 `jieba.add_word` 所有 speaker 名和 glossary 词），去空白，空格连接。
+- `index.search(db, query, day_from=None, day_to=None, speaker=None, limit=20) -> list[Hit]`：FTS5 `MATCH`（把 query 分词后用 `OR`/`AND` 组合：先 AND，结果 < 3 再 OR），按 `bm25()` 排序，附带 utterance 行与 `day/abs_start/speaker_name/text`。另提供 `like_search` 子串兜底。
+- `index.window(db, utterance_id, before=5, after=5)` 返回上下文。
+- `tools.py`：OpenAI function-calling 工具定义与分发：`search_transcripts(query, day_from?, day_to?, speaker?)`, `get_transcript(day, hour_from?, hour_to?)`, `get_daily_summary(day)`, `list_days()`, `list_speakers()`, `search_notes(query?, kind?)`, `get_context(utterance_id)`。每个工具返回字符串（≤ 4000 字）。
+- `chat.MemoryChat(cfg, db, client)`：system prompt 说明今天日期、可用工具、回答要引用时间与说话人；循环最多 `memory.max_tool_rounds` 轮工具调用；`ask(question, history) -> answer`；`repl()` 用 rich 的交互。
+
+## 8. 每日分析（analysis/daily.py 规范）
+
+`DailyAnalyzer(cfg, db, client)`:
+- `run(day) -> (summary_md, summary_json)`：取当天 utterances；按时间间隔 > 20 分钟切 session；每个 session 文本 ≤ 6000 字分块；map：每块 → JSON `{title, summary, topics[], decisions[], todos[], people[], mood, open_questions[]}`；reduce：合并为日报 JSON 并渲染 Markdown（概览 / 主要话题 / 决定 / 待办 / 提到的人 / 情绪 / 未闭环 / 时间线）；写 `daily_summaries` 与 `daily/YYYY-MM-DD.md`；把 todos/decisions/people 写入 `memory_notes`（按 title 去重更新）。
+- `push(day)`：用 push.Notifier 发送（标题"每日记录 YYYY-MM-DD"，正文 Markdown，超长按渠道上限截断）；成功后写 `pushed_at`。
+- 当天无 utterances → 返回一条简短说明，不调 LLM。
+
+## 9. 推送（push/ 规范）
+
+```python
+@dataclass
+class Message: title: str; body_md: str; url: str | None = None
+class Channel(Protocol): name: str; def send(self, msg: Message) -> None  # raise on failure
+class Notifier: def __init__(cfg); def send(msg) -> dict[str, str|None]   # channel -> error/None；按 cfg.push.channels 顺序全部发送
+```
+渠道实现（httpx，超时 10s，失败抛异常）：feishu（text/post/interactive，可选 sign：`base64(HMAC-SHA256(key=f"{ts}\n{secret}", msg=b""))`）、wecom（markdown ≤4096B）、serverchan（`https://sctapi.ftqq.com/{key}.send` title+desp）、pushplus（`https://www.pushplus.plus/send` template markdown）、wxpusher（SPT simple-push 或 appToken+uids）、ntfy（POST body，headers Title/Markdown）、toast（PowerShell `Windows.UI.Notifications` XML，零依赖；失败不抛仅记日志）。
+
+## 10. CLI / 服务（cli.py / service.py / scheduler.py 规范）
+
+`audio-note <cmd>`（`python -m audio_note` 同效）：
+- `devices` 列输入设备；`record` 只录音；`run [--tray]` 录音 + 调度；`status`
+- `import <files...> [--start "2026-10-31 09:00"]`
+- `process [--retry-failed] [--limit N]`；`transcribe <file>` 一次性转写并打印（不入库）
+- `speakers enroll <name> <wav...>` / `speakers list` / `speakers label <segment_id|path> <name> --from s --to s` / `speakers calibrate`
+- `daily [--day YYYY-MM-DD] [--push] [--force]`；`push-test "文本"`
+- `chat [question]`（无参进入 REPL）
+- `cleanup`；`init`（生成 config.yaml、检查模型文件、打印缺失项）
+调度：`process_interval_min` 处理新段；`cleanup_interval_min` 清理；每天 `analysis.daily_time` 跑前一天/当天日报并推送（`kv` 记录 last_daily_day 防重复）。日志：rich console + `data/audio_note.log`（RotatingFileHandler）。单实例：`data/service.lock` 写 pid，启动时检测进程存活。
+
+## 11. 默认参数
+
+16 kHz / 512 样本块 / VAD 阈值 0.5（迟滞 0.15）/ 起始 0.3s / 静音结束 2.0s / 前后 0.5s / 最长 300s / Opus 24 kbps / ASR 单段 ≤60s / 说话人阈值 0.45 / 聚类阈值 0.5 / 处理间隔 10 min / 清理 30 min / 日报 22:30 / 音频保留 30 天 / 磁盘上限 20 GB。
+
+## 12. 风险与未验证
+
+- MiMo ASR 单请求时长上限未公开；10K TPM 若按音频 token 计（≈6.25 tok/s）则吞吐约 26 分钟音频/分钟，足够。
+- 说话人阈值需用真实样本校准；跨设备/远场会降低分数。
+- 飞书个人版是否能建自定义机器人需在客户端确认；兜底 toast/ntfy。
+- 纠错模型可能过度修改：守卫 + 保留 text_raw。
