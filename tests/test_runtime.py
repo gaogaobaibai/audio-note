@@ -89,7 +89,8 @@ def test_status_shape_on_empty_db(rt: Runtime):
     svc = st["service"]
     assert svc == {"running": False, "read_only": False, "other_pid": None, "scheduler": False, "recording": False,
                    "is_speaking": False, "segments_written": 0, "speech_total_s": 0.0, "recorder_started_at": None,
-                   "last_error": None, "device": None}
+                   "last_error": None, "device": None, "system_audio": False, "system_device": None,
+                   "system_active": False, "system_name": None, "system_error": None}
     assert st["segments"] == {} and st["pending"] == 0 and st["failed"] == 0
     assert st["today"] == {"day": datetime.now().strftime("%Y-%m-%d"), "utterances": 0, "speech_min": 0.0,
                            "segments": 0, "recorded_speech_min": 0.0}
