@@ -42,16 +42,16 @@ audio_note/                 Python 包
   speech/speakers.py        SpeakerEngine: diarize/identify_turns/enroll/embed; Turn dataclass   [已完成]
   speech/asr.py             ASR(cfg, client).transcribe(audio) -> ASRResult(text, seconds, parts)[已完成]
   llm/client.py             MimoClient: chat/text/json/transcribe_bytes；LLMError；parse_json_loose[已完成]
-  speech/correct.py         Corrector(cfg, client).correct(items, glossary) 编辑对纠错 + 守卫     [待实现 A]
-  speech/pipeline.py        Processor: 分离→分段→ASR→纠错→utterances→transcripts md             [待实现 B]
-  memory/index.py           jieba 分词、FTS 检索、上下文窗口                                     [待实现 C]
-  memory/tools.py           给 LLM 的工具定义 + 执行                                             [待实现 C]
-  memory/chat.py            MemoryChat 迭代检索问答 + REPL                                        [待实现 C]
-  analysis/daily.py         DailyAnalyzer.run(day) / push(day)                                   [待实现 D]
-  push/base.py …            Message, Channel, Notifier + 各渠道                                   [待实现 E]
-  cli.py service.py scheduler.py   命令行 + 常驻服务                                              [待实现 F]
-tests/                      pytest（不联网，mock MimoClient）                                     [待实现 G]
-config.example.yaml README.md glossary.example.txt scripts/*.ps1                                 [待实现 H]
+  speech/correct.py         Corrector(cfg, client).correct(items, glossary) 编辑对纠错 + 守卫     [已完成]
+  speech/pipeline.py        Processor: 分离→分段→ASR→纠错→utterances→transcripts md             [已完成]
+  memory/index.py           jieba 分词、FTS 检索、上下文窗口                                     [已完成]
+  memory/tools.py           给 LLM 的工具定义 + 执行                                             [已完成]
+  memory/chat.py            MemoryChat 迭代检索问答 + REPL                                        [已完成]
+  analysis/daily.py         DailyAnalyzer.run(day) / push(day)                                   [已完成]
+  push/base.py …            Message, Channel, Notifier + 各渠道                                   [已完成]
+  cli.py service.py scheduler.py   命令行 + 常驻服务                                              [已完成]
+tests/                      pytest（不联网，mock MimoClient）                                     [已完成]
+config.example.yaml README.md glossary.example.txt scripts/*.ps1                                 [已完成]
 data/   audio/YYYY-MM-DD/HHMMSS_mmm.opus  transcripts/YYYY-MM-DD.md  daily/YYYY-MM-DD.md  audio_note.sqlite3  speakers/
 models/ silero_vad.onnx  3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx  sherpa-onnx-pyannote-segmentation-3-0/model.onnx
 ```
@@ -75,7 +75,7 @@ models/ silero_vad.onnx  3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx  she
 2. `turns = engine.diarize(audio)`；`engine.identify_turns(audio, turns, db)` → 每个 turn 有 cluster/speaker_name/score。
    - 没有任何 turn → `status='no_speech'`，删除文件。
 3. **构造 ASR chunk**：按时间顺序合并相邻、同 cluster、间隔 ≤ 1.0s 的 turn；单 chunk 时长 ≤ `mimo.asr_max_chunk_s`（超过则在此处切开）。每个 chunk = (start_s, end_s, cluster, speaker_id, speaker_name, score, audio[start:end] 前后各留 0.15s padding)。时长 < 0.6s 的 chunk 丢弃。
-4. 每个 chunk → `asr.transcribe(chunk_audio)` → text_raw（空则跳过）。
+4. 每个 chunk → `asr.transcribe(chunk_audio)` → text_raw（空则跳过；421 `ContentFiltered` 只跳过该 chunk，不让整段失败）。
 5. `corrector.correct(items, glossary)`：items 是整段 segment 的 chunk 列表 `[{"i":0,"speaker":"张三","text":"..."}]`，返回每条的 `text`（纠正后）和 `edits`。纠错失败（LLMError）→ text = text_raw，记日志，不阻塞。
 6. 写 `transcripts` 一行（raw_json = chunks 列表含时间与 raw/corrected 文本）；写 `utterances`（每 chunk 一行；`abs_start = started_at + start_s`，`day` 取 abs_start 的本地日期；`text_seg = memory.index.tokenize(text)`）。
 7. `status='done'`；重写当天的 `transcripts/YYYY-MM-DD.md`（从 DB 生成，格式见下）。
@@ -87,7 +87,7 @@ transcript Markdown 格式：
 ```
 # 2026-10-31 记录
 
-## 08:19–08:24（会议室）  ← 段落按 segment；括号内可省略
+## 08:19:10–08:24:03 (#123 081910_250.opus)（导入：xxx.m4a）  ← 段落按 segment：起止时间 + id + 文件名；导入标注可省略
 - **08:19:10 张三**：今天我们先过一下……
 - **08:19:32 未知**：好的。
 ```
@@ -138,7 +138,7 @@ class Notifier: def __init__(cfg); def send(msg) -> dict[str, str|None]   # chan
 - `daily [--day YYYY-MM-DD] [--push] [--force]`；`push-test "文本"`
 - `chat [question]`（无参进入 REPL）
 - `cleanup`；`init`（生成 config.yaml、检查模型文件、打印缺失项）
-调度：`process_interval_min` 处理新段；`cleanup_interval_min` 清理；每天 `analysis.daily_time` 跑前一天/当天日报并推送（`kv` 记录 last_daily_day 防重复）。日志：rich console + `data/audio_note.log`（RotatingFileHandler）。单实例：`data/service.lock` 写 pid，启动时检测进程存活。
+调度：`process_interval_min` 处理新段；`cleanup_interval_min` 清理；每天 `analysis.daily_time` 跑前一天/当天日报并推送（`kv` 记录 last_daily_day 防重复）。日志：rich console + `data/audio_note.log`（RotatingFileHandler）。单实例：`data/service.lock` 写 pid + 进程创建时间，启动时检测进程存活且创建时间一致（防 pid 复用）。`process` 启动时把超过 10 min 的 `processing` 行放回 `new`；日报前先跑 `process`，次日复检前一天的 utterance 数有变化则重生成并推送。
 
 ## 11. 默认参数
 

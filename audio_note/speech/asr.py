@@ -19,6 +19,8 @@ from ..llm.client import MimoClient
 
 log = logging.getLogger(__name__)
 
+SPLIT_TOLERANCE_S = 0.5   # > 2 * build_chunks pad_s (0.15): a max-length chunk plus padding is not split
+
 
 @dataclass
 class ASRResult:
@@ -67,7 +69,13 @@ class ASR:
     def transcribe(self, audio: np.ndarray) -> ASRResult:
         if len(audio) < int(0.3 * SAMPLE_RATE):
             return ASRResult("", 0.0, 0)
-        parts = split_at_quietest(audio, self.vad, self.max_chunk_s)
+        # build_chunks bounds the speech span to max_chunk_s and then pads 0.15 s on each side; such a
+        # chunk must still go out as ONE request, so only genuinely longer audio is split (and then
+        # strictly to <= max_chunk_s pieces).
+        if len(audio) <= int((self.max_chunk_s + SPLIT_TOLERANCE_S) * SAMPLE_RATE):
+            parts = [audio]
+        else:
+            parts = split_at_quietest(audio, self.vad, self.max_chunk_s)
         texts: list[str] = []
         secs = 0.0
         for p in parts:

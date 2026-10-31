@@ -1,0 +1,102 @@
+# audio_note 配置示例
+# 复制为 config.yaml 后按需修改（或运行 `audio-note init` 自动生成）。
+# 所有键的默认值与 audio_note/config.py 中 DEFAULTS 一致；删掉某个键即使用默认值。
+# 标有【密钥】的字段是敏感信息，不要提交到 git（.gitignore 已忽略 config.yaml）。
+# mimo.api_key 也可以不写在文件里，改用环境变量 MIMO_API_KEY（优先级高于文件）。
+
+paths:
+  data_dir: data                 # 数据目录（音频/转写/日报/数据库）；相对路径相对于项目根目录
+  models_dir: models             # 本地模型目录（silero VAD / CAM++ / pyannote）
+
+mimo:
+  api_key: ""                    # 【密钥】MiMo API Key（形如 sk-xxxx，填在引号里）；也可用环境变量 MIMO_API_KEY；留空则不转写
+  base_url: https://api.xiaomimimo.com/v1   # MiMo OpenAI 兼容接口地址
+  chat_model: mimo-v2.6-flash    # 纠错 / 问答默认模型（便宜）；可改 mimo-v2.6-pro
+  analysis_model: ""             # 每日分析用的模型；留空 = chat_model；追求质量可填 mimo-v2.6-pro
+  asr_model: mimo-v2.5-asr       # 语音转文字模型
+  asr_language: auto             # ASR 语言：auto | zh | en
+  asr_max_chunk_s: 60            # 单次 ASR 请求最长秒数（超过 ~2 分钟质量下降）
+  asr_concurrency: 4             # 同一段内并发的 ASR 请求数（单请求延迟约 0.8 倍实时；接口上限 100 次/分钟）
+  rpm: 90                        # 客户端限速：每分钟请求数（官方上限 100）
+  timeout_s: 120                 # 单次请求超时（秒）
+  max_retries: 3                 # 429/503/网络错误时的重试次数
+  temperature: 0.2               # 聊天模型温度（thinking 关闭时生效）
+
+audio:
+  device: null                   # 输入设备：null = 系统默认；或设备序号；或名称子串（`audio-note devices` 查看）
+  sample_rate: 16000             # 采样率（固定 16k；设备不支持时自动按默认采样率采集再重采样）
+  channels: 1                    # 单声道
+  block_ms: 32                   # 采集块长度（32ms = 512 样本，与 silero VAD 窗口一致）
+  vad_threshold: 0.5             # VAD 语音概率阈值（0~1，越高越保守）
+  min_silence_s: 2.0             # 连续静音超过此秒数即结束一个片段
+  min_speech_s: 0.3              # 短于此秒数的语音不触发录制
+  max_segment_s: 300             # 单个片段最长秒数（硬切，保证文件适合 ASR）
+  pre_roll_s: 0.5                # 语音开始前保留的秒数
+  post_roll_s: 0.5               # 语音结束后保留的秒数
+  codec: opus                    # 存储编码：opus | flac | wav
+  opus_bitrate: 24000            # Opus 码率（bps）；24k ≈ 11 MB/小时语音
+  gain: 1.0                      # 输入增益倍数
+
+storage:
+  cleanup_enabled: true          # 是否定时清理
+  cleanup_interval_min: 30       # 清理间隔（分钟）
+  min_speech_ratio: 0.15         # 复检时语音占比低于此值的片段会被删除
+  min_speech_total_s: 1.0        # 复检时语音总秒数低于此值的片段会被删除
+  keep_audio_days: 30            # 已转写音频保留天数；0 = 永久保留（文字记录永不删除）
+  max_disk_gb: 20                # 音频目录磁盘上限（GB），超出后删除最旧的已转写音频
+
+speakers:
+  embedding_model: 3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx   # 声纹模型（相对于 models_dir）
+  segmentation_model: sherpa-onnx-pyannote-segmentation-3-0/model.onnx  # 说话人分割模型
+  vad_model: silero_vad.onnx     # VAD 模型
+  num_threads: 4                 # onnxruntime 线程数
+  identify_threshold: 0.45       # 余弦相似度 ≥ 此值即认定为已注册说话人（`speakers calibrate` 校准）
+  cluster_threshold: 0.5         # 说话人聚类阈值（越小分出的人越多）
+  min_turn_s: 0.3                # 最短说话轮次（秒）
+  unknown_label: 未知            # 未识别出身份时显示的名字
+  auto_enroll_from_diarization: false   # 是否把未识别的聚类自动注册为新说话人（默认关闭）
+
+correction:
+  enabled: true                  # 是否用 LLM 对 ASR 结果做纠错
+  glossary_file: glossary.txt    # 词表文件（每行一个词；相对于项目根目录）
+  max_chars_per_call: 3000       # 每次纠错请求最多字符数
+
+pipeline:
+  process_interval_min: 10       # 多久处理一次新片段（分离 → ASR → 纠错）
+  min_segment_age_s: 20          # 片段创建后至少等待多少秒再处理（避免处理正在写的文件）
+  transcripts_dir: transcripts   # 文字记录目录（相对于 data_dir）
+
+memory:
+  top_k: 20                      # 检索返回条数
+  max_context_chars: 16000       # 送入模型的上下文字符上限
+  max_tool_rounds: 8             # 问答时每个问题最多的工具调用轮数
+  chat_model: ""                 # 问答模型；留空 = mimo.chat_model
+
+analysis:
+  daily_time: "22:30"            # 每日分析触发时间（本地时间 HH:MM）
+  push_daily: true               # 分析完成后是否推送
+  session_gap_min: 20            # 两句话间隔超过此分钟数即视为新的一段对话（session）
+  max_block_chars: 6000          # 每次 map 总结请求的最大字符数
+
+push:
+  channels: [toast]              # 启用的推送渠道列表，可多选：toast, feishu, wecom, serverchan, pushplus, wxpusher, ntfy
+  feishu:
+    webhook: ""                  # 【密钥】飞书自定义机器人 webhook，形如 https://open.feishu.cn/open-apis/bot/v2/hook/xxxx
+    secret: ""                   # 【密钥】飞书机器人"签名校验"密钥（未开启签名则留空）
+  wecom:
+    webhook: ""                  # 【密钥】企业微信群机器人 webhook，形如 https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxx
+  serverchan:
+    sendkey: ""                  # 【密钥】Server酱 Turbo 的 SendKey（SCTxxxx）
+  pushplus:
+    token: ""                    # 【密钥】PushPlus 用户 token
+  wxpusher:
+    spt: ""                      # 【密钥】WxPusher 极简推送 SPT（与 app_token/uids 二选一）
+    app_token: ""                # 【密钥】WxPusher 应用 appToken（AT_xxxx）
+    uids: []                     # WxPusher 接收者 UID 列表，例如 [UID_xxxx]
+  ntfy:
+    topic: ""                    # ntfy 主题名（任何人知道主题名即可订阅，建议用随机字符串）
+    server: https://ntfy.sh      # ntfy 服务器地址（可自建）
+
+log:
+  level: INFO                    # 日志级别：DEBUG | INFO | WARNING | ERROR
+  file: audio_note.log           # 日志文件名（位于 data_dir 下）

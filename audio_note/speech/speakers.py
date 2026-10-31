@@ -5,8 +5,10 @@ Models (sherpa-onnx, CPU, no torch):
   embedding    : 3D-Speaker CAM++ zh-cn 16k (192-d)
 
 Enrollment: `enroll(name, wav_paths)` extracts one embedding per sample (speech-gated) and stores
-them in speaker_embeddings. Identification: cosine similarity between a cluster's mean embedding
-and each enrolled speaker's embeddings (max over samples); accepted if >= identify_threshold.
+them in speaker_embeddings; a 16 kHz copy of the speech-only part of every accepted sample is kept
+under data/speakers/<name>/ so voices can be re-embedded later. Identification: cosine similarity
+between a cluster's mean embedding and each enrolled speaker's embeddings (max over samples);
+accepted if >= identify_threshold.
 """
 from __future__ import annotations
 
@@ -16,6 +18,7 @@ from pathlib import Path
 
 import numpy as np
 import sherpa_onnx
+import soundfile as sf
 
 from ..config import Config
 from ..db import DB
@@ -23,6 +26,8 @@ from ..audio.storage import read_segment
 from ..audio.vad import SAMPLE_RATE, GateConfig, SileroVAD, segment_audio
 
 log = logging.getLogger(__name__)
+
+MIN_ENROLL_SPEECH_S = 1.0   # samples with less speech than this are rejected (enroll and label alike)
 
 
 @dataclass
@@ -81,13 +86,35 @@ class SpeakerEngine:
         n = np.linalg.norm(e)
         return e / n if n > 0 else e
 
-    def embed_speech_only(self, audio: np.ndarray, max_s: float = 60.0) -> tuple[np.ndarray, float]:
-        """Concatenate VAD speech parts (up to max_s) before embedding. Returns (embedding, speech_seconds)."""
+    def speech_only(self, audio: np.ndarray, max_s: float = 60.0) -> np.ndarray:
+        """VAD speech parts of `audio` concatenated (up to max_s); the whole clip when VAD finds nothing."""
         segs = segment_audio(audio, self.vad, GateConfig(min_silence_s=0.3, pre_roll_s=0.1, post_roll_s=0.1, max_segment_s=max_s))
         parts = [s.audio for s in segs]
         speech = np.concatenate(parts) if parts else audio
-        speech = speech[: int(max_s * SAMPLE_RATE)]
+        return speech[: int(max_s * SAMPLE_RATE)]
+
+    def embed_speech_only(self, audio: np.ndarray, max_s: float = 60.0) -> tuple[np.ndarray, float]:
+        """Concatenate VAD speech parts (up to max_s) before embedding. Returns (embedding, speech_seconds)."""
+        speech = self.speech_only(audio, max_s)
         return self.embed(speech), len(speech) / SAMPLE_RATE
+
+    def _save_sample(self, name: str, speech: np.ndarray, stem: str) -> Path | None:
+        """Keep a 16 kHz mono copy of the accepted (speech-only) sample under data/speakers/<name>/ so
+        the voice can be re-embedded later (new model / threshold) even if the original file is gone."""
+        try:
+            d = self.cfg.speakers_dir / _safe_name(name)
+            d.mkdir(parents=True, exist_ok=True)
+            base = _safe_name(stem) or "sample"
+            dest = d / f"{base}.wav"
+            k = 0
+            while dest.exists():
+                k += 1
+                dest = d / f"{base}_{k}.wav"
+            sf.write(str(dest), speech.astype(np.float32, copy=False), SAMPLE_RATE, format="WAV", subtype="PCM_16")
+            return dest
+        except Exception as e:  # noqa: BLE001 - a missing copy must not block enrollment
+            log.warning("cannot save speaker sample for %s: %s", name, e)
+            return None
 
     # --- diarization -------------------------------------------------------
     def diarize(self, audio: np.ndarray) -> list[Turn]:
@@ -144,19 +171,27 @@ class SpeakerEngine:
         for src in sources:
             src = Path(src)
             audio = decode_any(src)
-            emb, speech_s = self.embed_speech_only(audio)
-            if speech_s < 1.0:
+            speech = self.speech_only(audio)
+            speech_s = len(speech) / SAMPLE_RATE
+            if speech_s < MIN_ENROLL_SPEECH_S:
                 log.warning("skip %s: only %.1fs speech", src, speech_s)
                 continue
-            db.add_speaker_embedding(sid, emb, str(src), speech_s)
+            saved = self._save_sample(name, speech, src.stem)
+            db.add_speaker_embedding(sid, self.embed(speech), str(saved or src), speech_s)
             n += 1
         log.info("enrolled %s with %d samples", name, n)
         return sid
 
     def enroll_from_audio(self, db: DB, name: str, audio: np.ndarray, source: str | None = None) -> int:
+        """Add one embedding for `name` from an in-memory clip. Raises ValueError when the clip holds
+        less than MIN_ENROLL_SPEECH_S of speech (a noise embedding would later attract false matches)."""
+        speech = self.speech_only(audio)
+        speech_s = len(speech) / SAMPLE_RATE
+        if speech_s < MIN_ENROLL_SPEECH_S:
+            raise ValueError(f"选中的范围只有 {speech_s:.1f}s 语音（至少需要 {MIN_ENROLL_SPEECH_S:.0f}s），未注册")
         sid = db.upsert_speaker(name)
-        emb, speech_s = self.embed_speech_only(audio)
-        db.add_speaker_embedding(sid, emb, source, speech_s)
+        saved = self._save_sample(name, speech, Path(str(source).split("#")[0]).stem if source else "label")
+        db.add_speaker_embedding(sid, self.embed(speech), source if source is not None else (str(saved) if saved else None), speech_s)
         return sid
 
     def enroll_from_segment_turns(self, db: DB, name: str, seg_path: Path | str, turns: list[tuple[float, float]]) -> int:
@@ -164,3 +199,8 @@ class SpeakerEngine:
         audio = read_segment(seg_path)
         parts = [audio[int(a * SAMPLE_RATE): int(b * SAMPLE_RATE)] for a, b in turns]
         return self.enroll_from_audio(db, name, np.concatenate(parts), f"{seg_path}#{turns[0][0]:.1f}-{turns[-1][1]:.1f}")
+
+
+def _safe_name(s: str) -> str:
+    """File-system friendly version of a speaker name / stem."""
+    return "".join(ch if ch.isalnum() or ch in "-_ ." else "_" for ch in str(s)).strip(" .") or "_"

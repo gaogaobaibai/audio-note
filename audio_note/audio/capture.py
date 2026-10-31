@@ -1,9 +1,17 @@
-"""Microphone capture via sounddevice (PortAudio). Produces float32 mono 16 kHz blocks on a queue."""
+"""Microphone capture via sounddevice (PortAudio). Produces float32 mono 16 kHz blocks on a queue.
+
+Every block is stamped with the wall-clock time of its PortAudio callback (``last_block_wall``
+after ``read()``), so the consumer can anchor sample indices to real time even when blocks were
+dropped, the machine slept, or the queue built up a backlog. ``last_callback_at`` / ``is_active()``
+let the consumer detect a stream that silently stopped delivering (device unplugged, WASAPI
+endpoint invalidated after sleep/resume).
+"""
 from __future__ import annotations
 
 import logging
 import queue
 import threading
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -64,11 +72,13 @@ class MicCapture:
         self.device = resolve_device(device)
         self.block_ms = block_ms
         self.gain = gain
-        self.queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=max_queue)
+        self.queue: queue.Queue[tuple[np.ndarray, float]] = queue.Queue(maxsize=max_queue)
         self.sr = TARGET_SR
         self._stream: sd.InputStream | None = None
         self.dropped = 0
         self.overflows = 0
+        self.last_callback_at: float = 0.0   # time.time() of the most recent PortAudio callback
+        self.last_block_wall: float = 0.0    # time.time() stamp of the block most recently returned by read()
         self._lock = threading.Lock()
 
     def _open(self, sr: int) -> sd.InputStream:
@@ -89,7 +99,18 @@ class MicCapture:
             self._stream.start()
             self.sr = sr
         log.info("capture started on device %s (%s) @ %d Hz", self.device, sd.query_devices(self.device, "input")["name"], self.sr)
+        self.last_callback_at = time.time()
         return self
+
+    def is_active(self) -> bool:
+        """True while the PortAudio stream reports itself running."""
+        s = self._stream
+        if s is None:
+            return False
+        try:
+            return bool(s.active)
+        except Exception:  # noqa: BLE001 - closed/invalid stream
+            return False
 
     def __exit__(self, *exc) -> None:
         if self._stream is not None:
@@ -98,6 +119,8 @@ class MicCapture:
             self._stream = None
 
     def _cb(self, indata: np.ndarray, frames: int, time_info, status) -> None:
+        now = time.time()
+        self.last_callback_at = now
         if status and status.input_overflow:
             self.overflows += 1
         x = indata[:, 0].copy()
@@ -106,12 +129,16 @@ class MicCapture:
         if self.sr != TARGET_SR:
             x = _resample(x, self.sr, TARGET_SR)
         try:
-            self.queue.put_nowait(x)
+            self.queue.put_nowait((x, now))
         except queue.Full:
             self.dropped += 1
 
     def read(self, timeout: float = 1.0) -> np.ndarray | None:
+        """Next block (float32 mono 16 kHz) or None on timeout; its callback wall time is left in
+        ``last_block_wall``."""
         try:
-            return self.queue.get(timeout=timeout)
+            block, wall = self.queue.get(timeout=timeout)
         except queue.Empty:
             return None
+        self.last_block_wall = wall
+        return block

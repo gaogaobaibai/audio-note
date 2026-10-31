@@ -4,5 +4,6 @@ __pycache__/
 data/
 models/
 config.yaml
+glossary.txt
 *.log
 .pytest_cache/

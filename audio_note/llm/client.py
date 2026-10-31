@@ -19,7 +19,7 @@ from typing import Any, Callable
 
 from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI, RateLimitError
 
-from ..config import Config
+from ..config import Config, is_placeholder_key
 
 log = logging.getLogger(__name__)
 
@@ -30,6 +30,48 @@ class LLMError(RuntimeError):
 
 class MissingAPIKey(LLMError):
     pass
+
+
+class ContentFiltered(LLMError):
+    """HTTP 421: the input was rejected by the content filter. Deterministic, never retried;
+    the pipeline skips the affected ASR chunk instead of failing the whole segment."""
+
+
+RETRYABLE_STATUS = {408, 409, 429}           # plus every 5xx
+RATE_LIMIT_BASE_DELAY_S = 10.0               # 429: 10 / 20 / 40 / 60 s so three retries span a per-minute window
+RATE_LIMIT_MAX_DELAY_S = 60.0
+BASE_DELAY_S = 2.0                           # 5xx / network: 2 / 4 / 8 s
+MAX_DELAY_S = 60.0
+
+
+def _retry_after_seconds(err: Exception) -> float | None:
+    """Seconds requested by a Retry-After header (integer seconds or HTTP-date), or None."""
+    resp = getattr(err, "response", None)
+    headers = getattr(resp, "headers", None)
+    if not headers:
+        return None
+    try:
+        raw = headers.get("retry-after")
+    except Exception:  # noqa: BLE001
+        return None
+    if not raw:
+        return None
+    raw = str(raw).strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+
+        dt = parsedate_to_datetime(raw)
+        return max(0.0, dt.timestamp() - time.time())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _is_retryable_status(code: int) -> bool:
+    return code in RETRYABLE_STATUS or code >= 500
 
 
 class RateLimiter:
@@ -53,7 +95,7 @@ class MimoClient:
     def __init__(self, cfg: Config, rpm: int = 90):
         m = cfg.mimo
         self.cfg = cfg
-        if not m.api_key:
+        if not m.api_key or is_placeholder_key(m.api_key):
             raise MissingAPIKey("mimo.api_key is empty: fill config.yaml or set MIMO_API_KEY")
         self.client = OpenAI(api_key=m.api_key, base_url=m.base_url, timeout=float(m.timeout_s), max_retries=0)
         self.chat_model = m.chat_model
@@ -65,27 +107,42 @@ class MimoClient:
 
     # --- low level ---------------------------------------------------------
     def _with_retry(self, fn: Callable[[], Any], what: str) -> Any:
-        delay = 2.0
+        """Retry policy: 429 -> 10/20/40/60 s backoff (Retry-After honoured when larger);
+        408/409/5xx/network -> 2/4/8 s; every other 4xx (400/413/415/422, 401/402/403/404) is
+        deterministic and raised at once; 421 raises ContentFiltered."""
+        delay = BASE_DELAY_S
+        rl_delay = RATE_LIMIT_BASE_DELAY_S
         for attempt in range(self.max_retries + 1):
+            rate_limited = False
             try:
                 self.limiter.wait()
                 return fn()
             except RateLimitError as e:
                 err: Exception = e
+                rate_limited = True
             except APIStatusError as e:
-                if e.status_code in (402, 401, 403, 404):
-                    raise LLMError(f"{what}: HTTP {e.status_code} {getattr(e, 'message', e)}") from e
-                if e.status_code == 421:
-                    raise LLMError(f"{what}: content filtered (421)") from e
+                code = int(getattr(e, "status_code", 0) or 0)
+                if code == 421:
+                    raise ContentFiltered(f"{what}: content filtered (421)") from e
+                if not _is_retryable_status(code):
+                    raise LLMError(f"{what}: HTTP {code} {getattr(e, 'message', e)}") from e
                 err = e
+                rate_limited = code == 429
             except (APIConnectionError, APITimeoutError) as e:
                 err = e
             if attempt >= self.max_retries:
                 raise LLMError(f"{what}: giving up after {attempt + 1} attempts: {err}") from err
-            sleep = delay * (1 + random.random() * 0.5)
+            if rate_limited:
+                sleep = rl_delay * (1 + random.random() * 0.5)
+                rl_delay = min(rl_delay * 2, RATE_LIMIT_MAX_DELAY_S)
+            else:
+                sleep = delay * (1 + random.random() * 0.5)
+                delay = min(delay * 2, MAX_DELAY_S)
+            hinted = _retry_after_seconds(err)
+            if hinted is not None and hinted > sleep:
+                sleep = min(hinted + 0.5, 300.0)
             log.warning("%s failed (%s); retry in %.1fs", what, err, sleep)
             time.sleep(sleep)
-            delay = min(delay * 2, 60)
         raise LLMError(what)  # unreachable
 
     def _account(self, resp: Any) -> None:
@@ -104,8 +161,10 @@ class MimoClient:
              max_tokens: int = 4096, json_mode: bool = False, thinking: bool = False,
              tools: list[dict] | None = None, tool_choice: Any = None) -> Any:
         """Returns the raw ChatCompletion. Use .choices[0].message."""
+        # `max_tokens` is the field every OpenAI-compatible server (MiMo included) honours;
+        # `max_completion_tokens` is OpenAI-only and would be silently ignored or rejected elsewhere.
         kwargs: dict[str, Any] = dict(
-            model=model or self.chat_model, messages=messages, max_completion_tokens=max_tokens,
+            model=model or self.chat_model, messages=messages, max_tokens=max_tokens,
             extra_body={"thinking": {"type": "enabled" if thinking else "disabled"}},
         )
         if not thinking:

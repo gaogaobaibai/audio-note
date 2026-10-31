@@ -29,6 +29,7 @@ DEFAULTS: dict[str, Any] = {
         "asr_model": "mimo-v2.5-asr",
         "asr_language": "auto",        # auto | zh | en
         "asr_max_chunk_s": 60,         # ASR quality degrades past ~2 min per request; split at quiet points
+        "asr_concurrency": 4,          # parallel ASR requests per segment (latency ~0.8x realtime each; API cap 100 RPM)
         "rpm": 90,                     # client-side request rate cap (API limit is 100 RPM)
         "timeout_s": 120,
         "max_retries": 3,
@@ -87,7 +88,8 @@ DEFAULTS: dict[str, Any] = {
     "analysis": {
         "daily_time": "22:30",
         "push_daily": True,
-        "lookback_days": 7,
+        "session_gap_min": 20,         # a gap longer than this splits the day into separate sessions
+        "max_block_chars": 6000,       # max characters per map-step LLM call
     },
     "push": {
         "channels": ["toast"],         # any of: toast, feishu, wecom, serverchan, pushplus, wxpusher, ntfy
@@ -100,6 +102,25 @@ DEFAULTS: dict[str, Any] = {
     },
     "log": {"level": "INFO", "file": "audio_note.log"},
 }
+
+
+#: values that mean "not filled in yet" (the example / init templates and common habits)
+API_KEY_PLACEHOLDERS = frozenset({
+    "sk-填这里", "填这里", "sk-xxx", "sk-xxxx", "sk-...", "xxx", "your-key", "your_api_key", "your-api-key",
+    "<your-key>", "<api-key>", "todo", "changeme", "none", "null",
+})
+
+
+def is_placeholder_key(key: Any) -> bool:
+    """True for an empty value or a known placeholder, so every 'missing key' guard treats it as unset."""
+    if key is None:
+        return True
+    s = str(key).strip()
+    if not s:
+        return True
+    if s.lower() in API_KEY_PLACEHOLDERS or s in API_KEY_PLACEHOLDERS:
+        return True
+    return ("填" in s) or (s.startswith("<") and s.endswith(">"))
 
 
 class Section(dict):
@@ -192,6 +213,9 @@ def load_config(path: str | os.PathLike | None = None) -> Config:
     env_key = os.environ.get("MIMO_API_KEY")
     if env_key:
         merged["mimo"]["api_key"] = env_key
+    # a placeholder copied from config.example.yaml must behave exactly like an empty key
+    if is_placeholder_key(merged["mimo"].get("api_key")):
+        merged["mimo"]["api_key"] = ""
     cfg = Config(merged)
     cfg["_config_path"] = str(p)
     return cfg

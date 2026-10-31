@@ -198,6 +198,27 @@ class DB:
             (f"-{int(min_age_s)} seconds", limit),
         )
 
+    def reset_stale_processing(self, max_age_s: int = 600) -> int:
+        """Put segments stuck in 'processing' (process killed mid-segment) back to 'new'.
+        Only rows whose updated_at is older than max_age_s are touched, so a processor that is
+        genuinely working in another thread/process is left alone. Returns the number reset."""
+        cur = self.execute(
+            "UPDATE segments SET status='new', error=NULL, updated_at=? WHERE status='processing'"
+            " AND updated_at <= datetime('now','localtime', ?)",
+            (now_iso(), f"-{int(max_age_s)} seconds"),
+        )
+        return int(cur.rowcount or 0)
+
+    def unfinished_segments_for_day(self, day: str, failed_within_s: int = 86400) -> int:
+        """Segments of `day` (by started_at) that have not produced utterances yet: new / processing,
+        plus failed ones that failed recently (older failures need a manual --retry-failed)."""
+        row = self.one(
+            "SELECT COUNT(*) AS n FROM segments WHERE started_at >= ? AND started_at < ? AND ("
+            " status IN ('new','processing') OR (status='failed' AND updated_at >= datetime('now','localtime', ?)))",
+            (f"{day}T00:00:00", f"{day}T23:59:59.999", f"-{int(failed_within_s)} seconds"),
+        )
+        return int(row["n"]) if row else 0
+
     # --- speakers ----------------------------------------------------------
     def upsert_speaker(self, name: str, notes: str | None = None) -> int:
         row = self.one("SELECT id FROM speakers WHERE name=?", (name,))

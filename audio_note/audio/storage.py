@@ -23,6 +23,8 @@ from .vad import SAMPLE_RATE, SileroVAD, speech_seconds
 
 log = logging.getLogger(__name__)
 
+RATIO_MIN_DURATION_S = 10.0   # min_speech_ratio only applies to segments at least this long (short replies are fine)
+
 
 def opus_compression_level(bitrate_bps: int) -> float:
     """libsndfile maps compression_level (0..1) to an Opus VBR bitrate roughly linearly:
@@ -37,17 +39,35 @@ def segment_path(cfg: Config, started_at: datetime, ext: str) -> Path:
     return d / (started_at.strftime("%H%M%S_") + f"{started_at.microsecond // 1000:03d}" + ext)
 
 
-def write_segment_file(cfg: Config, audio: np.ndarray, started_at: datetime) -> Path:
+def unique_segment_path(cfg: Config, started_at: datetime, ext: str, db: DB | None = None) -> Path:
+    """segment_path() that is neither on disk nor registered in `segments` (appends _1, _2, ...).
+
+    Two imports with the same --start, a re-import after cleanup expired the earlier files, or two
+    phone recordings carrying the same timestamp must never overwrite each other's audio or trip
+    the UNIQUE(path) constraint half-way through an import.
+    """
+    base = segment_path(cfg, started_at, ext)
+    stem = base.name[: -len(ext)] if ext and base.name.endswith(ext) else base.stem
+    cand = base
+    k = 0
+    while cand.exists() or (db is not None and db.one("SELECT id FROM segments WHERE path=?", (str(cand),)) is not None):
+        k += 1
+        cand = base.parent / f"{stem}_{k}{ext}"
+    return cand
+
+
+def write_segment_file(cfg: Config, audio: np.ndarray, started_at: datetime, db: DB | None = None) -> Path:
+    """Encode `audio` to a fresh file named after `started_at`; never overwrites an existing segment."""
     codec = cfg.audio.codec
     if codec == "opus":
-        p = segment_path(cfg, started_at, ".opus")
+        p = unique_segment_path(cfg, started_at, ".opus", db)
         sf.write(p, audio, SAMPLE_RATE, format="OGG", subtype="OPUS",
                  compression_level=opus_compression_level(int(cfg.audio.opus_bitrate)))
     elif codec == "flac":
-        p = segment_path(cfg, started_at, ".flac")
+        p = unique_segment_path(cfg, started_at, ".flac", db)
         sf.write(p, audio, SAMPLE_RATE, format="FLAC", subtype="PCM_16")
     else:
-        p = segment_path(cfg, started_at, ".wav")
+        p = unique_segment_path(cfg, started_at, ".wav", db)
         sf.write(p, audio, SAMPLE_RATE, format="WAV", subtype="PCM_16")
     return p
 
@@ -89,14 +109,26 @@ class PartialWriter:
 
 def finalize_segment(cfg: Config, db: DB, audio: np.ndarray, started_at: datetime, speech_s: float,
                      source: str = "mic", origin: str | None = None, partial: Path | None = None) -> int | None:
-    """Encode + register one segment. Returns the segment id (or None if dropped as non-speech)."""
+    """Encode + register one segment. Returns the segment id (or None if dropped as non-speech).
+
+    Dropped when speech_s < storage.min_speech_total_s, or (for segments longer than
+    RATIO_MIN_DURATION_S) when speech_s / duration < storage.min_speech_ratio: a gate kept open by
+    hysteresis-band noise (TV, HVAC, distant chatter) can otherwise run to max_segment_s with a
+    second of real speech in it.
+    """
     dur = len(audio) / SAMPLE_RATE
     if speech_s < float(cfg.storage.min_speech_total_s):
         log.debug("dropping %.1fs segment with only %.2fs speech", dur, speech_s)
         if partial and partial.exists():
             partial.unlink()
         return None
-    path = write_segment_file(cfg, audio, started_at)
+    ratio = speech_s / max(dur, 1e-6)
+    if dur >= RATIO_MIN_DURATION_S and ratio < float(cfg.storage.min_speech_ratio):
+        log.info("dropping %.1fs segment: speech ratio %.3f < %.2f", dur, ratio, float(cfg.storage.min_speech_ratio))
+        if partial and partial.exists():
+            partial.unlink()
+        return None
+    path = write_segment_file(cfg, audio, started_at, db)
     seg_id = db.add_segment(path, started_at, dur, SAMPLE_RATE, source=source, origin=origin, speech_s=speech_s)
     if partial and partial.exists():
         partial.unlink()
@@ -150,8 +182,10 @@ def _delete_file(path: str) -> None:
 
 def cleanup(cfg: Config, db: DB, vad: SileroVAD | None = None) -> dict[str, int]:
     """Housekeeping pass:
-    1. VAD re-check of segments without speech_s -> delete those with (almost) no speech.
-    2. Delete audio of transcribed segments older than keep_audio_days (transcripts are kept).
+    1. VAD re-check of segments without speech_s, plus 'new' segments whose stored speech ratio is
+       already below min_speech_ratio -> delete those with (almost) no speech.
+    2. Delete audio of transcribed (or permanently failed) segments older than keep_audio_days
+       (transcripts are kept).
     3. If audio dir exceeds max_disk_gb, delete oldest transcribed audio first.
     4. Remove empty day folders.
     """
@@ -160,7 +194,12 @@ def cleanup(cfg: Config, db: DB, vad: SileroVAD | None = None) -> dict[str, int]
 
     # 1. recheck
     if vad is not None:
-        for row in db.query("SELECT * FROM segments WHERE speech_s IS NULL AND status IN ('new','done')"):
+        rows = db.query(
+            "SELECT * FROM segments WHERE (speech_s IS NULL AND status IN ('new','done'))"
+            " OR (status='new' AND speech_s IS NOT NULL AND duration_s >= ? AND speech_s / MAX(duration_s, 1e-6) < ?)",
+            (RATIO_MIN_DURATION_S, float(st.min_speech_ratio)),
+        )
+        for row in rows:
             try:
                 audio = read_segment(row["path"])
             except Exception as e:  # noqa: BLE001
@@ -171,7 +210,8 @@ def cleanup(cfg: Config, db: DB, vad: SileroVAD | None = None) -> dict[str, int]
             db.execute("UPDATE segments SET speech_s=? WHERE id=?", (sp, row["id"]))
             stats["rechecked"] += 1
             ratio = sp / max(1e-6, row["duration_s"])
-            if row["status"] == "new" and (sp < float(st.min_speech_total_s) or ratio < float(st.min_speech_ratio)):
+            low_ratio = ratio < float(st.min_speech_ratio) and float(row["duration_s"]) >= RATIO_MIN_DURATION_S
+            if row["status"] == "new" and (sp < float(st.min_speech_total_s) or low_ratio):
                 _delete_file(row["path"])
                 db.set_segment_status(row["id"], "no_speech")
                 stats["no_speech"] += 1
@@ -180,7 +220,7 @@ def cleanup(cfg: Config, db: DB, vad: SileroVAD | None = None) -> dict[str, int]
     keep_days = int(st.keep_audio_days or 0)
     if keep_days > 0:
         cutoff = (datetime.now() - timedelta(days=keep_days)).isoformat(timespec="seconds")
-        for row in db.query("SELECT id, path FROM segments WHERE status='done' AND started_at < ?", (cutoff,)):
+        for row in db.query("SELECT id, path FROM segments WHERE status IN ('done','failed') AND started_at < ?", (cutoff,)):
             _delete_file(row["path"])
             db.set_segment_status(row["id"], "deleted")
             stats["expired"] += 1

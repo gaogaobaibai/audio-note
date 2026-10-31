@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
 import tempfile
 from datetime import datetime, timedelta
@@ -36,19 +37,27 @@ def decode_any(path: Path) -> np.ndarray:
         return audio if audio.ndim == 1 else audio.mean(axis=1)
 
 
-def guess_start_time(path: Path) -> datetime:
-    """Try YYYYMMDD[_-]HHMMSS or YYYY-MM-DD[ _]HH-MM-SS in the file name, else file mtime minus duration (set later)."""
-    import re
+_NAME_TIME_RE = re.compile(r"(20\d{2})[-_]?(\d{2})[-_]?(\d{2})[ _T-]?(\d{2})[-_:]?(\d{2})(?:[-_:]?(\d{2}))?")
 
-    s = path.stem
-    m = re.search(r"(20\d{2})[-_]?(\d{2})[-_]?(\d{2})[ _T-]?(\d{2})[-_:]?(\d{2})[-_:]?(\d{2})", s)
-    if m:
-        y, mo, d, h, mi, se = (int(g) for g in m.groups())
-        try:
-            return datetime(y, mo, d, h, mi, se)
-        except ValueError:
-            pass
-    return datetime.fromtimestamp(path.stat().st_mtime)
+
+def parse_name_time(path: Path) -> datetime | None:
+    """Start time encoded in the file name (YYYYMMDD[_-]HHMM[SS], YYYY-MM-DD[ _T]HH-MM[-SS], ...),
+    or None when absent or not a valid date. Seconds are optional (voice recorders often omit them)."""
+    m = _NAME_TIME_RE.search(Path(path).stem)
+    if not m:
+        return None
+    y, mo, d, h, mi, se = (int(g) if g is not None else 0 for g in m.groups())
+    try:
+        return datetime(y, mo, d, h, mi, se)
+    except ValueError:
+        return None
+
+
+def guess_start_time(path: Path) -> datetime:
+    """Time from the file name (parse_name_time) else the file mtime (usually the END of a recording:
+    import_file subtracts the duration in that case, see _name_has_time)."""
+    t = parse_name_time(path)
+    return t if t is not None else datetime.fromtimestamp(path.stat().st_mtime)
 
 
 def import_file(cfg: Config, db: DB, path: Path, start_time: datetime | None = None,
@@ -75,6 +84,6 @@ def import_file(cfg: Config, db: DB, path: Path, start_time: datetime | None = N
 
 
 def _name_has_time(path: Path) -> bool:
-    import re
-
-    return re.search(r"20\d{2}[-_]?\d{2}[-_]?\d{2}[ _T-]?\d{2}[-_:]?\d{2}", path.stem) is not None
+    """True exactly when guess_start_time() took the time from the file name (same parser, so an
+    invalid date such as month 13 counts as 'no time in name' and the mtime path is used)."""
+    return parse_name_time(path) is not None
