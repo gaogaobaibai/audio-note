@@ -307,3 +307,37 @@ def test_push_leaves_pushed_at_when_all_fail(cfg, db, monkeypatch):
     _fake_push_module(monkeypatch, {"toast": "no toast"})
     assert an.push(DAY) == {"toast": "no toast"}
     assert db.one("SELECT pushed_at FROM daily_summaries WHERE day=?", (DAY,))["pushed_at"] is None
+
+
+# ----------------------------------------------------------------------------------------------
+# review fix: the cache also keys on the people side (names / self / relations), not just the count
+# ----------------------------------------------------------------------------------------------
+def test_rerun_refreshes_when_people_change_and_keeps_legacy_digests(cfg, db):
+    _two_sessions(db)
+    client = FakeClient()
+    an = DailyAnalyzer(cfg, db, client)
+    _, js1 = an.run(DAY)
+    n_calls = len(client.calls)
+    assert isinstance(js1.get("people_fp"), str) and len(js1["people_fp"]) == 40
+    assert an.run(DAY)[1]["people_fp"] == js1["people_fp"] and len(client.calls) == n_calls and an.last_run_cached
+    # a voice gets named: same utterance count, different (speaker, count) pairs -> regenerated
+    db.execute("UPDATE utterances SET speaker_name='王五' WHERE speaker_name IS NULL")
+    _, js2 = an.run(DAY)
+    assert len(client.calls) == 2 * n_calls and not an.last_run_cached and js2["people_fp"] != js1["people_fp"]
+    # the user marks somebody as self -> the 「人物」 line changes -> regenerated again
+    sid = db.upsert_speaker("张三")
+    db.execute("UPDATE utterances SET speaker_id=? WHERE speaker_name='张三'", (sid,))
+    db.set_self_speaker(sid)
+    _, js3 = an.run(DAY)
+    assert len(client.calls) == 3 * n_calls and js3["people_fp"] != js2["people_fp"] and js3["self_name"] == "张三"
+    assert "张三" in client.calls[-1]["user"]
+    an.run(DAY)
+    assert len(client.calls) == 3 * n_calls and an.last_run_cached
+    # a digest stored before the fingerprint existed is still trusted while the count matches
+    row = json.loads(db.one("SELECT summary_json FROM daily_summaries WHERE day=?", (DAY,))["summary_json"])
+    row.pop("people_fp")
+    db.execute("UPDATE daily_summaries SET summary_json=? WHERE day=?", (json.dumps(row, ensure_ascii=False), DAY))
+    db.set_relation(sid, "同事", "user")
+    _, js4 = an.run(DAY)
+    assert js4.get("people_fp") is None and len(client.calls) == 3 * n_calls and an.last_run_cached
+    assert an.run(DAY, force=True)[1]["people_fp"] and len(client.calls) == 4 * n_calls

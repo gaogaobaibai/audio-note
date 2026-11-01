@@ -11,7 +11,7 @@ import logging
 import sys
 import time
 import types
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -897,3 +897,269 @@ def test_init_missing_models_returns_1(tmp_path: Path, monkeypatch: pytest.Monke
     finally:
         from audio_note.logging_setup import _remove_own_handlers
         _remove_own_handlers(logging.getLogger())
+
+
+# --- speakers v2: set-self / relation / relations / voices / scan ------------------------------------
+
+def _unit_vec(seed: int, dim: int = 192) -> np.ndarray:
+    v = np.random.default_rng(seed).standard_normal(dim).astype(np.float32)
+    return v / np.linalg.norm(v)
+
+
+class VoiceEngine:
+    """SpeakerEngine stand-in for `speakers voices` / `scan`: the real voices module drives it
+    (cluster_embedding for the backfill, enroll_from_audio for naming)."""
+
+    instances: list["VoiceEngine"] = []
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.calls: list[tuple] = []
+        VoiceEngine.instances.append(self)
+
+    def cluster_embedding(self, audio, turns):
+        self.calls.append(("cluster", len(turns)))
+        return _unit_vec(7)
+
+    def enroll_from_audio(self, db, name, audio, source=None, copy_as_source=False):
+        self.calls.append(("enroll", name, source))
+        sid = db.upsert_speaker(name)
+        db.add_speaker_embedding(sid, _unit_vec(8), source, len(audio) / SR)
+        return sid
+
+
+@pytest.fixture
+def voice_engine(monkeypatch: pytest.MonkeyPatch):
+    import audio_note.speech.speakers as spk
+
+    VoiceEngine.instances.clear()
+    monkeypatch.setattr(spk, "SpeakerEngine", VoiceEngine)
+    return VoiceEngine
+
+
+def _unknown_segment(db: DB, cfg: Any, when: datetime, texts: list[str], cluster: int = 0) -> int:
+    """A done segment with a real wav file and unidentified utterances of 2 s each in one cluster."""
+    wav = write_wav(cfg.audio_dir / when.strftime("%Y-%m-%d") / f"seg_{when.strftime('%H%M%S')}.wav", 2.0 * len(texts) + 1)
+    seg = add_done_segment(db, cfg, when, path=wav)
+    db.add_utterances([{"segment_id": seg, "start_s": 2.0 * i, "end_s": 2.0 * i + 2.0, "cluster_label": cluster,
+                        "abs_start": (when + timedelta(seconds=2 * i)).isoformat(timespec="milliseconds"),
+                        "day": when.strftime("%Y-%m-%d"), "text_raw": t, "text": t} for i, t in enumerate(texts)])
+    return seg
+
+
+def test_speakers_set_self_and_relation(tmp_cfg, out: io.StringIO):
+    db = DB(tmp_cfg.db_path)
+    a = db.upsert_speaker("张伟")
+    b = db.upsert_speaker("王敏")
+    assert cli.main(["speakers", "set-self", "李四"]) == 2
+    assert "没有叫 李四 的说话人" in out.getvalue()
+    assert cli.main(["speakers", "set-self", "张伟"]) == 0
+    assert "已把 张伟 (id 1) 设为本人" in out.getvalue() and db.self_speaker()["id"] == a
+    out.truncate(0); out.seek(0)
+    assert cli.main(["speakers", "set-self", "王敏"]) == 0                      # moves: still exactly one self
+    assert "本人已从 张伟 改为 王敏" in out.getvalue()
+    assert [r["id"] for r in db.query("SELECT id FROM speakers WHERE is_self=1")] == [b]
+    assert cli.main(["speakers", "relation", "王敏", "同事"]) == 2               # self needs no relation
+    assert cli.main(["speakers", "relation", "张伟", "同事", "--note", "同一个组"]) == 0
+    assert "已标注 张伟：同事（同一个组）" in out.getvalue()
+    row = db.one("SELECT relation, relation_source, relation_note, relation_updated_at FROM speakers WHERE id=?", (a,))
+    assert tuple(row)[:3] == ("同事", "user", "同一个组") and row["relation_updated_at"]
+    out.truncate(0); out.seek(0)
+    assert cli.main(["speakers", "list"]) == 0
+    text = out.getvalue()
+    assert "本人" in text and "关系" in text and "同事" in text and "我" in text
+    assert text.index("王敏") < text.index("张伟")                                # self is listed first
+    assert cli.main(["speakers", "relation", "张伟", "-"]) == 0
+    assert "已清除 张伟 的关系标注" in out.getvalue()
+    assert tuple(db.one("SELECT relation, relation_source, relation_note FROM speakers WHERE id=?", (a,))) == (None, None, None)
+    db.set_relation(a, "朋友", "auto", "推断")
+    out.truncate(0); out.seek(0)
+    assert cli.main(["speakers", "list"]) == 0
+    assert "朋友（自动推断）" in out.getvalue()
+    # no self yet -> hint
+    db.set_self_speaker(None)
+    out.truncate(0); out.seek(0)
+    assert cli.main(["speakers", "list"]) == 0
+    assert "speakers set-self" in out.getvalue()
+
+
+def test_speakers_relations_prints_table(tmp_cfg, fake_client, monkeypatch: pytest.MonkeyPatch, out: io.StringIO):
+    from audio_note.analysis import relations
+
+    db = DB(tmp_cfg.db_path)
+    sid = db.upsert_speaker("王敏")
+    seen: list[dict] = []
+
+    def fake_infer(cfg, db_, client, speaker_ids=None, force=False):
+        assert client is fake_client
+        seen.append({"speaker_ids": speaker_ids, "force": force})
+        return [{"id": sid, "name": "王敏", "relation": "同事", "confidence": 0.82, "reason": "叫他王总", "applied": True, "skipped": None},
+                {"id": 9, "name": "李强", "relation": "不确定", "confidence": 0.3, "reason": "证据不足", "applied": False, "skipped": None},
+                {"id": 10, "name": "小雨", "relation": None, "confidence": None, "reason": None, "applied": False, "skipped": "语句太少"}]
+
+    monkeypatch.setattr(relations, "infer_relations", fake_infer)
+    assert cli.main(["speakers", "relations"]) == 0
+    text = out.getvalue()
+    for needle in ("关系推断", "王敏", "同事", "0.82", "已写入", "叫他王总", "李强", "未写入", "小雨", "跳过：语句太少", "共 3 人，写入 1 个关系"):
+        assert needle in text, needle
+    assert cli.main(["speakers", "relations", "--force", "--speaker", "王敏"]) == 0
+    assert seen == [{"speaker_ids": None, "force": False}, {"speaker_ids": [sid], "force": True}]
+    assert cli.main(["speakers", "relations", "--speaker", "没有人"]) == 2
+    assert "没有叫 没有人 的说话人" in out.getvalue() and len(seen) == 2
+    monkeypatch.setattr(relations, "infer_relations", lambda *a, **k: [])
+    out.truncate(0); out.seek(0)
+    assert cli.main(["speakers", "relations"]) == 0
+    assert "没有需要推断的说话人" in out.getvalue()
+
+
+def test_speakers_relations_without_api_key_is_cli_error(tmp_cfg, out: io.StringIO):
+    assert cli.main(["speakers", "relations"]) == 2
+    assert "MIMO_API_KEY" in out.getvalue()
+
+
+def test_speakers_voices_scan_list_and_assign(tmp_cfg, voice_engine, out: io.StringIO):
+    db = DB(tmp_cfg.db_path)
+    assert cli.main(["speakers", "voices"]) == 0
+    assert "没有待确认的声音" in out.getvalue() and voice_engine.instances == []      # empty db: no engine loaded
+    seg1 = _unknown_segment(db, tmp_cfg, datetime(2026, 10, 30, 9, 0), ["早上好", "今天开会", "下午再说"])
+    seg2 = _unknown_segment(db, tmp_cfg, datetime(2026, 10, 31, 10, 0), ["明天见"])
+    out.truncate(0); out.seek(0)
+    assert cli.main(["speakers", "scan"]) == 0
+    text = out.getvalue()
+    assert "正在扫描 2 段录音" in text and "扫描完成：2 段 / 2 个声音簇" in text
+    assert len(voice_engine.instances) == 1 and [c for c in voice_engine.instances[0].calls if c[0] == "cluster"] == [("cluster", 3), ("cluster", 1)]
+    assert len(db.cluster_embeddings()) == 2
+    out.truncate(0); out.seek(0)
+    assert cli.main(["speakers", "scan"]) == 0
+    assert "没有需要扫描的录音段" in out.getvalue() and len(voice_engine.instances) == 1
+    # list: one group (identical fake embeddings), 4 sentences over 2 days, 3 example lines
+    out.truncate(0); out.seek(0)
+    assert cli.main(["speakers", "voices"]) == 0
+    text = out.getvalue()
+    assert "未识别的声音（1 组，4 句未识别）" in text and "2026-10-30 ~ 2026-10-31（2 天）" in text and "8s" in text
+    assert "早上好" in text and "今天开会" in text and "--assign <#>" in text
+    assert cli.main(["speakers", "voices", "--assign", "1"]) == 2
+    assert "需要给出姓名" in out.getvalue()
+    assert cli.main(["speakers", "voices", "--assign", "5", "张伟"]) == 2
+    assert "没有第 5 组" in out.getvalue()
+    out.truncate(0); out.seek(0)
+    assert cli.main(["speakers", "voices", "--assign", "1", "张伟", "--self", "--relation", "同事"]) == 0
+    text = out.getvalue()
+    assert "已标记为 张伟 (id 1)：4 句，补充 2 个声纹样本（2 段 / 2 天）" in text and "已设为本人" in text and "关系：同事" in text
+    assert "已更新检索索引（4 条）" in text and "speakers relabel" not in text    # nothing unidentified is left
+    utts = db.query("SELECT speaker_id, speaker_name, speaker_score, speaker_source FROM utterances ORDER BY id")
+    assert all(tuple(u) == (1, "张伟", None, "user") for u in utts) and len(utts) == 4
+    me = db.self_speaker()
+    assert me["name"] == "张伟" and me["relation"] == "同事" and me["relation_source"] == "user"
+    enrolls = [c for e in voice_engine.instances for c in e.calls if c[0] == "enroll"]
+    assert len(enrolls) == 2 and enrolls[0][1] == "张伟" and "#0.0-6.0" in enrolls[0][2]      # longest member first
+    assert (tmp_cfg.transcripts_dir / "2026-10-30.md").exists() and "张伟" in (tmp_cfg.transcripts_dir / "2026-10-31.md").read_text(encoding="utf-8")
+    out.truncate(0); out.seek(0)
+    assert cli.main(["speakers", "voices"]) == 0
+    assert "没有待确认的声音" in out.getvalue()
+    assert seg1 != seg2
+
+
+def test_speakers_voices_assign_after_a_scan_asks_for_a_fresh_number(tmp_cfg, voice_engine, out: io.StringIO):
+    db = DB(tmp_cfg.db_path)
+    _unknown_segment(db, tmp_cfg, datetime(2026, 10, 30, 9, 0), ["早上好"])
+    assert cli.main(["speakers", "voices", "--assign", "1", "张伟"]) == 1       # the scan just stored new clusters
+    text = out.getvalue()
+    assert "正在扫描 1 段录音" in text and "分组可能变了" in text
+    assert db.one("SELECT COUNT(*) AS n FROM speakers")["n"] == 0
+    out.truncate(0); out.seek(0)
+    assert cli.main(["speakers", "voices", "--assign", "1", "张伟"]) == 0        # nothing new: proceeds
+    assert "已标记为 张伟" in out.getvalue()
+    assert db.one("SELECT speaker_name FROM utterances")["speaker_name"] == "张伟"
+
+
+def test_speakers_voices_assign_too_short_is_cli_error(tmp_cfg, voice_engine, monkeypatch: pytest.MonkeyPatch, out: io.StringIO):
+    def too_short(self, db, name, audio, source=None):
+        raise ValueError("选中的范围只有 0.3s 语音（至少需要 1s），未注册")
+
+    monkeypatch.setattr(VoiceEngine, "enroll_from_audio", too_short)
+    db = DB(tmp_cfg.db_path)
+    _unknown_segment(db, tmp_cfg, datetime(2026, 10, 30, 9, 0), ["嗯"])
+    assert cli.main(["speakers", "scan"]) == 0
+    assert cli.main(["speakers", "voices", "--assign", "1", "新人"]) == 2
+    assert "语音太短" in out.getvalue()
+    assert db.one("SELECT COUNT(*) AS n FROM speakers")["n"] == 0
+    assert db.one("SELECT speaker_id FROM utterances")["speaker_id"] is None
+
+
+def test_speakers_label_accepts_self_and_relation(tmp_cfg, tmp_path: Path, speakers_stubs, out: io.StringIO):
+    db = DB(tmp_cfg.db_path)
+    wav = write_wav(tmp_cfg.audio_dir / "2026-10-31" / "seg.wav", 3.0)
+    seg = add_done_segment(db, tmp_cfg, datetime(2026, 10, 31, 8, 0), path=wav)
+    assert cli.main(["speakers", "label", str(seg), "张伟", "--from", "0.5", "--to", "2.0", "--self", "--relation", "导师"]) == 0
+    text = out.getvalue()
+    assert "已把 张伟 设为本人" in text and "关系：导师" in text
+    me = db.self_speaker()
+    assert me["name"] == "张伟" and me["relation"] == "导师" and me["relation_source"] == "user"
+    # without the flags nothing changes for the next person
+    assert cli.main(["speakers", "label", str(seg), "王敏", "--from", "0.5", "--to", "2.0"]) == 0
+    assert db.self_speaker()["name"] == "张伟" and db.one("SELECT relation FROM speakers WHERE name='王敏'")["relation"] is None
+
+
+# --- review fixes: stable keys in `speakers voices`, engine failures as CLIError ------------------------------
+
+def test_speakers_voices_shows_keys_and_assign_accepts_index_or_key(tmp_cfg, voice_engine, out: io.StringIO):
+    from audio_note.speech import voices
+
+    db = DB(tmp_cfg.db_path)
+    _unknown_segment(db, tmp_cfg, datetime(2026, 10, 30, 9, 0), ["早上好", "今天开会"])
+    assert cli.main(["speakers", "scan"]) == 0
+    key = voices.group_unknown_voices(db, tmp_cfg)["groups"][0]["key"]
+    out.truncate(0); out.seek(0)
+    assert cli.main(["speakers", "voices"]) == 0
+    text = out.getvalue()
+    assert "编号" in text and key[:6] in text and "也可以写编号" in text
+    # an unknown key, a too-short prefix and an index out of range are CLIErrors; nothing is named
+    assert cli.main(["speakers", "voices", "--assign", "zzzzzz", "张伟"]) == 2
+    assert "没有编号为 zzzzzz 的声音组" in out.getvalue()
+    assert cli.main(["speakers", "voices", "--assign", "ab", "张伟"]) == 2            # too short for a key
+    assert cli.main(["speakers", "voices", "--assign", "7", "张伟"]) == 2
+    assert "没有第 7 组" in out.getvalue()
+    assert db.one("SELECT COUNT(*) AS n FROM speakers")["n"] == 0
+    # by (short) key: the group it resolved to is printed
+    out.truncate(0); out.seek(0)
+    assert cli.main(["speakers", "voices", "--assign", key[:6], "张伟"]) == 0
+    text = out.getvalue()
+    assert f"第 1 组 = 编号 {key}" in text and "已标记为 张伟" in text
+    assert db.one("SELECT speaker_name FROM utterances")["speaker_name"] == "张伟"
+    # by index: the key it resolved to is printed; by full key works as well
+    _unknown_segment(db, tmp_cfg, datetime(2026, 10, 31, 9, 0), ["明天见"])
+    assert cli.main(["speakers", "scan"]) == 0
+    key2 = voices.group_unknown_voices(db, tmp_cfg)["groups"][0]["key"]
+    assert key2 != key
+    out.truncate(0); out.seek(0)
+    assert cli.main(["speakers", "voices", "--assign", "1", "王敏"]) == 0
+    assert f"第 1 组 = 编号 {key2}" in out.getvalue() and "已标记为 王敏" in out.getvalue()
+    _unknown_segment(db, tmp_cfg, datetime(2026, 11, 1, 9, 0), ["后天见"])
+    assert cli.main(["speakers", "scan"]) == 0
+    key3 = voices.group_unknown_voices(db, tmp_cfg)["groups"][0]["key"]
+    assert cli.main(["speakers", "voices", "--assign", key3, "王敏"]) == 0
+    assert db.one("SELECT COUNT(*) AS n FROM utterances WHERE speaker_id IS NULL")["n"] == 0
+
+
+def test_speakers_voices_engine_failure_is_a_cli_error(tmp_cfg, voice_engine, monkeypatch: pytest.MonkeyPatch, out: io.StringIO):
+    db = DB(tmp_cfg.db_path)
+    _unknown_segment(db, tmp_cfg, datetime(2026, 10, 30, 9, 0), ["早上好"])
+
+    def boom(self, cfg):
+        raise RuntimeError("onnxruntime: model file is corrupt")
+
+    monkeypatch.setattr(VoiceEngine, "__init__", boom)
+    assert cli.main(["speakers", "voices"]) == 2
+    text = out.getvalue()
+    assert "错误" in text and "声纹模型加载失败" in text and "Traceback" not in text
+    # a missing model file is reported before the engine is even built
+    cfg_path = Path(tmp_cfg["_config_path"])
+    data = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    data.setdefault("speakers", {})["embedding_model"] = "missing-model.onnx"
+    cfg_path.write_text(yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
+    monkeypatch.setattr(VoiceEngine, "__init__", lambda self, cfg: pytest.fail("the engine must not be built"))
+    out.truncate(0); out.seek(0)
+    assert cli.main(["speakers", "scan"]) == 2
+    assert "模型文件缺失" in out.getvalue() and "download_models" in out.getvalue()
+    assert db.one("SELECT COUNT(*) AS n FROM cluster_embeddings")["n"] == 0

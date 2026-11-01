@@ -387,7 +387,8 @@ def test_daily_job_with_fake_analyzer(rt: Runtime, monkeypatch: pytest.MonkeyPat
     with pytest.raises(JobError, match="MiMo API key"):
         rt.run_job("daily", day="2026-10-30")
     rt._client = FakeClient()
-    assert rt.run_job("daily", day="2026-10-30") == {"day": "2026-10-30", "utterances": 3, "cached": True, "partial": False, "chars": 4}
+    assert rt.run_job("daily", day="2026-10-30") == {"day": "2026-10-30", "utterances": 3, "cached": True, "partial": False, "chars": 4,
+                                                     "relations": []}
     out = rt.run_job("daily", day="2026-10-30", force=True, push=True)
     assert out["cached"] is False and out["push"] == {"toast": None} and pushes == ["2026-10-30"]
     assert runs == [("2026-10-30", False), ("2026-10-30", True)]
@@ -518,3 +519,199 @@ def test_reset_stop_event_propagates_to_processor(rt: Runtime):
     s.reset_stop_event(ev)
     assert s.stop_event is ev
     assert fake.stop_event is old and s._processor is None    # a tick still using `fake` keeps its (set) event
+
+
+# --- speakers v2: voices / relations jobs, status fields -----------------------------------------------
+
+def test_voices_and_relations_jobs_exist_with_labels(rt: Runtime):
+    from audio_note.runtime import JOB_LABELS
+
+    assert "voices" in JOBS and "relations" in JOBS
+    assert JOB_LABELS["voices"] == "扫描未识别的声音" and JOB_LABELS["relations"] == "推断关系"
+    assert set(rt.jobs) == set(JOBS)
+    st = rt.status()
+    assert st["jobs"]["voices"]["label"] == "扫描未识别的声音" and st["jobs"]["voices"]["running"] is False
+    assert st["jobs"]["relations"]["label"] == "推断关系" and st["jobs"]["relations"]["runs"] == 0
+
+
+def test_voices_job_runs_backfill_with_the_shared_engine(rt: Runtime, monkeypatch: pytest.MonkeyPatch):
+    from audio_note.speech import voices
+
+    engine = object()
+    rt._engine = engine
+    calls: list = []
+
+    def fake_backfill(db, cfg, eng, limit=None, stop_event=None):
+        calls.append((db, cfg, eng, limit, stop_event))
+        return {"segments": 2, "clusters": 3, "skipped": 0}
+
+    monkeypatch.setattr(voices, "backfill_cluster_embeddings", fake_backfill)
+    assert rt.run_job("voices") == {"segments": 2, "clusters": 3, "skipped": 0}
+    assert calls[0][0] is rt.db and calls[0][1] is rt.cfg and calls[0][2] is engine
+    assert calls[0][4] is None                                          # scheduler not running: no stop event
+    rt.start_service(record=False)
+    try:
+        rt.run_job("voices")
+        assert calls[1][4] is rt._svc_stop                              # the service's stop event ends a long scan
+    finally:
+        rt.stop_service()
+    st = rt.submit("voices")
+    assert rt.wait_jobs(5) and st.result == {"segments": 2, "clusters": 3, "skipped": 0} and st.runs == 1
+
+
+def test_relations_job_needs_a_key_and_passes_arguments(rt: Runtime, monkeypatch: pytest.MonkeyPatch):
+    from audio_note.analysis import relations
+
+    with pytest.raises(JobError, match="MiMo API key"):
+        rt.run_job("relations")
+    rt._client = FakeClient()
+    calls: list = []
+
+    def fake_infer(cfg, db, client, speaker_ids=None, force=False):
+        calls.append((cfg, db, client, speaker_ids, force))
+        return [{"id": 1, "name": "王敏", "relation": "同事", "confidence": 0.8, "reason": "r", "applied": True, "skipped": None},
+                {"id": 2, "name": "小雨", "relation": None, "confidence": 0.0, "reason": "", "applied": False, "skipped": "too few"}]
+
+    monkeypatch.setattr(relations, "infer_relations", fake_infer)
+    out = rt.run_job("relations")
+    assert out["speakers"] == 2 and out["applied"] == 1 and out["results"][0]["name"] == "王敏"
+    assert calls[-1][0] is rt.cfg and calls[-1][1] is rt.db and isinstance(calls[-1][2], FakeClient)
+    assert calls[-1][3] is None and calls[-1][4] is False
+    rt.run_job("relations", speaker_id=7, force=True)
+    assert calls[-1][3] == [7] and calls[-1][4] is True
+    st = rt.submit("relations", speaker_id=3)
+    assert st.args == {"speaker_id": 3} and rt.wait_jobs(5) and st.result["speakers"] == 2
+
+
+def test_daily_job_calls_relation_inference_and_tolerates_its_failure(rt: Runtime, monkeypatch: pytest.MonkeyPatch):
+    import audio_note.analysis.daily as daily_mod
+    from audio_note.analysis import relations
+
+    class FakeAnalyzer:
+        def __init__(self, cfg, db, client):
+            self.last_run_cached = False
+            self.last_run_partial = False
+
+        def run(self, day, force=False):
+            return "# md", {"utterance_count": 1}
+
+    monkeypatch.setattr(daily_mod, "DailyAnalyzer", FakeAnalyzer)
+    rt._client = FakeClient()
+    seen: list = []
+    monkeypatch.setattr(relations, "maybe_infer_after_daily",
+                        lambda cfg, db, client: seen.append(client) or [{"id": 1, "name": "x", "applied": True}])
+    out = rt.run_job("daily", day="2026-10-30")
+    assert out["relations"] == [{"id": 1, "name": "x", "applied": True}] and isinstance(seen[0], FakeClient)
+    monkeypatch.setattr(relations, "maybe_infer_after_daily", lambda cfg, db, client: (_ for _ in ()).throw(RuntimeError("llm down")))
+    out = rt.run_job("daily", day="2026-10-30")
+    assert out["relations"] == [] and out["utterances"] == 1                  # the digest itself still succeeded
+
+
+def test_scheduler_daily_calls_relation_inference_after_run(rt: Runtime, monkeypatch: pytest.MonkeyPatch):
+    import audio_note.analysis.daily as daily_mod
+    from audio_note.analysis import relations
+
+    order: list[str] = []
+
+    class FakeAnalyzer:
+        def __init__(self, cfg, db, client):
+            self.last_run_cached = False
+            self.last_run_partial = False
+
+        def run(self, day, force=False):
+            order.append("run")
+            return "# md", {"utterance_count": 1}
+
+        def push(self, day):
+            order.append("push")
+            return {"toast": None}
+
+    monkeypatch.setattr(daily_mod, "DailyAnalyzer", FakeAnalyzer)
+    client = FakeClient()
+    monkeypatch.setattr(rt.sched, "_client", lambda: client)
+    monkeypatch.setattr(relations, "maybe_infer_after_daily", lambda cfg, db, c: order.append("relations") or [])
+    rt.sched._default_daily("2026-10-30", push=True)
+    assert order == ["run", "push", "relations"]
+    # a crashing inference is logged, the daily result still comes back
+    monkeypatch.setattr(relations, "maybe_infer_after_daily", lambda cfg, db, c: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert rt.sched._default_daily("2026-10-30", push=False) == ("# md", {"utterance_count": 1})
+
+
+def test_status_reports_self_name_and_unknown_utterances(rt: Runtime):
+    st = rt.status()
+    assert st["self_name"] is None and st["unknown_utterances"] == 0
+    db = rt.db
+    seg = db.add_segment(rt.cfg.audio_dir / "s.opus", datetime(2026, 10, 30, 9, 0), 5.0)
+    me = db.upsert_speaker("张伟")
+    other = db.upsert_speaker("王敏")
+    db.add_utterances([
+        {"segment_id": seg, "start_s": 0, "end_s": 1, "abs_start": "2026-10-30T09:00:00", "day": "2026-10-30", "text_raw": "a", "text": "a",
+         "speaker_id": me, "speaker_name": "张伟"},
+        {"segment_id": seg, "start_s": 1, "end_s": 2, "abs_start": "2026-10-30T09:00:01", "day": "2026-10-30", "text_raw": "b", "text": "b"},
+        {"segment_id": seg, "start_s": 2, "end_s": 3, "abs_start": "2026-10-30T09:00:02", "day": "2026-10-30", "text_raw": "c", "text": "c",
+         "speaker_name": "未知"},
+    ])
+    st = rt.status()
+    assert st["self_name"] is None and st["unknown_utterances"] == 2
+    db.set_self_speaker(me)
+    assert rt.status()["self_name"] == "张伟"
+    db.set_self_speaker(other)
+    assert rt.status()["self_name"] == "王敏"
+    db.set_self_speaker(None)
+    assert rt.status()["self_name"] is None
+
+
+# --- review fixes: request-busy counter, missing speaker models --------------------------------------------
+
+def test_busy_counter_blocks_a_switch_and_is_refused_once_switching(rt: Runtime):
+    assert rt.request_busy() == 0 and rt.busy_reason() is None
+    with rt.busy():
+        assert rt.request_busy() == 1 and rt.busy_reason() == rt_mod.BUSY_REQUEST_LABEL
+        with rt.busy():
+            assert rt.request_busy() == 2
+        with pytest.raises(JobError, match="等它结束再切换档案"):
+            rt.begin_switch()
+        assert rt.switching is False
+    assert rt.request_busy() == 0 and rt.busy_reason() is None
+    with pytest.raises(ValueError):                           # released on errors too
+        with rt.busy():
+            raise ValueError("x")
+    assert rt.request_busy() == 0
+    rt.begin_switch()
+    with pytest.raises(JobError, match="正在切换档案"):
+        with rt.busy():
+            pass
+    rt.end_switch()
+    with rt.busy():
+        pass
+    rt.jobs["relabel"].running = True                         # a running UI job is reported first
+    try:
+        assert rt.busy_reason() == "重新识别说话人"
+    finally:
+        rt.jobs["relabel"].running = False
+
+    def work():
+        for _ in range(300):
+            with rt.busy():
+                pass
+
+    ts = [threading.Thread(target=work) for _ in range(8)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert rt.request_busy() == 0
+
+
+def test_voices_job_reports_missing_models_in_chinese(rt: Runtime, monkeypatch: pytest.MonkeyPatch):
+    from audio_note.speech import voices
+
+    rt.cfg["speakers"]["embedding_model"] = "missing-model.onnx"
+    assert rt.speaker_models_missing() == ["embedding_model"]
+    monkeypatch.setattr(voices, "backfill_cluster_embeddings", lambda *a, **k: pytest.fail("the engine must not be built"))
+    with pytest.raises(JobError, match="模型文件缺失"):
+        rt.run_job("voices")
+    st = rt.submit("voices")
+    assert rt.wait_jobs(5) and st.error == rt_mod.VOICE_MODELS_MISSING_MSG and st.runs == 0
+    rt._engine = object()                                      # an engine already loaded means the files were there
+    assert rt.speaker_models_missing() == []

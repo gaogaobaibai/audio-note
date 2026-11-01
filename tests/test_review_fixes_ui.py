@@ -307,3 +307,25 @@ def test_markdown_renderer_never_emits_raw_source():
     for case, html in zip(cases, outs):
         assert "<input onfocus" not in html and "<script>" not in html and "<b>" not in html and "<u>" not in html, (case, html)
     assert '<input type="checkbox" disabled checked>' in outs[2] and "&lt;b&gt;done&lt;/b&gt;" in outs[2]
+
+
+# --- review fix: a profile switch waits for request threads doing heavy work (Runtime.busy) ------------------
+
+def test_switch_refuses_while_a_request_is_busy_and_refuses_new_requests_once_claimed(holder: RuntimeHolder, root: Path):
+    old = holder.rt
+    with TestClient(create_app(holder), raise_server_exceptions=False) as c:
+        with old.busy():
+            with pytest.raises(JobError, match="等它结束再切换档案"):
+                holder.switch("demo")
+            r = c.post("/api/profiles/demo/switch")
+            assert r.status_code == 409 and "等它结束再切换档案" in r.json()["error"]
+        assert holder.rt is old and old.alive and old.switching is False and old.db.open_connections() >= 1
+        assert c.post("/api/profiles/demo/switch").status_code == 200
+    new = holder.rt
+    assert new is not old and not old.alive and new.profile == "demo"
+    with pytest.raises(JobError, match="切换档案"):             # the torn-down runtime refuses new work
+        with old.busy():
+            pass
+    with new.busy():
+        assert new.request_busy() == 1
+    assert new.request_busy() == 0

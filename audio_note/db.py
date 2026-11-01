@@ -7,8 +7,9 @@ transcripts        raw + corrected ASR output per segment
 utterances         speaker-attributed sentences with absolute timestamps (the unit of memory)
 utterance_tokens   jieba-segmented text, mirrored into the FTS5 index utterances_fts
 utterance_vectors  sentence embeddings (float32 blobs) for vector / hybrid retrieval
-speakers           enrolled people
+speakers           enrolled people (+ is_self / relation columns added by _migrate)
 speaker_embeddings enrollment embeddings (float32 blobs)
+cluster_embeddings one embedding per diarization cluster of a processed segment (for naming unknown voices)
 daily_summaries    per-day LLM digest
 memory_notes       long-lived notes (entities, topics, todos) maintained by the daily analysis
 kv                 misc state
@@ -146,7 +147,36 @@ CREATE TABLE IF NOT EXISTS kv (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+
+CREATE TABLE IF NOT EXISTS cluster_embeddings (
+    segment_id INTEGER NOT NULL REFERENCES segments(id) ON DELETE CASCADE,
+    cluster_label INTEGER NOT NULL,
+    embedding BLOB NOT NULL,             -- float32, L2-normalised
+    dim INTEGER NOT NULL,
+    speech_s REAL NOT NULL,              -- total duration of this cluster's turns in the segment
+    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+    PRIMARY KEY (segment_id, cluster_label)
+);
 """
+
+#: columns added after the first release: (table, column, declaration). Applied by DB._migrate with
+#: ALTER TABLE ... ADD COLUMN when PRAGMA table_info does not list them (old databases and new ones alike).
+MIGRATION_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("speakers", "is_self", "INTEGER NOT NULL DEFAULT 0"),          # at most one row is 1
+    ("speakers", "relation", "TEXT"),                                # 朋友 / 同事 / 领导 ... (free text allowed)
+    ("speakers", "relation_source", "TEXT"),                         # 'user' | 'auto' | NULL
+    ("speakers", "relation_note", "TEXT"),                           # inference reason / user remark
+    ("speakers", "relation_updated_at", "TEXT"),
+    ("utterances", "speaker_source", "TEXT"),                        # NULL = automatic; 'user' = hand-labelled (relabel keeps it)
+)
+
+
+#: kv key prefix holding the utterance count at the last relation inference of a speaker (analysis.relations)
+RELATION_KV_PREFIX = "relation_inferred_n:"
+
+
+def relation_cache_key(sid: int) -> str:
+    return f"{RELATION_KV_PREFIX}{int(sid)}"
 
 
 def now_iso() -> str:
@@ -192,6 +222,30 @@ class DB:
         c.execute("PRAGMA journal_mode=WAL")
         c.execute("PRAGMA synchronous=NORMAL")
         c.executescript(SCHEMA)
+        self._migrate(c)
+
+    @staticmethod
+    def _migrate(c: sqlite3.Connection) -> list[str]:
+        """Add the columns of MIGRATION_COLUMNS that are missing (idempotent). Returns the ones added.
+        Two processes upgrading the same old database at once both see a column missing; the loser's
+        ALTER TABLE fails with 'duplicate column name', which is the wanted end state and is ignored."""
+        added: list[str] = []
+        for table, col, decl in MIGRATION_COLUMNS:
+            have = {r[1] for r in c.execute(f"PRAGMA table_info({table})").fetchall()}
+            if col in have:
+                continue
+            try:
+                c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
+                continue
+            added.append(f"{table}.{col}")
+        if added:
+            import logging
+
+            logging.getLogger(__name__).info("database upgraded: added %s", ", ".join(added))
+        return added
 
     def conn(self) -> sqlite3.Connection:
         h: _ConnHolder | None = getattr(self._local, "holder", None)
@@ -321,18 +375,115 @@ class DB:
         )
         return [(int(r["speaker_id"]), r["name"], np.frombuffer(r["embedding"], dtype=np.float32)) for r in rows]
 
+    # --- self / relations ----------------------------------------------------
+    def self_speaker(self) -> sqlite3.Row | None:
+        """The speaker marked as the user themselves (at most one), or None."""
+        return self.one("SELECT * FROM speakers WHERE is_self=1 ORDER BY id LIMIT 1")
+
+    def set_self_speaker(self, sid: int | None) -> None:
+        """Make `sid` the one and only self speaker; None only clears the flag everywhere."""
+        c = self.conn()
+        with _Tx(c):
+            c.execute("UPDATE speakers SET is_self=0 WHERE is_self<>0")
+            if sid is not None:
+                c.execute("UPDATE speakers SET is_self=1 WHERE id=?", (int(sid),))
+
+    def set_relation(self, sid: int, relation: str | None, source: str | None, note: str | None = None) -> bool:
+        """Store the speaker's relation to the user (source 'user' | 'auto'). An empty relation clears all three
+        columns and forgets the inference cache (so the next relation run asks the model again).
+        An 'auto' write never replaces a relation the user set (they may have labelled it while the LLM
+        call was in flight). Returns True when the row was written."""
+        relation = (relation or "").strip()
+        sid = int(sid)
+        if not relation:
+            c = self.conn()
+            with _Tx(c):
+                cur = c.execute("UPDATE speakers SET relation=NULL, relation_source=NULL, relation_note=NULL, relation_updated_at=NULL"
+                                " WHERE id=?", (sid,))
+                c.execute("DELETE FROM kv WHERE key=?", (relation_cache_key(sid),))
+            return int(cur.rowcount or 0) == 1
+        guard = " AND (relation_source IS NULL OR relation_source<>'user')" if source == "auto" else ""
+        cur = self.execute(f"UPDATE speakers SET relation=?, relation_source=?, relation_note=?, relation_updated_at=? WHERE id=?{guard}",
+                           (relation, source, note, now_iso(), sid))
+        return int(cur.rowcount or 0) == 1
+
+    def delete_speaker(self, sid: int, unknown_name: str) -> int:
+        """Remove a speaker: its utterances go back to unidentified (name = unknown_name, no score and no
+        'user' mark, so relabel may re-identify them) and the relation inference cache is dropped.
+        Returns the number of utterances released (0 when the speaker had none or did not exist)."""
+        sid = int(sid)
+        c = self.conn()
+        with _Tx(c):
+            cur = c.execute("UPDATE utterances SET speaker_name=?, speaker_score=NULL, speaker_source=NULL WHERE speaker_id=?",
+                            (unknown_name, sid))
+            c.execute("DELETE FROM kv WHERE key=?", (relation_cache_key(sid),))
+            c.execute("DELETE FROM speakers WHERE id=?", (sid,))
+        return int(cur.rowcount or 0)
+
+    def people_table(self) -> list[dict[str, Any]]:
+        """Every enrolled speaker with their relation and utterance count: self first, then by utterances desc."""
+        rows = self.query(
+            "SELECT s.id, s.name, s.is_self, s.relation, s.relation_source, s.relation_note,"
+            " (SELECT COUNT(*) FROM utterances u WHERE u.speaker_id=s.id) AS n"
+            " FROM speakers s ORDER BY s.is_self DESC, n DESC, s.name, s.id"
+        )
+        return [{"id": int(r["id"]), "name": r["name"], "is_self": bool(r["is_self"]), "relation": r["relation"],
+                 "relation_source": r["relation_source"], "relation_note": r["relation_note"], "utterances": int(r["n"])}
+                for r in rows]
+
+    # --- cluster embeddings ------------------------------------------------------
+    def upsert_cluster_embedding(self, segment_id: int, cluster_label: int, emb: np.ndarray, speech_s: float) -> None:
+        emb = np.asarray(emb, dtype=np.float32).ravel()
+        self.execute(
+            "INSERT INTO cluster_embeddings(segment_id, cluster_label, embedding, dim, speech_s) VALUES (?,?,?,?,?)"
+            " ON CONFLICT(segment_id, cluster_label) DO UPDATE SET embedding=excluded.embedding, dim=excluded.dim,"
+            " speech_s=excluded.speech_s, created_at=datetime('now','localtime')",
+            (int(segment_id), int(cluster_label), emb.tobytes(), int(emb.shape[0]), float(speech_s)),
+        )
+
+    def cluster_embeddings(self, segment_ids: list[int] | None = None) -> list[tuple[int, int, np.ndarray, float]]:
+        """[(segment_id, cluster_label, embedding, speech_s)] for all segments or the given ones.
+        Sentinel rows (cluster_label < 0: scanned, nothing to embed) are left out."""
+        if segment_ids is None:
+            rows = self.query("SELECT segment_id, cluster_label, embedding, speech_s FROM cluster_embeddings WHERE cluster_label >= 0"
+                              " ORDER BY segment_id, cluster_label")
+        else:
+            ids = [int(i) for i in segment_ids]
+            if not ids:
+                return []
+            rows = self.query(
+                f"SELECT segment_id, cluster_label, embedding, speech_s FROM cluster_embeddings WHERE segment_id IN ({','.join('?' * len(ids))})"
+                " AND cluster_label >= 0 ORDER BY segment_id, cluster_label", ids)
+        return [(int(r["segment_id"]), int(r["cluster_label"]), np.frombuffer(r["embedding"], dtype=np.float32), float(r["speech_s"]))
+                for r in rows]
+
+    def delete_cluster_embeddings(self, segment_id: int) -> int:
+        cur = self.execute("DELETE FROM cluster_embeddings WHERE segment_id=?", (int(segment_id),))
+        return int(cur.rowcount or 0)
+
+    def mark_cluster_embeddings_empty(self, segment_id: int) -> None:
+        """Record that `segment_id` was scanned for cluster embeddings but none could be made (unreadable
+        file, utterances outside the audio ...): a sentinel row with cluster_label=-1 and an empty blob, so
+        the segment is not counted as missing and re-scanned every session. delete_cluster_embeddings
+        (process_segment) removes it like any other row."""
+        self.execute(
+            "INSERT INTO cluster_embeddings(segment_id, cluster_label, embedding, dim, speech_s) VALUES (?,-1,X'',0,0)"
+            " ON CONFLICT(segment_id, cluster_label) DO UPDATE SET created_at=datetime('now','localtime')",
+            (int(segment_id),))
+
     # --- utterances --------------------------------------------------------
     def add_utterances(self, rows: list[dict[str, Any]]) -> list[int]:
-        """rows: dicts with keys matching the utterances columns plus optional 'text_seg'."""
+        """rows: dicts with keys matching the utterances columns plus optional 'text_seg' / 'speaker_source'."""
         ids: list[int] = []
         c = self.conn()
         with _Tx(c):
             for r in rows:
                 cur = c.execute(
-                    "INSERT INTO utterances(segment_id,start_s,end_s,abs_start,day,cluster_label,speaker_id,speaker_name,speaker_score,text_raw,text)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO utterances(segment_id,start_s,end_s,abs_start,day,cluster_label,speaker_id,speaker_name,speaker_score,"
+                    "text_raw,text,speaker_source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                     (r["segment_id"], r["start_s"], r["end_s"], r["abs_start"], r["day"], r.get("cluster_label"),
-                     r.get("speaker_id"), r.get("speaker_name"), r.get("speaker_score"), r["text_raw"], r["text"]),
+                     r.get("speaker_id"), r.get("speaker_name"), r.get("speaker_score"), r["text_raw"], r["text"],
+                     r.get("speaker_source")),
                 )
                 uid = int(cur.lastrowid)
                 ids.append(uid)

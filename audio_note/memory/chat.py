@@ -85,10 +85,29 @@ class MemoryChat:
             "4. 检索不到就明确说没有找到，不要猜测；可以建议用户换个说法或时间范围。\n"
             "5. 用用户提问所用的语言回答（中文提问用中文）。简洁、直接、有条理；长答案用要点。"
         )
-        out = head + how + tail
+        out = head + self.people_block() + how + tail
         if prefetched:
             out += "\n\n## 预检索结果（按相关度，[#编号] 可用于 get_context）\n" + prefetched
         return out
+
+    def people_block(self) -> str:
+        """The 「人物」 line (user themselves + relations of the enrolled speakers) and what “我” means
+        in a question. Never raises: '' when the speaker table cannot be read."""
+        from ..analysis.prompts import people_line
+
+        try:
+            people = self.db.people_table()
+        except Exception as e:  # noqa: BLE001
+            log.warning("people table unavailable: %s", e)
+            return ""
+        me = next((p for p in people if p.get("is_self")), None)
+        line = people_line(people, self.cfg.speakers.unknown_label)
+        if me is not None:
+            hint = (f"提问里的“我”指用户本人「{me['name']}」：记录里「{me['name']}」的发言就是用户自己说的，"
+                    "回答时按第一人称理解（“我说过…”就是查「" + str(me["name"]) + "」的记录）。")
+        else:
+            hint = "提问里的“我”指用户本人；用户本人还没有登记，记录里的第一人称发言可能是本人，不要把某个说话人当成用户。"
+        return line + "\n" + hint + "\n\n"
 
     def prefetch(self, question: str, k: int | None = None) -> str:
         """Retriever hits for the question, formatted for the system prompt ('' when nothing found).

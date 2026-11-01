@@ -70,10 +70,12 @@ models/ silero_vad.onnx  3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx  she
 
 - `segments(id, path, started_at ISO, duration_s, sample_rate, source mic|import, origin, status new|processing|done|failed|no_speech|deleted, speech_s, error)`
 - `transcripts(id, segment_id, asr_model, raw_json, text_raw, text_corrected, correction_json, language)`
-- `utterances(id, segment_id, start_s, end_s, abs_start ISO, day YYYY-MM-DD, cluster_label, speaker_id, speaker_name, speaker_score, text_raw, text)`
+- `utterances(id, segment_id, start_s, end_s, abs_start ISO, day YYYY-MM-DD, cluster_label, speaker_id, speaker_name, speaker_score, speaker_source NULL|'user', text_raw, text)`：`speaker_source='user'` 是用户亲手标的，`relabel` 不会改
 - `utterance_vectors(utterance_id, model, dim, vec float32 blob)`：句向量（L2 归一化）
 - `utterance_tokens(utterance_id, text_seg)` → FTS5 `utterances_fts(text_seg)`（外部内容表，触发器同步；`text_seg` 是 jieba 分词后空格连接）
-- `speakers(id, name, notes)`、`speaker_embeddings(speaker_id, embedding float32 blob, dim, source_path, duration_s)`
+- `speakers(id, name, notes, is_self 0|1, relation, relation_source 'user'|'auto', relation_note, relation_updated_at)`（最多一行 is_self=1）、`speaker_embeddings(speaker_id, embedding float32 blob, dim, source_path, duration_s)`
+- `cluster_embeddings(segment_id, cluster_label, embedding, dim, speech_s)`：每段录音里每个分离出来的声音簇的声纹（流水线识别时顺手存；老片段由 `speakers scan` / 界面自动补），「未识别的声音」分组用它，不用重新读音频
+- 老库升级：`DB.__init__` 用 `PRAGMA table_info` 检查并 `ALTER TABLE ADD COLUMN` 补缺的列（`db.MIGRATION_COLUMNS`），幂等
 - `daily_summaries(day PK, summary_md, summary_json, model, utterance_count, pushed_at)`
 - `memory_notes(id, kind person|topic|todo|decision|fact, title, content, day_from, day_to, source_utterance_ids)`
 - `kv(key, value json)`
@@ -83,7 +85,7 @@ models/ silero_vad.onnx  3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx  she
 对每个 `status='new'` 且 `created_at` 早于 `pipeline.min_segment_age_s` 的 segment：
 
 1. `audio = read_segment(path)`；`status='processing'`。
-2. `turns = engine.diarize(audio)`；`engine.identify_turns(audio, turns, db)` → 每个 turn 有 cluster/speaker_name/score。
+2. `turns = engine.diarize(audio)`；`engine.identify_turns(audio, turns, db, segment_id=id)` → 每个 turn 有 cluster/speaker_name/score，每个 cluster 的声纹同时写进 `cluster_embeddings`。
    - 没有任何 turn → `status='no_speech'`，删除文件。
 3. **构造 ASR chunk**：按时间顺序合并相邻、同 cluster、间隔 ≤ 1.0s 的 turn；单 chunk 时长 ≤ `mimo.asr_max_chunk_s`（超过则在此处切开）。每个 chunk = (start_s, end_s, cluster, speaker_id, speaker_name, score, audio[start:end] 前后各留 0.15s padding)。时长 < 0.6s 的 chunk 丢弃。
 4. 每个 chunk → `asr.transcribe(chunk_audio)` → text_raw（空则跳过；421 `ContentFiltered` 只跳过该 chunk，不让整段失败）。
@@ -178,7 +180,7 @@ class Notifier: def __init__(cfg); def send(msg) -> dict[str, str|None]   # chan
 - `devices` 列输入设备；`record` 只录音；`run [--tray] [--no-ui] [--open] [--port]` 录音 + 调度 + 网页界面；`ui [--record]` 网页界面（录音由页面开关）；`status`
 - `import <files...> [--start "2026-10-31 09:00"]`
 - `process [--retry-failed] [--limit N]`；`transcribe <file>` 一次性转写并打印（不入库）
-- `speakers enroll <name> <wav...>` / `speakers list` / `speakers label <segment_id|path> <name> --from s --to s` / `speakers calibrate`
+- `speakers enroll <name> <wav...>` / `speakers list` / `speakers label <segment_id|path> <name> --from s --to s [--self] [--relation R]` / `speakers calibrate` / `speakers voices [--assign N name]` / `speakers scan` / `speakers set-self <name>` / `speakers relation <name> <R|->` / `speakers relations [--force]`（见 10.3）
 - `daily [--day YYYY-MM-DD] [--push] [--force]`；`push-test "文本"`
 - `chat [question]`（无参进入 REPL）
 - `cleanup`；`init`（生成 config.yaml、检查模型文件、打印缺失项）
@@ -207,6 +209,15 @@ class Notifier: def __init__(cfg); def send(msg) -> dict[str, str|None]   # chan
 - 名字校验 `PROFILE_NAME_RE`（中英文、数字、`_`、`-`，≤32）且不得为 `default/current/custom/data`，因此目录只会落在 `profiles/` 下；删除整目录前要求 CLI 输入档案名 / API 传 `confirm`，且该档案没有别的进程持锁、不是当前档案。
 - 进程内切换：`RuntimeHolder.switch(name)`（持 `holder.lock`）= 旧 Runtime `shutdown()`（停录音/调度、释放锁、结束任务线程、`DB.close_all()` 关掉所有线程的 sqlite 连接——Windows 上否则删不掉文件）→ 新 Runtime → 重设日志文件 → 原来在录音就继续录。FastAPI 的处理函数通过 `_RuntimeProxy` 访问 `holder.rt`，所以不用重建 app；`run_service` 的主循环、托盘也从 holder 取当前 Runtime。
 - `profiles/demo` 是示例档案（`scripts/fake_days.py` 生成的 3 天数据复制而来，sqlite 里的绝对路径已改写到该目录），整个 `profiles/` 在 `.gitignore` 里。
+
+### 10.3 说话人：本人、关系、从记录里认人（speech/voices.py, analysis/relations.py）
+
+用户的三点要求：要有唯一的本人（日报 / 推送 / 问答站在本人视角）；其他人可标与本人的关系（不强制，可自动推断）；不可能请每个人单独录样本，要直接从已有录音里认人。
+
+- **本人**：`speakers.is_self`，`db.set_self_speaker()` 保证唯一。`prompts.people_line()` 生成「人物」一行（`我=「张伟」（用户本人）；王敏（同事）；李强（领导，自动推断）…`）注入日报 map/reduce 和问答的 system prompt；日报的 `people` 字段不含本人，人物笔记也跳过本人；`list_speakers` 工具标出本人与关系。
+- **关系**：`speakers.relation / relation_source('user'|'auto') / relation_note`。`relations.infer_relations()`：候选 = 非本人、不是用户手标、语句数 ≥ `relation_min_utterances`；证据 = 该人最多 60 句（跨天均匀抽样，带同片段前后句，本人标「本人」）+ 该人的 person 笔记；JSON 模式问模型 `{relation ∈ 候选表|不确定, confidence, reason, address}`，`confidence ≥ relation_min_confidence` 才写入（source='auto'）。kv `relation_inferred_n:<sid>` 记上次推断时的语句数，不涨到 1.5 倍不重问；用户手标永不覆盖。日报任务之后自动跑（`speakers.infer_relations`），界面「自动推断关系」/ `speakers relations` 手动跑。
+- **未识别的声音**：`group_unknown_voices()` 取所有含未识别语句的 (segment, cluster) 的 `cluster_embeddings`，按 speech_s 加权质心做贪心平均连接聚类（cosine ≥ `voice_group_threshold`，默认 0.55），每组给句数 / 时长 / 天数 / 最长的 5 句示例（可试听）/ 与已登记声纹最接近的人（提示用）。老片段没有 cluster_embeddings 时 `backfill_cluster_embeddings()` 用已存的 utterance 区间当 turn 补算（`voices` 任务，界面自动触发一次）。`name_voice()`：从最长的 ≤3 个成员拼出语音做声纹样本（存纯语音副本到 `data/speakers/<name>/`），组内所有语句直接指派给该人并标 `speaker_source='user'`，可同时设本人 / 关系，重写当天 markdown；API 层随后排队 `relabel` 让其他片段用新声纹重识别。记录页的 👤 标记默认把同片段同簇的句子一起标，同样写 `speaker_source='user'`。
+- 阈值取舍：0.55 比识别阈值 0.45 高，宁可把一个人分成两组（都起同一个名字即可合并）也不把两个人合成一组。合成的 demo 数据里 TTS 音色有限，「可能是 X」提示会很高（0.67），真实数据里留在未识别组的声音对已登记人的相似度通常 < 0.45。
 
 ## 11. 默认参数
 

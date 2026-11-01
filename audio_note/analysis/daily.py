@@ -357,8 +357,39 @@ class DailyAnalyzer:
             kw.setdefault("model", self.model)
         return self.client.json(system, user, **kw)
 
-    def map_block(self, day: str, block: Block, total: int) -> dict[str, Any]:
-        system, user = prompts.map_prompt(day, block.index, total, f"{block.start:%H:%M}", f"{block.end:%H:%M}", block.text)
+    def people_fingerprint(self, people: str, rows: list[sqlite3.Row]) -> str:
+        """Cheap hash of what the people side of the prompt depends on: the 「人物」 line (self, relations)
+        and the (speaker_name, count) pairs of the day's utterances. Stored as summary_json['people_fp'];
+        a digest is only reused while it matches, so naming a voice, choosing "self" or setting a
+        relation refreshes an existing digest even though the utterance count did not change."""
+        import hashlib
+
+        counts: dict[str, int] = {}
+        for r in rows:
+            k = _speaker(r, self.unknown_label)
+            counts[k] = counts.get(k, 0) + 1
+        payload = people + "\n" + json.dumps(sorted(counts.items()), ensure_ascii=False)
+        return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+    def people_line(self) -> str:
+        """The 「人物」 prompt line (self + relations of the enrolled speakers); '' if the table cannot be read."""
+        try:
+            return prompts.people_line(self.db.people_table(), self.unknown_label)
+        except Exception as e:  # noqa: BLE001 - the digest must not depend on this line
+            log.warning("people line unavailable: %s", e)
+            return ""
+
+    def self_name(self) -> str | None:
+        try:
+            row = self.db.self_speaker()
+        except Exception as e:  # noqa: BLE001
+            log.warning("self speaker unavailable: %s", e)
+            return None
+        return str(row["name"]) if row else None
+
+    def map_block(self, day: str, block: Block, total: int, people: str = "") -> dict[str, Any]:
+        system, user = prompts.map_prompt(day, block.index, total, f"{block.start:%H:%M}", f"{block.end:%H:%M}", block.text,
+                                          people=people)
         res = normalize_map_result(self._json(system, user, max_tokens=2048))
         res["time_from"] = f"{block.start:%H:%M}"
         res["time_to"] = f"{block.end:%H:%M}"
@@ -366,9 +397,9 @@ class DailyAnalyzer:
         return res
 
     def reduce_blocks(self, day: str, results: list[dict[str, Any]], *, utterance_count: int, session_count: int,
-                      speakers: list[str]) -> dict[str, Any]:
+                      speakers: list[str], people: str = "") -> dict[str, Any]:
         system, user = prompts.reduce_prompt(day, results, utterance_count=utterance_count,
-                                             session_count=session_count, speakers=speakers)
+                                             session_count=session_count, speakers=speakers, people=people)
         return normalize_digest(self._json(system, user, max_tokens=4096))
 
     # --- main entry -----------------------------------------------------------------------
@@ -381,29 +412,37 @@ class DailyAnalyzer:
         rows = [r for s in sessions for r in s]
         if not rows:
             md = empty_day_markdown(day)
-            js = dict(EMPTY_DIGEST, day=day, utterance_count=0, session_count=0, overview="当天没有记录到任何语音内容。")
+            js = dict(EMPTY_DIGEST, day=day, utterance_count=0, session_count=0, overview="当天没有记录到任何语音内容。",
+                      self_name=self.self_name())
             if force:
                 self._write_summary(day, md, js, 0)
             log.info("daily %s: no utterances", day)
             return md, js
 
+        people = self.people_line()
+        people_fp = self.people_fingerprint(people, rows)
         existing = self.db.one("SELECT summary_md, summary_json, utterance_count FROM daily_summaries WHERE day=?", (day,))
         if existing and not force and int(existing["utterance_count"] or 0) == len(rows) and existing["summary_json"]:
             try:
                 js_cached = json.loads(existing["summary_json"])
+            except (TypeError, ValueError):
+                js_cached = None
+            # a legacy digest (no fingerprint) stays valid; otherwise the people side must be unchanged too
+            if isinstance(js_cached, dict) and js_cached.get("people_fp") in (None, people_fp):
                 self.last_run_cached = True
                 return existing["summary_md"], js_cached
-            except (TypeError, ValueError):
-                pass
+            if isinstance(js_cached, dict):
+                log.info("daily %s: speakers / relations changed since the digest; regenerating", day)
 
         blocks = self.blocks(sessions)
         speakers = sorted({_speaker(r, self.unknown_label) for r in rows} - {self.unknown_label})
+        self_name = self.self_name()
         results: list[dict[str, Any]] = []
         kept_blocks: list[Block] = []
         failed_blocks: list[dict[str, Any]] = []
         for b in blocks:
             try:
-                results.append(self.map_block(day, b, len(blocks)))
+                results.append(self.map_block(day, b, len(blocks), people=people))
                 kept_blocks.append(b)
             except MissingAPIKey:
                 raise  # configuration problem, not a transient failure of this block
@@ -418,7 +457,8 @@ class DailyAnalyzer:
         covered = len({uid for b in kept_blocks for uid in b.utterance_ids})
 
         try:
-            digest = self.reduce_blocks(day, results, utterance_count=len(rows), session_count=len(sessions), speakers=speakers)
+            digest = self.reduce_blocks(day, results, utterance_count=len(rows), session_count=len(sessions), speakers=speakers,
+                                        people=people)
         except LLMError as e:
             log.warning("daily %s: reduce failed (%s); using concatenated block summaries", day, e)
             digest = _fallback_digest(kept_blocks, results)
@@ -431,6 +471,8 @@ class DailyAnalyzer:
             "block_count": len(blocks),
             "time_range": f"{_row_start(rows[0]):%H:%M}–{max(_row_end(r) for r in rows):%H:%M}",
             "speakers": speakers,
+            "self_name": self_name,
+            "people_fp": people_fp,
             "model": self.model,
             "blocks": results,
         })
@@ -479,10 +521,13 @@ class DailyAnalyzer:
             d = str(d)
             if d:
                 notes.append(("decision", d[:NOTE_TITLE_MAX], d, []))
+        self_name = js.get("self_name") or self.self_name()
         for p in js.get("people", []):
             name = p.get("name", "") if isinstance(p, dict) else str(p)
             if not name:
                 continue
+            if self_name and name == self_name:
+                continue   # the user themselves is not a "person" note
             ctx = p.get("context", "") if isinstance(p, dict) else ""
             ids = [int(r["id"]) for r in rows
                    if _speaker(r, self.unknown_label) == name or name in str(r["text"] or "")][:50]

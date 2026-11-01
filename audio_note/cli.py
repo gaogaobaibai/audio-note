@@ -8,7 +8,9 @@ Commands
   import <files...> [--start]     import existing recordings
   process [--retry-failed] [--limit N]
   transcribe <file>               one-off transcription, printed, not stored
-  speakers enroll|list|label|relabel|calibrate
+  speakers enroll|record|list|label|relabel|calibrate
+  speakers voices|scan            unidentified voices in the recordings: list / name a group (no enrollment recording needed)
+  speakers set-self|relation|relations   who the user is, relations to the user (by hand / inferred by the LLM)
   daily [--day] [--push] [--force]
   push-test <text>
   chat [question...]              one question, or an interactive REPL without arguments
@@ -717,20 +719,219 @@ def cmd_speakers_record(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def _relation_text(relation: str | None, source: str | None) -> str:
+    """'同事' / '朋友（自动推断）' / '' for the speaker tables."""
+    if not relation:
+        return ""
+    return f"{relation}（自动推断）" if source == "auto" else str(relation)
+
+
 def cmd_speakers_list(cfg: Config, args: argparse.Namespace) -> int:
     db = _db(cfg)
     rows = db.query(
-        "SELECT s.id, s.name, s.notes, s.created_at, COUNT(e.id) AS n, COALESCE(SUM(e.duration_s),0) AS dur"
-        " FROM speakers s LEFT JOIN speaker_embeddings e ON e.speaker_id=s.id GROUP BY s.id ORDER BY s.name"
+        "SELECT s.id, s.name, s.notes, s.created_at, s.is_self, s.relation, s.relation_source,"
+        " COUNT(e.id) AS n, COALESCE(SUM(e.duration_s),0) AS dur"
+        " FROM speakers s LEFT JOIN speaker_embeddings e ON e.speaker_id=s.id GROUP BY s.id ORDER BY s.is_self DESC, s.name"
     )
     t = Table(title="已注册说话人")
-    for col in ("id", "姓名", "样本数", "语音时长", "注册时间", "备注"):
+    for col in ("id", "姓名", "本人", "关系", "样本数", "语音时长", "注册时间", "备注"):
         t.add_column(col)
     for r in rows:
-        t.add_row(str(r["id"]), r["name"], str(r["n"]), f"{r['dur']:.0f}s", r["created_at"], r["notes"] or "")
+        t.add_row(str(r["id"]), r["name"], "我" if r["is_self"] else "", _relation_text(r["relation"], r["relation_source"]),
+                  str(r["n"]), f"{r['dur']:.0f}s", r["created_at"], r["notes"] or "")
     console.print(t)
     if not rows:
         console.print("（空）")
+    elif not any(r["is_self"] for r in rows):
+        console.print("还没有标出哪位是本人：audio-note speakers set-self <姓名>（日报 / 问答会站在本人视角）")
+    return 0
+
+
+def _speaker_by_name(db: DB, name: str) -> Any:
+    row = db.one("SELECT * FROM speakers WHERE name=?", (str(name).strip(),))
+    if row is None:
+        raise CLIError(f"没有叫 {name} 的说话人（audio-note speakers list 查看）")
+    return row
+
+
+def cmd_speakers_set_self(cfg: Config, args: argparse.Namespace) -> int:
+    """Mark an enrolled speaker as the user ("我"): digests, chat and pushes take that person's point of view."""
+    db = _db(cfg)
+    row = _speaker_by_name(db, args.name)
+    prev = db.self_speaker()
+    db.set_self_speaker(int(row["id"]))
+    if prev is not None and int(prev["id"]) != int(row["id"]):
+        console.print(f"本人已从 {prev['name']} 改为 [bold]{row['name']}[/bold] (id {row['id']})。")
+    else:
+        console.print(f"已把 [bold]{row['name']}[/bold] (id {row['id']}) 设为本人。")
+    return 0
+
+
+def cmd_speakers_relation(cfg: Config, args: argparse.Namespace) -> int:
+    """Store (or clear with '-') a speaker's relation to the user; `--note` keeps a remark next to it."""
+    db = _db(cfg)
+    row = _speaker_by_name(db, args.name)
+    rel = str(args.relation or "").strip()
+    if row["is_self"]:
+        raise CLIError(f"{row['name']} 是本人，不需要标注关系")
+    if rel in ("", "-"):
+        db.set_relation(int(row["id"]), None, None)
+        console.print(f"已清除 {row['name']} 的关系标注。")
+        return 0
+    db.set_relation(int(row["id"]), rel, "user", (args.note or "").strip() or None)
+    console.print(f"已标注 {row['name']}：{rel}" + (f"（{args.note}）" if args.note else "") + "。")
+    return 0
+
+
+def cmd_speakers_relations(cfg: Config, args: argparse.Namespace) -> int:
+    """Ask the LLM how each enrolled speaker relates to the user (hand-labelled ones are never touched)."""
+    relations = _lazy_module("analysis.relations")
+    db = _db(cfg)
+    ids = None
+    if args.speaker:
+        ids = [int(_speaker_by_name(db, args.speaker)["id"])]
+    client = _client(cfg)
+    results = list(relations.infer_relations(cfg, db, client, speaker_ids=ids, force=bool(args.force)) or [])
+    t = Table(title="关系推断")
+    for col in ("id", "姓名", "关系", "置信度", "结果", "理由"):
+        t.add_column(col)
+    for r in results:
+        conf = r.get("confidence")
+        if r.get("skipped"):
+            outcome = f"跳过：{r['skipped']}"
+        elif r.get("applied"):
+            outcome = "[green]已写入[/green]"
+        else:
+            outcome = "未写入（不确定或置信度不够）"
+        t.add_row(str(r.get("id", "")), str(r.get("name", "")), str(r.get("relation") or ""),
+                  f"{float(conf):.2f}" if isinstance(conf, (int, float)) else "", outcome, str(r.get("reason") or ""))
+    console.print(t)
+    applied = sum(1 for r in results if r.get("applied"))
+    if not results:
+        console.print("没有需要推断的说话人（本人和已手动标注的不推断；语句太少的也跳过）。")
+    else:
+        console.print(f"共 {len(results)} 人，写入 {applied} 个关系。手动标注：audio-note speakers relation <姓名> <关系>")
+    return 0
+
+
+def _scan_voices(cfg: Config, db: DB, voices: Any, engine_factory: Callable[[], Any]) -> dict[str, int]:
+    """backfill_cluster_embeddings for the segments that still lack cluster embeddings (loads the engine only when needed)."""
+    missing = voices.missing_segments(db)
+    if not missing:
+        return {"segments": 0, "clusters": 0, "skipped": 0}
+    console.print(f"正在扫描 {len(missing)} 段录音的声音…")
+    stats = dict(voices.backfill_cluster_embeddings(db, cfg, engine_factory()))
+    console.print(f"扫描完成：{stats['segments']} 段 / {stats['clusters']} 个声音簇，{stats['skipped']} 段跳过。")
+    return stats
+
+
+KEY_SHOWN = 6   # characters of a voice group's stable key shown in the table (the full key is accepted too)
+
+
+def _print_voice_groups(res: dict[str, Any]) -> None:
+    groups = res.get("groups") or []
+    if not groups:
+        console.print("没有待确认的声音（所有语句都已识别，或还没有已转写的记录）。")
+        return
+    t = Table(title=f"未识别的声音（{len(groups)} 组，{res.get('unknown_utterances', 0)} 句未识别）")
+    for col in ("#", "编号", "句数", "时长", "日期", "可能是", "示例"):
+        t.add_column(col)
+    for i, g in enumerate(groups, start=1):
+        days = g.get("days") or []
+        span = days[0] if len(days) <= 1 else f"{days[0]} ~ {days[-1]}（{len(days)} 天）"
+        closest = g.get("closest") or {}
+        maybe = f"{closest['name']}（{closest['score']:.2f}）" if closest and float(closest.get("score") or 0) >= 0.3 else ""
+        samples = "\n".join(f"{s.get('time', '')} {s.get('text', '')}".strip() for s in (g.get("samples") or [])[:3])
+        t.add_row(str(i), str(g.get("key") or "")[:KEY_SHOWN], str(g.get("utterances", 0)), f"{float(g.get('speech_s', 0)):.0f}s",
+                  span or "", maybe, samples)
+    console.print(t)
+    console.print("命名：audio-note speakers voices --assign <#> <姓名> [--self] [--relation 同事]（<#> 也可以写编号，编号在重新扫描后不变）")
+
+
+def _resolve_voice_group(groups: list[dict[str, Any]], ref: Any) -> tuple[int, dict[str, Any]]:
+    """`--assign` takes the 1-based index of the listing or the group's stable key (full or a prefix of at
+    least a few characters). Returns (index, group)."""
+    ref = str(ref or "").strip().lower()
+    if not ref:
+        raise CLIError("--assign 需要给出序号或编号：speakers voices --assign <#或编号> <姓名>")
+    if ref.isdigit() and 1 <= int(ref) <= len(groups):
+        return int(ref), groups[int(ref) - 1]
+    hits = [(i, g) for i, g in enumerate(groups, start=1) if len(ref) >= 3 and str(g.get("key") or "").lower().startswith(ref)]
+    if len(hits) == 1:
+        return hits[0]
+    if len(hits) > 1:
+        raise CLIError(f"编号 {ref} 不唯一（匹配 {len(hits)} 组），请多写几位")
+    if ref.isdigit():
+        raise CLIError(f"没有第 {int(ref)} 组（共 {len(groups)} 组，先运行 audio-note speakers voices 查看）")
+    raise CLIError(f"没有编号为 {ref} 的声音组（共 {len(groups)} 组，先运行 audio-note speakers voices 查看）")
+
+
+def _voice_engine_factory(cfg: Config) -> Callable[[], Any]:
+    """Lazy SpeakerEngine for `voices` / `scan`: only built when a scan or a naming needs it; a missing
+    model file or a failing load is a CLIError (Chinese message) instead of a traceback."""
+    def engine() -> Any:
+        if not cfg.model_path("embedding_model").exists():
+            raise CLIError(f"模型文件缺失，无法提取声纹（运行 scripts/download_models.ps1）：{cfg.model_path('embedding_model')}")
+        from .speech.speakers import SpeakerEngine
+
+        try:
+            return SpeakerEngine(cfg)
+        except CLIError:
+            raise
+        except Exception as e:  # noqa: BLE001 - onnxruntime / model file problems
+            raise CLIError(f"声纹模型加载失败：{e}（检查 models/ 目录，或重新运行 scripts/download_models.ps1）") from e
+
+    return engine
+
+
+def cmd_speakers_voices(cfg: Config, args: argparse.Namespace) -> int:
+    """List the unidentified voices grouped across recordings; `--assign <#|key> <name>` names one group."""
+    voices = _lazy_module("speech.voices")
+    db = _db(cfg)
+    engine = _voice_engine_factory(cfg)
+    scan = _scan_voices(cfg, db, voices, engine)
+    res = voices.group_unknown_voices(db, cfg)
+    if args.assign is None:
+        _print_voice_groups(res)
+        return 0
+    if not args.name:
+        raise CLIError("--assign 需要给出姓名：speakers voices --assign <#或编号> <姓名>")
+    groups = res.get("groups") or []
+    if scan["clusters"]:
+        _print_voice_groups(res)
+        console.print("[yellow]刚扫描到新的录音，分组可能变了：请按上面的新序号或编号重新运行 --assign。[/yellow]")
+        return 1
+    idx, g = _resolve_voice_group(groups, args.assign)
+    console.print(f"第 {idx} 组 = 编号 {g.get('key', '')}（{g.get('utterances', 0)} 句）")
+    try:
+        out = voices.name_voice(db, cfg, engine(), g["members"], args.name, is_self=bool(args.self),
+                                relation=(args.relation or "").strip() or None)
+    except ValueError as e:
+        raise CLIError(str(e)) from e
+    console.print(f"已标记为 [bold]{out['name']}[/bold] (id {out['id']})：{out['utterances_assigned']} 句，"
+                  f"补充 {out['samples_added']} 个声纹样本（{len(out['segments'])} 段 / {len(out['days'])} 天）。")
+    if out.get("samples_from_clusters"):
+        console.print(f"这组的录音已过期，{out['samples_from_clusters']} 个样本直接取自扫描时保存的声纹。")
+    if out.get("skipped_user_labels"):
+        console.print(f"{out['skipped_user_labels']} 句已手动标为别人，保持不变。")
+    if args.self:
+        console.print("已设为本人。")
+    if args.relation:
+        console.print(f"关系：{args.relation}")
+    _reindex_after_enroll(cfg, db)
+    left = voices.unknown_utterance_count(db)
+    if left and out["samples_added"]:
+        console.print(f"还有 {left} 句未识别：audio-note speakers relabel 可用新声纹重新识别其他记录。")
+    return 0
+
+
+def cmd_speakers_scan(cfg: Config, args: argparse.Namespace) -> int:
+    """Only compute the missing cluster embeddings (what `voices` does before listing)."""
+    voices = _lazy_module("speech.voices")
+    db = _db(cfg)
+    stats = _scan_voices(cfg, db, voices, _voice_engine_factory(cfg))
+    if not stats["segments"] and not stats["skipped"]:
+        console.print("没有需要扫描的录音段。")
     return 0
 
 
@@ -814,6 +1015,13 @@ def cmd_speakers_label(cfg: Config, args: argparse.Namespace) -> int:
     except ValueError as e:
         raise CLIError(str(e)) from e
     console.print(f"已把 {path.name} 的 {a:.1f}s–{b:.1f}s 标记为 {args.name} (id {sid})。")
+    if getattr(args, "self", False):
+        db.set_self_speaker(int(sid))
+        console.print(f"已把 {args.name} 设为本人。")
+    relation = (getattr(args, "relation", None) or "").strip()
+    if relation:
+        db.set_relation(int(sid), relation, "user")
+        console.print(f"关系：{relation}")
     _reindex_after_enroll(cfg, db)
     if seg_id is not None:
         _relabel_segment_quietly(cfg, db, engine, seg_id)
@@ -1071,7 +1279,28 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--to", dest="end", type=float, default=None, metavar="S", help="结束秒（配合 segment）")
     s.add_argument("--at", default=None, metavar="TIME", help='记录里那句话的时间，如 "2026-10-31 08:19:32"（自动找到对应录音段与区间）')
     s.add_argument("--dur", type=float, default=None, metavar="S", help="配合 --at：从该句开始取多少秒（默认取整句）")
+    s.add_argument("--self", dest="self", action="store_true", help="这个人就是我（本人）")
+    s.add_argument("--relation", default=None, metavar="R", help="和本人的关系，如 同事 / 朋友 / 领导")
     s.set_defaults(func=cmd_speakers_label)
+    s = ssub.add_parser("voices", help="列出记录里还没认出来的声音（按声音分组），--assign 给一组起名字")
+    s.add_argument("--assign", default=None, metavar="N|编号", help="给第 N 组（或编号为 N 的组）命名；序号和编号见不带参数的输出")
+    s.add_argument("name", nargs="?", default=None, help="配合 --assign：这组声音是谁")
+    s.add_argument("--self", dest="self", action="store_true", help="配合 --assign：这组声音是我自己")
+    s.add_argument("--relation", default=None, metavar="R", help="配合 --assign：和本人的关系")
+    s.set_defaults(func=cmd_speakers_voices)
+    ssub.add_parser("scan", help="只扫描还没分析过声音的录音段（voices 会自动做）").set_defaults(func=cmd_speakers_scan)
+    s = ssub.add_parser("set-self", help="标出哪位说话人是本人（日报 / 问答以本人视角）")
+    s.add_argument("name")
+    s.set_defaults(func=cmd_speakers_set_self)
+    s = ssub.add_parser("relation", help="标注某人和本人的关系（- 清除）")
+    s.add_argument("name")
+    s.add_argument("relation", help="如 同事 / 朋友 / 领导 / 导师，或 - 清除")
+    s.add_argument("--note", default=None, help="备注")
+    s.set_defaults(func=cmd_speakers_relation)
+    s = ssub.add_parser("relations", help="让模型从记录里推断各说话人和本人的关系（手动标过的不动）")
+    s.add_argument("--force", action="store_true", help="忽略上次推断的缓存")
+    s.add_argument("--speaker", default=None, metavar="NAME", help="只推断某一个人")
+    s.set_defaults(func=cmd_speakers_relations)
     s = ssub.add_parser("relabel", help="对已转写的录音段按当前声纹库重新识别说话人（不重复 ASR）")
     s.add_argument("--day", default=None, help="只处理某天 YYYY-MM-DD")
     s.add_argument("--segment", type=int, default=None, help="只处理某个 segment id")

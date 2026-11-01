@@ -7,12 +7,13 @@ only (no auth): ui.host must stay 127.0.0.1.
 
 Endpoints (see the handlers for parameters)
   status / service        GET /api/status   POST /api/recording/{start,stop}   POST /api/service/{start,stop}
-  jobs                    GET /api/jobs     POST /api/jobs/{name}   (process, daily, cleanup, reindex, relabel, push)
+  jobs                    GET /api/jobs     POST /api/jobs/{name}   (process, daily, cleanup, reindex, relabel, push, voices, relations)
   transcripts             GET /api/days  /api/transcript/{day}  /api/search  /api/context/{id}  /api/segments
   audio                   GET /api/audio/utterance/{id}  /api/audio/segment/{id}?from=&to=
   daily digests / notes   GET /api/daily  /api/daily/{day}   GET,DELETE /api/notes
   speakers                GET /api/speakers  POST /api/speakers/{name}/samples  POST /api/speakers/label
                           PATCH,DELETE /api/speakers/{id}  DELETE /api/speakers/samples/{id}  POST /api/speakers/calibrate
+  unknown voices          GET /api/voices   POST /api/voices/name   (name a group of not-yet-identified voices)
   memory chat             POST /api/chat   (NDJSON stream: tool / answer / error / ping events)
   settings                GET,PUT /api/config   GET,PUT /api/glossary   GET /api/devices   POST /api/config/test-api
                           POST /api/push/test   GET /api/logs   POST /api/import
@@ -38,7 +39,7 @@ from fastapi.staticfiles import StaticFiles
 
 from ..config import (DEFAULT_PROFILE, DEFAULTS, canonical_profile_name, create_profile, delete_profile, is_placeholder_key,
                       list_profiles, load_config, profile_config_path, profile_exists, valid_profile_name)
-from ..runtime import JOBS, JobError, ReadOnly, Runtime, RuntimeHolder, profile_label
+from ..runtime import JOBS, VOICE_MODELS_MISSING_MSG, JobError, ReadOnly, Runtime, RuntimeHolder, profile_label
 from ..service import AlreadyRunning
 from . import yaml_edit
 
@@ -53,7 +54,8 @@ EDITABLE: dict[str, set[str]] = {
     "audio": {"device", "vad_threshold", "min_silence_s", "min_speech_s", "max_segment_s", "gain", "codec",
               "system_audio", "system_device", "system_gain"},
     "storage": {"cleanup_enabled", "keep_audio_days", "max_disk_gb"},
-    "speakers": {"identify_threshold", "cluster_threshold", "unknown_label", "num_threads"},
+    "speakers": {"identify_threshold", "cluster_threshold", "unknown_label", "num_threads",
+                 "voice_group_threshold", "infer_relations", "relation_min_utterances", "relation_min_confidence"},
     "correction": {"enabled"},
     "pipeline": {"process_interval_min", "min_segment_age_s"},
     "memory": {"strategy", "retrieval", "query_expansion", "prefetch_k", "chat_model", "max_tool_rounds", "embedding_model"},
@@ -79,6 +81,8 @@ _RANGES: dict[tuple[str, ...], tuple[float, float]] = {
     ("audio", "max_segment_s"): (10.0, 3600.0), ("audio", "gain"): (0.05, 50.0), ("audio", "system_gain"): (0.05, 50.0),
     ("storage", "keep_audio_days"): (0, 100000), ("storage", "max_disk_gb"): (0, 100000),
     ("speakers", "identify_threshold"): (0.0, 1.0), ("speakers", "cluster_threshold"): (0.0, 1.0), ("speakers", "num_threads"): (1, 64),
+    ("speakers", "voice_group_threshold"): (0.0, 1.0), ("speakers", "relation_min_utterances"): (1, 1000),
+    ("speakers", "relation_min_confidence"): (0.0, 1.0),
     ("pipeline", "process_interval_min"): (1, 1440), ("pipeline", "min_segment_age_s"): (0, 3600),
     ("mimo", "asr_concurrency"): (1, 32), ("memory", "prefetch_k"): (1, 100), ("memory", "max_tool_rounds"): (0, 50),
     ("analysis", "session_gap_min"): (1, 1440), ("analysis", "catchup_days"): (1, 365), ("ui", "port"): (1024, 65535),
@@ -212,6 +216,21 @@ def _utt_dict(r: Any, unknown: str, audio_ok: bool | None = None) -> dict[str, A
     if audio_ok is not None:
         d["audio"] = audio_ok
     return d
+
+
+def _speaker_id_arg(v: Any) -> int | None:
+    """Optional speaker id from a request body: None / "" mean "all", anything else must be a positive integer."""
+    if v is None or v == "":
+        return None
+    if isinstance(v, bool) or isinstance(v, (dict, list)):
+        raise HTTPException(400, "speaker_id 应为说话人 id")
+    try:
+        sid = int(v)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "speaker_id 应为说话人 id")
+    if sid <= 0:
+        raise HTTPException(400, "speaker_id 应为说话人 id")
+    return sid
 
 
 def _wav_bytes(audio: Any) -> bytes:
@@ -421,6 +440,8 @@ def create_app(rt_or_holder: Runtime | RuntimeHolder) -> FastAPI:
             kwargs = {"day": _day(body["day"]) if body.get("day") else None, "segment_id": body.get("segment_id")}
         elif name == "reindex":
             kwargs = {"vectors": bool(body.get("vectors", True))}
+        elif name == "relations":
+            kwargs = {"speaker_id": _speaker_id_arg(body.get("speaker_id")), "force": bool(body.get("force", False))}
         st = rt.submit(name, **kwargs)
         return {"ok": True, "job": st.as_dict()}
 
@@ -625,13 +646,47 @@ def create_app(rt_or_holder: Runtime | RuntimeHolder) -> FastAPI:
     # ------------------------------------------------------------------ speakers
     def _speakers() -> list[dict[str, Any]]:
         rows = rt.db.query(
-            "SELECT s.id, s.name, s.notes, s.created_at, COUNT(e.id) AS samples, COALESCE(SUM(e.duration_s),0) AS dur"
+            "SELECT s.id, s.name, s.notes, s.created_at, s.is_self, s.relation, s.relation_source, s.relation_note,"
+            " COUNT(e.id) AS samples, COALESCE(SUM(e.duration_s),0) AS dur"
             " FROM speakers s LEFT JOIN speaker_embeddings e ON e.speaker_id=s.id GROUP BY s.id ORDER BY s.name")
         counts = {r["speaker_id"]: int(r["n"]) for r in rt.db.query(
             "SELECT speaker_id, COUNT(*) AS n FROM utterances WHERE speaker_id IS NOT NULL GROUP BY speaker_id")}
         return [{"id": int(r["id"]), "name": r["name"], "notes": r["notes"] or "", "created_at": r["created_at"],
-                 "samples": int(r["samples"]), "duration_s": round(float(r["dur"]), 1), "utterances": counts.get(r["id"], 0)}
+                 "samples": int(r["samples"]), "duration_s": round(float(r["dur"]), 1), "utterances": counts.get(r["id"], 0),
+                 "is_self": bool(r["is_self"]), "relation": r["relation"], "relation_source": r["relation_source"],
+                 "relation_note": r["relation_note"]}
                 for r in rows]
+
+    def _assign_utterances(sid: int, name: str, seg_id: int, ids: list[int], whole_cluster: bool) -> tuple[int, int]:
+        """Hand-label utterances (speaker_source='user': relabel leaves them alone). With whole_cluster every
+        utterance of the same segment that shares a cluster_label with one of `ids` is included - except the
+        ones the user already labelled by hand as somebody else, which are kept. Returns (assigned, skipped)."""
+        db = rt.db
+        if not ids:
+            return 0, 0
+        marks = ",".join("?" * len(ids))
+        where, params = f"id IN ({marks})", [*ids]
+        skipped = 0
+        if whole_cluster:
+            labels = [r["cluster_label"] for r in db.query(f"SELECT DISTINCT cluster_label FROM utterances WHERE id IN ({marks})", ids)
+                      if r["cluster_label"] is not None]
+            if labels:
+                lmarks = ",".join("?" * len(labels))
+                guard = "(speaker_source IS NULL OR speaker_source<>'user' OR speaker_id IS NULL OR speaker_id=?)"
+                other = db.one(f"SELECT COUNT(*) AS n FROM utterances WHERE segment_id=? AND cluster_label IN ({lmarks})"
+                               f" AND id NOT IN ({marks}) AND NOT {guard}", [int(seg_id), *labels, *ids, int(sid)])
+                skipped = int(other["n"]) if other else 0
+                where += f" OR (segment_id=? AND cluster_label IN ({lmarks}) AND {guard})"
+                params += [int(seg_id), *labels, int(sid)]
+        cur = db.execute(f"UPDATE utterances SET speaker_id=?, speaker_name=?, speaker_score=NULL, speaker_source='user'"
+                         f" WHERE {where}", [int(sid), name, *params])
+        return int(cur.rowcount or 0), skipped
+
+    def _apply_self_relation(sid: int, is_self: Any, relation: Any) -> None:
+        if is_self:
+            rt.db.set_self_speaker(int(sid))
+        if relation is not None and str(relation).strip():
+            rt.db.set_relation(int(sid), str(relation).strip(), "user")
 
     def _after_enroll(seg_id: int | None = None) -> dict[str, Any]:
         """Register the (new) name with jieba, refresh text_seg, re-identify one segment if given."""
@@ -657,9 +712,60 @@ def create_app(rt_or_holder: Runtime | RuntimeHolder) -> FastAPI:
 
     @app.get("/api/speakers")
     def speakers_list() -> dict[str, Any]:
+        from ..analysis.relations import RELATION_CHOICES
+
         unk = rt.db.one("SELECT COUNT(*) AS n FROM utterances WHERE speaker_id IS NULL")
+        me = rt.db.self_speaker()
         return {"speakers": _speakers(), "unknown_utterances": int(unk["n"]) if unk else 0,
-                "identify_threshold": float(rt.cfg.speakers.identify_threshold), "unknown_label": unknown()}
+                "identify_threshold": float(rt.cfg.speakers.identify_threshold), "unknown_label": unknown(),
+                "self_id": int(me["id"]) if me else None, "relation_choices": list(RELATION_CHOICES)}
+
+    # ------------------------------------------------------------------ unknown voices
+    @app.get("/api/voices")
+    def voices_list() -> dict[str, Any]:
+        """Not-yet-identified voices grouped across recordings (see speech.voices.group_unknown_voices)."""
+        from ..speech import voices
+
+        out = voices.group_unknown_voices(rt.db, rt.cfg)
+        out["scanning"] = bool(rt.jobs["voices"].running)
+        return out
+
+    @app.post("/api/voices/name")
+    async def voices_name(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        """Give a voice group a name: {members: [[segment_id, cluster_label], ...], name, is_self?, relation?,
+        auto_relabel?: true}. Enrolls samples from the group, assigns its utterances (speaker_source='user'),
+        then re-identifies the other recordings in the background when unidentified utterances remain."""
+        from ..speech import voices
+
+        name = str(body.get("name") or "").strip()
+        if not name:
+            raise HTTPException(400, "姓名不能为空")
+        members = body.get("members")
+        if not isinstance(members, list) or not members:
+            raise HTTPException(400, "members 不能为空")
+        is_self = bool(body.get("is_self", False))
+        relation = body.get("relation")
+        relation = str(relation).strip() if relation is not None else None
+        if rt.speaker_models_missing():
+            raise HTTPException(400, VOICE_MODELS_MISSING_MSG)
+        db = rt.db
+        with rt.busy():                      # a profile switch waits (JobError -> 409) instead of closing the DB under us
+            try:
+                res = await _to_thread(lambda: voices.name_voice(db, rt.cfg, rt.engine(), members, name,
+                                                                 is_self=is_self, relation=relation or None))
+            except ValueError as e:
+                raise HTTPException(400, str(e))
+            extra = await _to_thread(_after_enroll)
+        relabel_started = False
+        if body.get("auto_relabel", True):
+            left = db.one("SELECT COUNT(*) AS n FROM utterances WHERE speaker_id IS NULL")
+            if left and int(left["n"]) and db.one("SELECT 1 FROM speaker_embeddings LIMIT 1"):
+                try:
+                    rt.submit("relabel")
+                    relabel_started = True
+                except (JobError, ReadOnly) as e:
+                    log.info("relabel after naming a voice not started: %s", e)
+        return {"ok": True, **res, "relabel_started": relabel_started, **extra}
 
     @app.get("/api/speakers/{sid}/samples")
     def speaker_samples(sid: int) -> list[dict[str, Any]]:
@@ -724,20 +830,21 @@ def create_app(rt_or_holder: Runtime | RuntimeHolder) -> FastAPI:
             after = db.one("SELECT COUNT(*) AS n, COALESCE(MAX(duration_s),0) AS last FROM speaker_embeddings WHERE speaker_id=?", (sid,))
             return sid, n0, int(after["n"]) if after else 0, float(after["last"]) if after else 0.0
 
-        try:
-            sid, n0, n1, last = await _to_thread(enroll)
-        finally:
+        with rt.busy():
             try:
-                tmp.unlink()
-            except OSError:
-                pass
-        if n1 <= n0:
-            if n1 == 0 and not existed:
-                # a brand-new speaker row without samples is useless and confusing: remove it again
-                # (a pre-existing speaker keeps its row: utterances still carry its id and name)
-                rt.db.execute("DELETE FROM speakers WHERE id=?", (sid,))
-            raise HTTPException(400, "样本里检测到的语音太少（至少 1 秒，建议 10 秒以上），请重录")
-        extra = await _to_thread(_after_enroll)
+                sid, n0, n1, last = await _to_thread(enroll)
+            finally:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+            if n1 <= n0:
+                if n1 == 0 and not existed:
+                    # a brand-new speaker row without samples is useless and confusing: remove it again
+                    # (a pre-existing speaker keeps its row: utterances still carry its id and name)
+                    rt.db.execute("DELETE FROM speakers WHERE id=?", (sid,))
+                raise HTTPException(400, "样本里检测到的语音太少（至少 1 秒，建议 10 秒以上），请重录")
+            extra = await _to_thread(_after_enroll)
         return {"ok": True, "id": sid, "name": name, "samples": n1, "speech_s": round(last, 1), **extra}
 
     @app.post("/api/speakers/label")
@@ -746,29 +853,47 @@ def create_app(rt_or_holder: Runtime | RuntimeHolder) -> FastAPI:
         if not name:
             raise HTTPException(400, "姓名不能为空")
         db = rt.db
+        whole_cluster = bool(body.get("whole_cluster", True))
+        utt_ids: list[int]
         if body.get("utterance_id") is not None:
-            u = db.one("SELECT segment_id, start_s, end_s FROM utterances WHERE id=?", (int(body["utterance_id"]),))
+            u = db.one("SELECT id, segment_id, start_s, end_s FROM utterances WHERE id=?", (int(body["utterance_id"]),))
             if u is None:
                 raise HTTPException(404, "没有这条记录")
             seg_id, a, b = int(u["segment_id"]), float(u["start_s"]), float(u["end_s"])
+            utt_ids = [int(u["id"])]
         else:
             try:
                 seg_id, a, b = int(body["segment_id"]), float(body["from"]), float(body["to"])
             except (KeyError, TypeError, ValueError):
                 raise HTTPException(400, "需要 utterance_id，或 segment_id + from + to")
+            # the utterances the range covers (overlapping it) are the ones labelled by hand
+            utt_ids = [int(r["id"]) for r in db.query(
+                "SELECT id FROM utterances WHERE segment_id=? AND start_s < ? AND end_s > ?", (seg_id, b, a))]
         if b <= a:
             raise HTTPException(400, "结束时间必须大于开始时间")
         seg = db.get_segment(seg_id)
         if seg is None or not Path(seg["path"]).exists():
             raise HTTPException(404, "这段音频已不存在（超过保留期），无法取声纹")
-        try:
-            seg_path = Path(seg["path"])
-            sid = await _to_thread(lambda: rt.engine().enroll_from_segment_turns(db, name, seg_path, [(a, b)]))
-        except ValueError as e:
-            raise HTTPException(400, str(e))
-        extra = await _to_thread(_after_enroll, seg_id)
+        with rt.busy():
+            try:
+                seg_path = Path(seg["path"])
+                sid = await _to_thread(lambda: rt.engine().enroll_from_segment_turns(db, name, seg_path, [(a, b)]))
+            except ValueError as e:
+                raise HTTPException(400, str(e))
+            assigned, skipped = _assign_utterances(sid, name, seg_id, utt_ids, whole_cluster)
+            extra = await _to_thread(_after_enroll, seg_id)       # relabel_segment leaves the hand-labelled ones alone
+            _apply_self_relation(sid, body.get("is_self"), body.get("relation"))
+            if assigned:
+                try:
+                    from ..speech.pipeline import write_day_markdown
+
+                    for d in db.query("SELECT DISTINCT day FROM utterances WHERE segment_id=? AND speaker_id=?", (seg_id, sid)):
+                        write_day_markdown(db, rt.cfg, d["day"])
+                except Exception as e:  # noqa: BLE001
+                    log.warning("rewrite markdown after label failed: %s", e)
         n = db.one("SELECT COUNT(*) AS n FROM speaker_embeddings WHERE speaker_id=?", (sid,))
-        return {"ok": True, "id": sid, "name": name, "samples": int(n["n"]) if n else 0, "segment_id": seg_id, **extra}
+        return {"ok": True, "id": sid, "name": name, "samples": int(n["n"]) if n else 0, "segment_id": seg_id,
+                "assigned": assigned, "skipped_user_labels": skipped, **extra}
 
     @app.patch("/api/speakers/{sid}")
     def speaker_update(sid: int, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
@@ -778,6 +903,21 @@ def create_app(rt_or_holder: Runtime | RuntimeHolder) -> FastAPI:
             raise HTTPException(404, "没有这个说话人")
         if "notes" in body:
             db.execute("UPDATE speakers SET notes=? WHERE id=?", (str(body["notes"] or "") or None, int(sid)))
+        if "is_self" in body:
+            if body["is_self"]:
+                db.set_self_speaker(int(sid))                       # the previous "self" (if any) is cleared
+            else:
+                me = db.self_speaker()
+                if me is not None and int(me["id"]) == int(sid):
+                    db.set_self_speaker(None)
+        if "relation" in body:
+            # "" clears relation / source / note and the inference cache (the next 自动推断关系 asks again);
+            # otherwise it is the user's own label (an inferred one is replaced)
+            rel = str(body.get("relation") or "").strip()
+            note = str(body.get("relation_note") or "").strip() or None
+            db.set_relation(int(sid), rel or None, "user" if rel else None, note)
+        elif "relation_note" in body:
+            db.execute("UPDATE speakers SET relation_note=? WHERE id=?", (str(body["relation_note"] or "").strip() or None, int(sid)))
         new_name = str(body.get("name") or "").strip()
         renamed_days: list[str] = []
         if new_name and new_name != row["name"]:
@@ -804,9 +944,9 @@ def create_app(rt_or_holder: Runtime | RuntimeHolder) -> FastAPI:
             raise HTTPException(404, "没有这个说话人")
         unk = unknown()
         days = [r["day"] for r in db.query("SELECT DISTINCT day FROM utterances WHERE speaker_id=?", (int(sid),))]
-        with db.transaction() as c:
-            c.execute("UPDATE utterances SET speaker_name=?, speaker_score=NULL WHERE speaker_id=?", (unk, int(sid)))
-            c.execute("DELETE FROM speakers WHERE id=?", (int(sid),))
+        # the utterances become unidentified again (no 'user' mark left behind, so relabel may re-identify
+        # them) and the relation inference cache of the id is dropped
+        db.delete_speaker(int(sid), unk)
         try:
             from ..speech.pipeline import write_day_markdown
 

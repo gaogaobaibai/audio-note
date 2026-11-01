@@ -72,6 +72,10 @@ DEFAULTS: dict[str, Any] = {
         "min_turn_s": 0.3,
         "unknown_label": "未知",
         "auto_enroll_from_diarization": False,
+        "voice_group_threshold": 0.55,  # cosine threshold for grouping unknown voices across recordings (higher = finer groups)
+        "infer_relations": True,        # after the daily digest, ask the LLM how each speaker relates to the user
+        "relation_min_utterances": 15,  # a speaker needs at least this many utterances before relation inference
+        "relation_min_confidence": 0.6, # inferred relations below this confidence are not written
     },
     "correction": {
         "enabled": True,

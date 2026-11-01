@@ -161,6 +161,7 @@
     $$("#nav a").forEach((a) => a.classList.toggle("active", a.dataset.page === page));
     state.page = page;
     state.refresh = null;
+    main.onfocusout = null;                 // the speakers page installs one; drop it with the page
     const my = ++routeGen;
     stopPagePoll();
     stopRecording();
@@ -214,7 +215,7 @@
         state.jobsSeen[n] = j.finished_at;
         if (j.error) toast(`${j.label}失败：${j.error}`, "err", 8000);
         else toast(`${j.label}完成${jobSummary(n, j.result)}`, "ok", 5000);
-        if (state.refresh) state.refresh().catch(() => {});
+        if (state.refresh) state.refresh(n).catch(() => {});      // pages may ignore the job name; the speakers page uses it
       }
     }
   }
@@ -226,6 +227,8 @@
     if (name === "reindex") return `：关键词 ${r.keywords} 条${r.vectors != null ? `，向量 ${r.vectors} 条` : ""}`;
     if (name === "relabel") return `：${r.segments} 段，${r.changed} 条语句变化`;
     if (name === "push") return `：${Object.entries(r.channels || {}).map(([k, v]) => `${k} ${v ? "失败" : "成功"}`).join("，")}`;
+    if (name === "voices") return `：分析 ${r.segments} 段录音，${r.clusters} 个声音${r.skipped ? `，${r.skipped} 段跳过` : ""}`;
+    if (name === "relations") return `：检查 ${r.speakers} 人，写入 ${r.applied} 条关系`;
     return "";
   }
 
@@ -333,6 +336,7 @@
             : `<button class="btn rec" data-act="start" ${st.models_missing.length ? "disabled" : ""}>● 开始录音</button>`}</div></div>
         ${alerts.join("")}
         <div class="card hero"><div><div class="${stateCls}"><span class="dot"></span>${stateTxt}</div><div class="detail">${detail}</div></div></div>
+        ${st.unknown_utterances ? `<div class="hint-line">有 ${st.unknown_utterances} 句话还没认出是谁说的 → <a href="#/speakers">去标记</a></div>` : ""}
         <div class="tiles mt">
           <div class="tile"><div class="k">今日语句</div><div class="v">${st.today.utterances}<small>条</small></div></div>
           <div class="tile"><div class="k">今日语音</div><div class="v">${st.today.recorded_speech_min.toFixed(0)}<small>分钟</small></div></div>
@@ -379,9 +383,11 @@
     const unk = (state.status && state.status.unknown_label) || "未知";
     const isUnk = !u.speaker_id;
     const c = isUnk ? "" : `spk-c${spkColor(u.speaker)}`;
+    const selfName = state.status && state.status.self_name;
+    const meBadge = !isUnk && selfName && u.speaker === selfName ? `<span class="badge me" title="本人">我</span>` : "";
     return `<div class="utt ${isUnk ? "unknown" : ""} ${hl ? "hl" : ""}" data-id="${u.id}" id="u${u.id}">
       <span class="time">${esc(u.time.slice(0, 5))}</span>
-      <span class="spk ${c}" title="${esc(u.speaker)}${u.score != null ? ` 相似度 ${u.score}` : ""}">${esc(u.speaker)}${u.score != null && !isUnk ? `<span class="sc">${u.score.toFixed(2)}</span>` : ""}</span>
+      <span class="spk ${c}" title="${esc(u.speaker)}${u.score != null ? ` 相似度 ${u.score}` : ""}">${esc(u.speaker)}${meBadge}${u.score != null && !isUnk ? `<span class="sc">${u.score.toFixed(2)}</span>` : ""}</span>
       <span class="text">${esc(u.text)}${u.text_raw ? `<div class="raw" title="纠错前的原始转写">原文：${esc(u.text_raw)}</div>` : ""}</span>
       <span class="acts">${noActs ? "" : `${u.audio ? `<button class="icon-btn" data-u="play" title="播放这句">▶</button>` : ""}<button class="icon-btn" data-u="label" title="标记这句话是谁说的">👤</button><button class="icon-btn" data-u="ctx" title="前后文">↕</button>`}</span>
     </div>`;
@@ -497,22 +503,38 @@
     } catch (e) { toastErr(e); }
   }
   async function labelUtt(u, after) {
-    const names = (await api("/api/speakers").catch(() => ({ speakers: [] }))).speakers.map((s) => s.name);
+    const sp = await api("/api/speakers").catch(() => ({ speakers: [], relation_choices: [], self_id: null }));
+    const names = sp.speakers.map((s) => s.name);
+    const me = sp.speakers.find((s) => s.id === sp.self_id) || null;
+    const choices = sp.relation_choices || [];
     modal(`<h2>这句话是谁说的？</h2>
       <div class="muted small mb">${esc(u.time.slice(0, 5))} ${esc(u.speaker)}：${esc(u.text)}</div>
-      <div class="field"><label>姓名（已有的人就选，新名字会自动注册）</label><input class="input" id="lb-name" list="lb-list" placeholder="例如：张三" value="${u.speaker_id ? esc(u.speaker) : ""}"><datalist id="lb-list">${names.map((n) => `<option value="${esc(n)}">`).join("")}</datalist>
-      <div class="help">会用这句话的声音补充该说话人的声纹，并立刻重新识别同一段录音里的其他语句（${(u.end_s - u.start_s).toFixed(1)} 秒，太短的话识别效果一般，建议选 3 秒以上的句子）。</div></div>
+      <div class="field"><label>姓名（已有的人就选，新名字会自动登记）</label><input class="input" id="lb-name" list="lb-list" placeholder="例如：张三" value="${u.speaker_id ? esc(u.speaker) : ""}"><datalist id="lb-list">${names.map((n) => `<option value="${esc(n)}">`).join("")}</datalist></div>
+      <div id="lb-new" class="row mt hidden"><label class="check small"><input type="checkbox" id="lb-self"> ${me ? "这其实是我" : "这是我自己"}</label>${relationSelect(choices, "", { empty: "和我的关系（可选）" })}</div>
+      <label class="check small mt"><input type="checkbox" id="lb-whole" checked> 这段录音里同一个声音的其他句子也一起标</label>
+      <div class="help mt">会用这句话的声音补充该说话人的声纹，并重新识别同一段录音里的其他语句（${(u.end_s - u.start_s).toFixed(1)} 秒，太短的话识别效果一般，建议选 3 秒以上的句子）。</div>
       ${u.audio ? `<div class="mt"><audio controls src="/api/audio/utterance/${u.id}?pad=0.3" style="width:100%"></audio></div>` : `<div class="alert warn mt">这段音频已被删除，无法提取声纹</div>`}
       <div class="actions"><button class="btn" data-x="cancel">取消</button><button class="btn primary" data-x="ok" ${u.audio ? "" : "disabled"}>标记</button></div>`,
       (el, close) => {
         const inp = el.querySelector("#lb-name"); inp.focus();
+        wireRelationSelects(el);
+        const newBox = el.querySelector("#lb-new");
+        const isNew = () => { const n = inp.value.trim(); return !!n && !names.includes(n); };
+        const syncNew = () => newBox.classList.toggle("hidden", !isNew());      // 本人 / 关系 only for a name not registered yet
+        inp.oninput = syncNew; inp.onchange = syncNew; syncNew();
         el.querySelector('[data-x="cancel"]').onclick = close;
         const ok = async () => {
           const name = inp.value.trim(); if (!name) return;
+          const body = { utterance_id: u.id, name, whole_cluster: el.querySelector("#lb-whole").checked };
+          if (isNew()) {
+            body.is_self = el.querySelector("#lb-self").checked;
+            const rel = relationValue(newBox); if (rel) body.relation = rel;
+          }
           const b = el.querySelector('[data-x="ok"]'); b.disabled = true; b.innerHTML = `<span class="spin"></span>处理中…`;
           try {
-            const r = await api("/api/speakers/label", { method: "POST", json: { utterance_id: u.id, name } });
-            toast(`已标记为 ${name}${r.relabeled_changed != null ? `，这段录音里 ${r.relabeled_changed} 条语句的说话人有更新` : ""}`, "ok", 6000);
+            const r = await api("/api/speakers/label", { method: "POST", json: body });
+            toast(`已标记为 ${name}：${r.assigned != null ? `${r.assigned} 句` : "已更新"}${r.relabeled_changed ? `，这段录音里另有 ${r.relabeled_changed} 句自动更新` : ""}`, "ok", 6000);
+            if (body.is_self) await refreshStatus();        // so the 我 badge shows on the very next render, not after the next poll
             close(); if (after) after();
           } catch (e) { toastErr(e); b.disabled = false; b.textContent = "标记"; }
         };
@@ -683,24 +705,212 @@
   // ------------------------------------------------------------------ speakers
   let recState = null;
   function stopRecording() { if (recState) { try { recState.stop(true); } catch (e) { /* ignore */ } recState = null; } }
+  // relation picker: <select> of the backend's RELATION_CHOICES plus "自定义…" that turns into a text box
+  const CUSTOM_REL = "__custom__";
+  function relationSelect(choices, value = "", { empty = "关系（可选）" } = {}) {
+    const v = String(value || "");
+    const custom = !!v && !choices.includes(v);
+    return `<span class="rel-pick"><select class="input" data-rel-sel><option value="">${esc(empty)}</option>${choices.map((c) => `<option value="${esc(c)}" ${c === v ? "selected" : ""}>${esc(c)}</option>`).join("")}<option value="${CUSTOM_REL}" ${custom ? "selected" : ""}>自定义…</option></select><input class="input ${custom ? "" : "hidden"}" data-rel-custom placeholder="填写关系" value="${esc(custom ? v : "")}"></span>`;
+  }
+  function wireRelationSelects(root) {
+    for (const sel of $$("[data-rel-sel]", root)) {
+      const custom = sel.parentElement.querySelector("[data-rel-custom]");
+      sel.onchange = () => { const c = sel.value === CUSTOM_REL; custom.classList.toggle("hidden", !c); if (c) custom.focus(); };
+    }
+  }
+  function relationValue(root) {
+    const sel = root.querySelector("[data-rel-sel]"); if (!sel) return "";
+    if (sel.value === CUSTOM_REL) { const c = root.querySelector("[data-rel-custom]"); return c ? c.value.trim() : ""; }
+    return sel.value;
+  }
+  // "X 和我的关系" dialog; resolves true when something was saved
+  function relationModal(spk, choices) {
+    return new Promise((resolve) => {
+      const auto = spk.relation_source === "auto";
+      const initialRel = spk.relation || "";
+      modal(`<h2>${esc(spk.name)} 和我的关系</h2>
+        <div class="field"><label>关系</label>${relationSelect(choices, initialRel)}</div>
+        <div class="field mt"><label>备注（可选）</label><input class="input" id="rm-note" value="${esc(auto ? "" : (spk.relation_note || ""))}" placeholder="例如：同一个项目组的 / 大学同学"></div>
+        ${auto && spk.relation_note ? `<div class="help mt">自动推断的理由：${esc(spk.relation_note)}（不改动直接保存会保留这条推断）</div>` : ""}
+        <div class="actions">${spk.relation ? `<button class="btn ghost" data-x="clear">清除关系</button>` : ""}<button class="btn" data-x="cancel">取消</button><button class="btn primary" data-x="ok">保存</button></div>`,
+        (el, close) => {
+          wireRelationSelects(el);
+          const patch = (body) => api(`/api/speakers/${spk.id}`, { method: "PATCH", json: body });
+          const noteEl = el.querySelector("#rm-note");
+          let noteTouched = false;                                   // an untouched note box must not overwrite an auto-inferred reason
+          noteEl.addEventListener("input", () => { noteTouched = true; });
+          el.querySelector('[data-x="cancel"]').onclick = () => { close(); resolve(false); };
+          el.querySelector('[data-x="ok"]').onclick = async () => {
+            const rel = relationValue(el); const note = noteEl.value.trim();
+            if (rel === initialRel && !noteTouched) { close(); resolve(false); return; }   // nothing changed: no PATCH (keeps source='auto' + its reason)
+            try {
+              if (rel) await patch({ relation: rel, relation_note: note });
+              else { await patch({ relation: "" }); if (note) await patch({ relation_note: note }); }   // "" clears relation + note; a note alone is kept
+              close(); resolve(true);
+            } catch (e) { toastErr(e); }
+          };
+          const cl = el.querySelector('[data-x="clear"]'); if (cl) cl.onclick = async () => { try { await patch({ relation: "" }); close(); resolve(true); } catch (e) { toastErr(e); } };
+        });
+    });
+  }
+
+  const voicesAutoScanned = {};            // profile name -> true: the speakers page submits the "voices" scan job at most once per profile per session
+  const currentProfile = () => (state.status && state.status.profile && state.status.profile.name) || "";
+  const voiceDrafts = {};                  // what the user typed into a voice card, kept across a re-render (keyed by group key)
+  const voiceLetter = (i) => (i < 26 ? String.fromCharCode(65 + i) : String(i + 1));
+  function stashVoiceDrafts() {
+    for (const c of $$(".voice-card")) {
+      const f = c.querySelector(".voice-form"); if (!f) continue;
+      const d = { name: f.querySelector("[data-vname]").value, sel: f.querySelector("[data-rel-sel]").value, custom: f.querySelector("[data-rel-custom]").value, self: f.querySelector("[data-vself]").checked };
+      if (d.name || d.sel || d.self) voiceDrafts[c.dataset.key] = d;
+    }
+  }
+
   async function pageSpeakers(arg, my) {
     const data = await api("/api/speakers");
     if (stale(my)) return;
     state.speakers = data.speakers;
-    const cards = data.speakers.map((s) => `<div class="card spk-card" data-sid="${s.id}">
-        <div class="row"><span class="avatar bg-c${spkColor(s.name)}">${esc(s.name.slice(0, 1))}</span><div class="grow"><div class="name">${esc(s.name)}</div><div class="small muted">${s.samples} 个声纹样本 · ${s.duration_s.toFixed(0)} 秒语音 · ${s.utterances} 条语句${s.notes ? ` · ${esc(s.notes)}` : ""}</div></div></div>
-        <div class="row"><button class="btn sm" data-act="add" data-name="${esc(s.name)}">补充样本</button><button class="btn sm" data-act="samples">样本列表</button><button class="btn sm" data-act="rename">重命名</button><button class="btn sm ghost" data-act="notes">备注</button><button class="btn sm danger right" data-act="delete">删除</button></div>
+    const choices = data.relation_choices || [];
+    const me = data.speakers.find((s) => s.id === data.self_id) || null;
+    const names = data.speakers.map((s) => s.name);
+    const people = [...data.speakers].sort((a, b) => (b.is_self ? 1 : 0) - (a.is_self ? 1 : 0));
+    const relationChip = (s) => {
+      if (s.is_self) return "";
+      if (!s.relation) return `<button class="relation-chip empty" data-act="relation" title="标注 TA 和你的关系">＋ 关系</button>`;
+      const auto = s.relation_source === "auto";
+      return `<button class="relation-chip ${auto ? "auto" : ""}" data-act="relation" title="${esc(s.relation_note || (auto ? "模型从记录里推断的，点击修改" : "点击修改"))}">${esc(s.relation)}${auto ? `<small>自动</small>` : ""}</button>`;
+    };
+    const cards = people.map((s) => `<div class="card spk-card ${s.is_self ? "me" : ""}" data-sid="${s.id}">
+        <div class="row"><span class="avatar bg-c${spkColor(s.name)}">${esc(s.name.slice(0, 1))}</span><div class="grow"><div class="name">${esc(s.name)}${s.is_self ? `<span class="badge me">我</span>` : ""}${relationChip(s)}</div><div class="small muted">${s.samples} 个声纹样本 · ${s.duration_s.toFixed(0)} 秒语音 · ${s.utterances} 条语句${s.notes ? ` · ${esc(s.notes)}` : ""}</div></div></div>
+        <div class="row">${s.is_self ? `<button class="btn sm ghost" data-act="unself" title="不再把 TA 当作本人">取消本人</button>` : `<button class="btn sm" data-act="self" title="日报、推送和问答都站在本人的视角；记录里本人的话就是“我”说的">${me ? "改为本人" : "设为本人"}</button>`}<button class="btn sm" data-act="add" data-name="${esc(s.name)}">补充样本</button><button class="btn sm" data-act="samples">样本列表</button><button class="btn sm" data-act="rename">重命名</button><button class="btn sm ghost" data-act="notes">备注</button><button class="btn sm danger right" data-act="delete">删除</button></div>
         <div class="samples hidden"></div></div>`).join("");
     main.innerHTML = `
-      <div class="page-head"><div><h1>说话人</h1><div class="sub">注册过的人会在记录里被自动识别；没注册的显示为「${esc(data.unknown_label)}」${data.unknown_utterances ? `（目前有 ${data.unknown_utterances} 条）` : ""}</div></div>
-        <div class="row"><button class="btn" id="calib">校准阈值</button><button class="btn" id="relabel-all" title="用当前声纹库重新识别所有已转写的记录（不重新转写）">重新识别全部记录</button><button class="btn primary" id="add-new">＋ 添加说话人</button></div></div>
+      <div class="page-head"><div><h1>说话人</h1><div class="sub">不用单独录样本：下面列出记录里还没认出来的声音，听一下是谁、填上名字就行；登记过的人会自动识别。</div></div>
+        <div class="row"><button class="btn" id="infer-rel" title="让模型从记录里的对话推断每个人和你的关系（手动标过的不会改）">自动推断关系</button><button class="btn" id="relabel-all" title="用当前声纹库重新识别所有已转写的记录（不重新转写）">重新识别全部记录</button><button class="btn" id="calib">校准阈值</button><button class="btn ghost" id="add-new">用麦克风 / 文件补充样本</button></div></div>
+      <datalist id="spk-names">${names.map((n) => `<option value="${esc(n)}">`).join("")}</datalist>
       <div id="enroll-panel" class="card hidden"></div>
-      ${data.speakers.length ? `<div class="grid grid-2">${cards}</div>` : `<div class="empty-state card"><div class="big">还没有注册任何说话人</div>先把自己录进去：点「添加说话人」，对着麦克风念 20 秒就行。</div>`}
-      <div class="card mt"><div class="card-head"><h2>怎么让识别更准</h2></div><ul class="muted small" style="margin:0;padding-left:18px"><li>每人 2–3 个样本、每个 10–30 秒、尽量只有这个人在说话；不同场合（会议室/家里）各录一个更稳。</li><li>已有记录里认错的人：在「记录」页悬停那句话 → 👤 标记，会补充声纹并重新识别那段录音。</li><li>注册了新的人之后点「重新识别全部记录」，历史记录不用重新转写。</li><li>当前识别阈值 ${data.identify_threshold}；样本多了之后「校准阈值」会给出建议值。</li></ul></div>`;
-    // a finished job re-renders the list unless an enrollment panel is open (recording in progress)
-    state.refresh = async () => { if (!recState && $("#enroll-panel").classList.contains("hidden")) await pageSpeakers(arg, my); };
+      <div id="voices-box"><div class="card"><div class="thinking"><span class="spin"></span>正在整理未识别的声音…</div></div></div>
+      ${people.length ? `<div class="sec-head mt"><h2>已登记的人</h2><span class="small muted">${me ? `本人：${esc(me.name)}` : "还没有标出哪位是本人（卡片上点「设为本人」）"}</span></div><div class="grid grid-2">${cards}</div>` : ""}
+      <div class="card mt"><div class="card-head"><h2>提示</h2></div><ul class="muted small" style="margin:0;padding-left:18px"><li>给一组声音起名后，会从这些录音里自动提取声纹样本，之后这个人在新录音里会被自动识别；认错的句子在「记录」页悬停 → 👤 标记即可。</li><li>把自己标为「本人」后，日报和问答会站在你的视角；关系可以手动标，也可以点「自动推断关系」让模型从对话里推断。</li><li>当前识别阈值 ${data.identify_threshold}；样本多了之后「校准阈值」会给出建议值。</li></ul></div>`;
+
+    // ---- unidentified voices
+    const voicesBox = $("#voices-box");
+    let voices = null;
+    const voiceCard = (g, i) => {
+      const days = g.days || [];
+      const range = days.length > 1 ? `${days[0].slice(5)} ~ ${days[days.length - 1].slice(5)}` : (days[0] || "").slice(5);
+      const close = g.closest && g.closest.score >= 0.3 ? g.closest : null;
+      const samples = (g.samples || []).map((s) => `<div class="voice-sample ${s.audio ? "" : "noaudio"}" data-uid="${s.utterance_id}">
+          <span class="time">${esc(String(s.day || "").slice(5))} ${esc(s.time || "")}</span><span class="text" title="${esc(s.text)}">${esc(s.text) || "<i>（没有文字）</i>"}</span><span class="dur">${Number(s.seconds || 0).toFixed(1)}s</span>
+          ${s.audio ? `<button class="icon-btn" data-vplay="${s.utterance_id}" title="播放这句">▶</button>` : `<span class="icon-btn faint" title="音频已删除，无法播放">▶</span>`}</div>`).join("");
+      return `<div class="card voice-card" data-key="${esc(g.key)}">
+        <div class="card-head"><div><h2>声音 ${voiceLetter(i)}</h2><div class="small muted">${g.utterances} 句 · ${Math.round(g.speech_s)} 秒 · ${g.n_days} 天${range ? `（${esc(range)}）` : ""}${g.segments > 1 ? ` · ${g.segments} 段录音` : ""}</div></div>
+          ${close ? `<button class="chip" data-vfill="${esc(close.name)}" title="与已登记声纹的相似度 ${Number(close.score).toFixed(2)}，点一下填入名字（不一定对，先听一听）">可能是 ${esc(close.name)}（${Number(close.score).toFixed(2)}）</button>` : ""}</div>
+        <div class="voice-samples">${samples || `<div class="muted small">（没有示例句）</div>`}</div>
+        <div class="voice-player"></div>
+        <div class="row voice-form"><input class="input" data-vname list="spk-names" placeholder="这是谁？">${relationSelect(choices)}<label class="check small"><input type="checkbox" data-vself> ${me ? "这其实是我" : "这是我自己"}</label><button class="btn primary" data-vok>就是 TA</button></div></div>`;
+    };
+    const renderVoices = () => {
+      const v = voices; if (!v || stale(my)) return;
+      const job = state.status && state.status.jobs && state.status.jobs.voices;
+      const scanning = !!(v.scanning || (job && job.running));
+      const groups = v.groups || [];
+      const readOnly = !!(state.status && state.status.service && state.status.service.read_only);
+      if (!groups.length && !data.speakers.length && !scanning && !v.missing_segments && !v.unknown_utterances) {
+        voicesBox.innerHTML = `<div class="empty-state card"><div class="big">还没有记录</div>录一会儿或导入音频后，这里会列出听到的声音。</div>`;
+        return;
+      }
+      const notes = [];
+      if (scanning) notes.push(`<div class="alert info"><span class="spin"></span>正在分析 ${v.missing_segments ? `${v.missing_segments} 段录音` : "录音"}…完成后这里会自动更新。</div>`);
+      else if (v.missing_segments) notes.push(`<div class="alert warn">还有 ${v.missing_segments} 段录音没有分析过声音${readOnly ? "（只读模式下无法扫描，请在运行服务的那个界面操作）" : ""}。<span class="right"><button class="btn sm" data-vact="scan" ${readOnly ? "disabled" : ""}>扫描</button></span></div>`);
+      if (!groups.length && !scanning && !v.missing_segments && v.unknown_utterances) notes.push(`<div class="small muted mb">有 ${v.unknown_utterances} 句未识别，但它们的音频已不在，无法按声音分组；可以在「记录」页逐句标记。</div>`);
+      voicesBox.innerHTML = `<div class="sec-head"><h2>未识别的声音</h2><span class="small muted">${v.unknown_utterances ? `${v.unknown_utterances} 句还没认出是谁说的` : ""}</span></div>${notes.join("")}
+        ${groups.length ? `<div class="grid grid-2">${groups.map(voiceCard).join("")}</div>` : `<div class="card muted">没有待确认的声音</div>`}`;
+      wireRelationSelects(voicesBox);
+      for (const c of $$(".voice-card", voicesBox)) {
+        const d = voiceDrafts[c.dataset.key]; if (!d) continue;
+        delete voiceDrafts[c.dataset.key];
+        const f = c.querySelector(".voice-form");
+        f.querySelector("[data-vname]").value = d.name;
+        const sel = f.querySelector("[data-rel-sel]"); sel.value = d.sel;
+        const custom = f.querySelector("[data-rel-custom]");
+        custom.classList.toggle("hidden", d.sel !== CUSTOM_REL);     // not sel.onchange(): that would focus() the custom box and steal focus from another card
+        custom.value = d.custom;
+        f.querySelector("[data-vself]").checked = d.self;
+      }
+    };
+    const loadVoices = async () => {
+      try { voices = await api("/api/voices"); }
+      catch (e) { if (!stale(my)) voicesBox.innerHTML = `<div class="alert danger">${esc(e.message)}</div>`; return; }
+      if (stale(my)) return;
+      if (!state.status) { await refreshStatus(); if (stale(my)) return; }    // need profile name + read_only before deciding to auto-scan
+      const readOnly = !!(state.status && state.status.service && state.status.service.read_only);
+      const prof = currentProfile();
+      if (voices.missing_segments > 0 && !voices.scanning && !readOnly && !voicesAutoScanned[prof]) {
+        voicesAutoScanned[prof] = true;
+        try { await api("/api/jobs/voices", { method: "POST", json: {} }); voices.scanning = true; refreshStatus().catch(() => {}); }
+        catch (e) { toast(`无法自动分析录音：${e.message}`, "err", 6000); }
+      }
+      renderVoices();
+    };
+    const playVoiceSample = (card, uid) => {
+      $$(".voice-sample.playing").forEach((x) => x.classList.remove("playing"));
+      $$(".voice-player").forEach((x) => { x.innerHTML = ""; });
+      const row = card.querySelector(`.voice-sample[data-uid="${uid}"]`); if (row) row.classList.add("playing");
+      const p = card.querySelector(".voice-player");
+      p.innerHTML = `<audio controls autoplay src="/api/audio/utterance/${uid}?pad=0.3"></audio><button class="icon-btn" title="关闭">✕</button>`;
+      p.querySelector("button").onclick = () => { p.innerHTML = ""; if (row) row.classList.remove("playing"); };
+      p.querySelector("audio").onerror = () => toast("音频无法播放（文件可能已删除）", "err");
+    };
+    const nameVoice = async (card) => {
+      const g = voices && (voices.groups || []).find((x) => x.key === card.dataset.key); if (!g) return;
+      const f = card.querySelector(".voice-form");
+      const inp = f.querySelector("[data-vname]"); const name = inp.value.trim();
+      if (!name) { toast("先填上这是谁", "err"); inp.focus(); return; }
+      const isSelf = f.querySelector("[data-vself]").checked;
+      if (isSelf && me && me.name !== name && !(await confirmModal("改为本人", `目前本人是「${me.name}」，改成「${name}」？日报和问答会改站在 ${name} 的视角。`, "改为本人"))) return;
+      const rel = relationValue(f);
+      const btn = f.querySelector("[data-vok]"); btn.disabled = true; btn.innerHTML = `<span class="spin"></span>提取声纹…`;
+      try {
+        const r = await api("/api/voices/name", { method: "POST", json: { members: g.members, name, is_self: isSelf, relation: rel || null, auto_relabel: true } });
+        toast(`已标记为 ${name}：${r.utterances_assigned} 句，补充 ${r.samples_added} 个声纹样本${r.relabel_started ? "；正在用新声纹重新识别其他记录" : ""}`, "ok", 7000);
+        stashVoiceDrafts();                                  // keep what was typed into the OTHER cards across the re-render
+        delete voiceDrafts[card.dataset.key];                // (after the stash, or the named card's draft would be re-added)
+        if (isSelf) await refreshStatus();                   // 我 badge / self_name are read from state.status by the next render
+        await pageSpeakers(arg, my);
+      } catch (err) { toastErr(err); btn.disabled = false; btn.textContent = "就是 TA"; }
+    };
+
+    // a finished job re-renders the page, but only for jobs that change what this page shows, and never while the user is
+    // typing into a voice card / relation form (a re-render would replace the input under the cursor); a skipped refresh runs
+    // once focus leaves the form.
+    const REFRESH_JOBS = new Set(["voices", "relabel", "relations", "process"]);
+    const editing = () => {
+      const a = document.activeElement;
+      if (!a || !main.contains(a)) return false;
+      const vb = $("#voices-box");
+      return (vb && vb.contains(a)) || a.matches("input,textarea,select");
+    };
+    let pendingRefresh = false;
+    const doRefresh = async () => {
+      if (stale(my)) return;
+      if (recState || !$("#enroll-panel").classList.contains("hidden") || $("#modal-root").children.length) return;
+      if (editing()) { pendingRefresh = true; return; }
+      pendingRefresh = false;
+      stashVoiceDrafts();
+      await pageSpeakers(arg, my);
+    };
+    state.refresh = async (job) => {
+      if (job !== undefined && !REFRESH_JOBS.has(job)) return;        // daily / push / cleanup / reindex do not touch speakers or voices
+      await doRefresh();
+    };
+    main.onfocusout = () => { setTimeout(() => { if (!stale(my) && pendingRefresh && !editing()) doRefresh().catch(() => {}); }, 0); };
     $("#add-new").onclick = () => enrollPanel("");
-    $("#relabel-all").onclick = async () => { if (await confirmModal("重新识别全部记录", "用当前注册的声纹重新识别所有已转写的语句，不重新转写、不花钱；记录多的话要几分钟。")) runJob("relabel"); };
+    $("#infer-rel").onclick = async () => {
+      if (state.status && !state.status.api_key) { toast("没有配置 MiMo API key，无法推断关系", "err"); return; }
+      if (await confirmModal("自动推断关系", "让模型根据记录里的对话推断每个人和你的关系，只处理语句足够多、还没手动标过的人；结果会标成「自动」，可以随时改。")) runJob("relations");
+    };
+    $("#relabel-all").onclick = async () => { if (await confirmModal("重新识别全部记录", "用当前登记的声纹重新识别所有已转写的语句，不重新转写、不花钱；记录多的话要几分钟。手动标过的句子不会改。")) runJob("relabel"); };
     $("#calib").onclick = async () => {
       try {
         const r = await api("/api/speakers/calibrate", { method: "POST" });
@@ -717,13 +927,27 @@
       } catch (e) { toastErr(e); }
     };
     main.onclick = async (e) => {
+      const vp = e.target.closest("[data-vplay]");
+      if (vp) { playVoiceSample(vp.closest(".voice-card"), Number(vp.dataset.vplay)); return; }
+      const va = e.target.closest("[data-vact]");
+      if (va) { if (va.dataset.vact === "scan" && !va.disabled) { voicesAutoScanned[currentProfile()] = true; await runJob("voices"); await loadVoices(); } return; }
+      const vok = e.target.closest("[data-vok]");
+      if (vok) { await nameVoice(vok.closest(".voice-card")); return; }
+      const vf = e.target.closest("[data-vfill]");
+      if (vf) { const inp = vf.closest(".voice-card").querySelector("[data-vname]"); inp.value = vf.dataset.vfill; inp.dispatchEvent(new Event("input")); inp.focus(); return; }
       const b = e.target.closest("[data-act]"); if (!b) return;
       const card = b.closest("[data-sid]"); if (!card) return;
       const sid = Number(card.dataset.sid); const spk = data.speakers.find((s) => s.id === sid);
       const a = b.dataset.act;
       if (a === "add") enrollPanel(spk.name);
+      else if (a === "self") {
+        const text = me ? `把本人从「${me.name}」改为「${spk.name}」？日报、推送和问答都会站在本人的视角，记录里本人的话就是“我”说的。` : `把「${spk.name}」设为本人（你自己）？日报、推送和问答都会站在本人的视角，记录里本人的话就是“我”说的。`;
+        if (await confirmModal(me ? "改为本人" : "设为本人", text, me ? "改为本人" : "设为本人")) { try { await api(`/api/speakers/${sid}`, { method: "PATCH", json: { is_self: true } }); toast(`本人：${spk.name}`, "ok"); await refreshStatus(); route(); } catch (err) { toastErr(err); } }
+      }
+      else if (a === "unself") { if (await confirmModal("取消本人", `不再把「${spk.name}」当作本人；之后可以再设。`)) { try { await api(`/api/speakers/${sid}`, { method: "PATCH", json: { is_self: false } }); await refreshStatus(); route(); } catch (err) { toastErr(err); } } }
+      else if (a === "relation") { if (await relationModal(spk, choices)) { toast("已保存关系", "ok"); route(); } }
       else if (a === "rename") { const n = await promptModal("重命名", { label: "新名字", value: spk.name }); if (n && n !== spk.name) { try { await api(`/api/speakers/${sid}`, { method: "PATCH", json: { name: n } }); toast("已重命名", "ok"); route(); } catch (err) { toastErr(err); } } }
-      else if (a === "notes") { const n = await promptModal("备注", { label: "例如：同事、家人", value: spk.notes }); if (n !== null) { try { await api(`/api/speakers/${sid}`, { method: "PATCH", json: { notes: n } }); route(); } catch (err) { toastErr(err); } } }
+      else if (a === "notes") { const n = await promptModal("备注", { label: "例如：项目组的同事、楼下邻居", value: spk.notes }); if (n !== null) { try { await api(`/api/speakers/${sid}`, { method: "PATCH", json: { notes: n } }); route(); } catch (err) { toastErr(err); } } }
       else if (a === "delete") { if (await confirmModal(`删除 ${spk.name}`, `删除声纹和 ${spk.utterances} 条语句上的名字（语句会变成「${data.unknown_label}」，文字不会丢）。`, "删除", true)) { try { await api(`/api/speakers/${sid}`, { method: "DELETE" }); toast("已删除"); route(); } catch (err) { toastErr(err); } } }
       else if (a === "samples") {
         const box = card.querySelector(".samples");
@@ -737,13 +961,14 @@
         };
       }
     };
+    await loadVoices();
   }
   function enrollPanel(name) {
     stopRecording();
     const panel = $("#enroll-panel");
     panel.classList.remove("hidden");
     const names = state.speakers.map((s) => s.name);
-    panel.innerHTML = `<div class="card-head"><h2>${name ? `为 ${esc(name)} 补充样本` : "添加说话人"}</h2><button class="btn sm ghost" id="enroll-close">关闭</button></div>
+    panel.innerHTML = `<div class="card-head"><div><h2>${name ? `为 ${esc(name)} 补充样本` : "用麦克风 / 文件补充样本"}</h2><div class="small muted">通常不需要：给上面的「未识别的声音」起名就会自动取样本；这里是识别不准时的补充手段。</div></div><button class="btn sm ghost" id="enroll-close">关闭</button></div>
       <div class="row mb"><div class="field" style="width:220px"><label>姓名</label><input class="input" id="en-name" list="en-list" value="${esc(name)}" placeholder="例如：我 / 张三"><datalist id="en-list">${names.map((n) => `<option value="${esc(n)}">`).join("")}</datalist></div></div>
       <div class="grid grid-2">
         <div><h3 class="mb">用麦克风录一段</h3><div class="row"><button class="btn rec" id="rec-btn">● 开始录音</button><span class="rec-timer" id="rec-timer">0:00</span><div class="level"><i id="rec-level"></i></div></div>
@@ -853,7 +1078,11 @@
             ${num("storage.max_disk_gb", "音频占用上限 (GB)", v.storage.max_disk_gb, "超过后从最旧的已转写音频开始删", "1", "0")}${bool("storage.cleanup_enabled", "定时清理无语音片段", v.storage.cleanup_enabled)}</div></div>
         <div class="card"><div class="card-head"><h2>说话人识别</h2></div>
           <div class="form-grid">${num("speakers.identify_threshold", "识别阈值", v.speakers.identify_threshold, "相似度 ≥ 此值才认定为注册过的人；说话人页可校准", "0.01", "0")}
-            ${num("speakers.cluster_threshold", "聚类阈值", v.speakers.cluster_threshold, "越小分出的人越多", "0.05", "0")}${text("speakers.unknown_label", "未识别时显示", v.speakers.unknown_label)}</div></div>
+            ${num("speakers.cluster_threshold", "聚类阈值", v.speakers.cluster_threshold, "越小分出的人越多", "0.05", "0")}${text("speakers.unknown_label", "未识别时显示", v.speakers.unknown_label)}
+            ${num("speakers.voice_group_threshold", "未识别声音分组阈值", v.speakers.voice_group_threshold ?? 0.55, "0–1，越高分得越细（同一个人可能被分成几组）", "0.01", "0")}
+            ${bool("speakers.infer_relations", "日报后自动推断关系", v.speakers.infer_relations ?? true, "让模型从记录里的对话推断每个人和本人的关系；手动标的不会被改")}
+            ${num("speakers.relation_min_utterances", "推断关系至少需要的语句数", v.speakers.relation_min_utterances ?? 15, "语句太少的人先不推断", "1", "1")}
+            ${num("speakers.relation_min_confidence", "推断关系的置信度门槛", v.speakers.relation_min_confidence ?? 0.6, "0–1，低于此值不写入", "0.05", "0")}</div></div>
         <div class="card"><div class="card-head"><h2>转写与纠错</h2></div>
           <div class="form-grid">${num("pipeline.process_interval_min", "自动转写间隔（分钟）", v.pipeline.process_interval_min, "", "1", "1")}${bool("correction.enabled", "用大模型纠正转写错别字", v.correction.enabled, "人名、术语以词表为准")}
             ${num("mimo.asr_concurrency", "转写并发数", v.mimo.asr_concurrency, "", "1", "1")}</div></div>

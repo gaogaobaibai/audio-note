@@ -431,11 +431,12 @@ def test_speaker_label_by_utterance_enrolls_and_relabels(client: TestClient, rt:
     assert r.status_code == 200, r.text
     out = r.json()
     assert out["ok"] is True and out["name"] == "雷军" and out["samples"] == 1 and out["segment_id"] == seg
-    assert "relabel_error" not in out and out["relabeled_changed"] == 1
+    # the labelled utterance is assigned by hand (speaker_source='user'), so relabel has nothing left to change
+    assert "relabel_error" not in out and out["relabeled_changed"] == 0 and out["assigned"] == 1
     emb = rt.db.query("SELECT source_path, duration_s FROM speaker_embeddings")
     assert len(emb) == 1 and emb[0]["source_path"] == f"{p}#0.0-8.0" and 1.0 <= emb[0]["duration_s"] <= 8.0
-    u = rt.db.one("SELECT speaker_id, speaker_name, speaker_score FROM utterances WHERE id=?", (uid,))
-    assert u["speaker_name"] == "雷军" and u["speaker_id"] == out["id"] and u["speaker_score"] > 0.45
+    u = rt.db.one("SELECT speaker_id, speaker_name, speaker_score, speaker_source FROM utterances WHERE id=?", (uid,))
+    assert u["speaker_name"] == "雷军" and u["speaker_id"] == out["id"] and u["speaker_score"] is None and u["speaker_source"] == "user"
     assert (rt.cfg.transcripts_dir / f"{DAY}.md").exists()
 
 

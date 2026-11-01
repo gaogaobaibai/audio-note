@@ -28,6 +28,7 @@ from ..audio.vad import SAMPLE_RATE, GateConfig, SileroVAD, segment_audio
 log = logging.getLogger(__name__)
 
 MIN_ENROLL_SPEECH_S = 1.0   # samples with less speech than this are rejected (enroll and label alike)
+MIN_CLUSTER_SPEECH_S = 0.5  # a diarization cluster shorter than this is neither identified nor stored
 
 
 @dataclass
@@ -124,8 +125,19 @@ class SpeakerEngine:
         return [Turn(float(r.start), float(r.end), int(r.speaker)) for r in res]
 
     # --- identification ----------------------------------------------------
-    def identify_turns(self, audio: np.ndarray, turns: list[Turn], db: DB) -> list[Turn]:
-        """Embed each cluster (all its turns concatenated, speech up to 60 s) and match against enrolled speakers."""
+    def cluster_embedding(self, audio: np.ndarray, turns: list[Turn]) -> np.ndarray | None:
+        """Embedding of one diarization cluster: its turns concatenated (at most 60 s of them).
+        None when they hold less than 0.5 s of audio (too short to embed meaningfully)."""
+        parts = [audio[int(t.start * SAMPLE_RATE): int(t.end * SAMPLE_RATE)] for t in turns]
+        speech = np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
+        if len(speech) < int(MIN_CLUSTER_SPEECH_S * SAMPLE_RATE):
+            return None
+        return self.embed(speech[: 60 * SAMPLE_RATE])
+
+    def identify_turns(self, audio: np.ndarray, turns: list[Turn], db: DB, segment_id: int | None = None) -> list[Turn]:
+        """Embed each cluster (all its turns concatenated, speech up to 60 s) and match against enrolled speakers.
+        With `segment_id` every cluster embedding is also stored in cluster_embeddings (speech_s = sum of its
+        turn durations) so the unknown voices can later be grouped and named without re-reading the audio."""
         enrolled = db.speaker_embeddings()
         thr = float(self.cfg.speakers.identify_threshold)
         unknown = self.cfg.speakers.unknown_label
@@ -133,15 +145,15 @@ class SpeakerEngine:
         for t in turns:
             clusters.setdefault(t.cluster, []).append(t)
         for cid, ts in clusters.items():
-            parts = [audio[int(t.start * SAMPLE_RATE): int(t.end * SAMPLE_RATE)] for t in ts]
-            speech = np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
-            if len(speech) < int(0.5 * SAMPLE_RATE):
+            emb = self.cluster_embedding(audio, ts)
+            if emb is None:
                 name, sid, score = unknown, None, None
             else:
-                emb = self.embed(speech[: 60 * SAMPLE_RATE])
                 sid, name, score = self.match(emb, enrolled, thr)
                 if sid is None:
                     name = unknown
+                if segment_id is not None:
+                    db.upsert_cluster_embedding(int(segment_id), int(cid), emb, sum(t.duration for t in ts))
             for t in ts:
                 t.speaker_id, t.speaker_name, t.score = sid, name, score
         return turns
@@ -182,16 +194,21 @@ class SpeakerEngine:
         log.info("enrolled %s with %d samples", name, n)
         return sid
 
-    def enroll_from_audio(self, db: DB, name: str, audio: np.ndarray, source: str | None = None) -> int:
+    def enroll_from_audio(self, db: DB, name: str, audio: np.ndarray, source: str | None = None,
+                          copy_as_source: bool = False) -> int:
         """Add one embedding for `name` from an in-memory clip. Raises ValueError when the clip holds
-        less than MIN_ENROLL_SPEECH_S of speech (a noise embedding would later attract false matches)."""
+        less than MIN_ENROLL_SPEECH_S of speech (a noise embedding would later attract false matches).
+        `source` ("<file>#a-b") is stored as the sample's source_path and names the saved copy; with
+        `copy_as_source` the saved speech-only copy is stored instead (for clips stitched from several
+        ranges, where a "#a-b" slice of the original would not play back the right audio)."""
         speech = self.speech_only(audio)
         speech_s = len(speech) / SAMPLE_RATE
         if speech_s < MIN_ENROLL_SPEECH_S:
             raise ValueError(f"选中的范围只有 {speech_s:.1f}s 语音（至少需要 {MIN_ENROLL_SPEECH_S:.0f}s），未注册")
         sid = db.upsert_speaker(name)
         saved = self._save_sample(name, speech, Path(str(source).split("#")[0]).stem if source else "label")
-        db.add_speaker_embedding(sid, self.embed(speech), source if source is not None else (str(saved) if saved else None), speech_s)
+        stored = str(saved) if saved and (copy_as_source or source is None) else source
+        db.add_speaker_embedding(sid, self.embed(speech), stored, speech_s)
         return sid
 
     def enroll_from_segment_turns(self, db: DB, name: str, seg_path: Path | str, turns: list[tuple[float, float]]) -> int:

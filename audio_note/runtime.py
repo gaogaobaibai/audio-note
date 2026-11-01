@@ -10,7 +10,7 @@ recorder thread optional and switchable at run time. Only one process may run th
 a data directory (service.lock); a second `audio-note ui` still works for browsing and memory chat
 but cannot record or run jobs ("read-only mode").
 
-Jobs (process / daily / cleanup / reindex / relabel / push) run one at a time on a worker thread
+Jobs (process / daily / cleanup / reindex / relabel / push / voices / relations) run one at a time on a worker thread
 and under Scheduler.lock, so a job started from the UI never overlaps a scheduler tick. Their state
 (running / last result / last error) is kept per job name for the UI to poll.
 """
@@ -22,6 +22,7 @@ import queue
 import shutil
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -35,10 +36,13 @@ from .service import AlreadyRunning, _recorder_loop, acquire_lock, release_lock,
 
 log = logging.getLogger(__name__)
 
-JOBS = ("process", "daily", "cleanup", "reindex", "relabel", "push")
+JOBS = ("process", "daily", "cleanup", "reindex", "relabel", "push", "voices", "relations")
 JOB_LABELS = {"process": "转写处理", "daily": "生成日报", "cleanup": "清理音频", "reindex": "重建索引",
-              "relabel": "重新识别说话人", "push": "推送日报"}
+              "relabel": "重新识别说话人", "push": "推送日报", "voices": "扫描未识别的声音", "relations": "推断关系"}
 JOIN_TIMEOUT_S = 15.0
+#: message for a speaker-embedding request / job when the CAM++ model file is absent
+VOICE_MODELS_MISSING_MSG = "模型文件缺失，无法提取声纹（运行 scripts/download_models.ps1）"
+BUSY_REQUEST_LABEL = "说话人请求（登记声纹 / 标记）"
 
 
 class JobError(RuntimeError):
@@ -87,6 +91,10 @@ class Runtime:
         self._rec_ref: dict[str, Any] = {}
         self._lock_held = False
         self._state_lock = threading.RLock()
+        # request threads doing heavy DB work (enrolment, naming a voice, labelling): see busy()
+        self._busy_lock = threading.Lock()
+        self._busy_n = 0
+        self.switching = False       # True once RuntimeHolder.switch decided to tear this runtime down
 
         self.sched = Scheduler(cfg, self.db, self._svc_stop, engine_factory=self.engine)
 
@@ -121,6 +129,52 @@ class Runtime:
 
     def service_running(self) -> bool:
         return self._lock_held
+
+    # ------------------------------------------------------------------ request-busy counter
+    @contextmanager
+    def busy(self):
+        """Marks a request thread doing heavy work on this runtime's database (enrolment, naming a
+        voice, labelling a sentence): RuntimeHolder.switch refuses while one is active, so the DB is
+        not closed under it. Raises JobError once a switch has claimed the runtime."""
+        with self._busy_lock:
+            if self.switching or not self.alive:
+                raise JobError("正在切换档案，请稍后再试")
+            self._busy_n += 1
+        try:
+            yield self
+        finally:
+            with self._busy_lock:
+                self._busy_n -= 1
+
+    def request_busy(self) -> int:
+        """Number of request threads currently inside busy()."""
+        with self._busy_lock:
+            return self._busy_n
+
+    def begin_switch(self) -> None:
+        """Claim the runtime for a profile switch: raises JobError while a request is busy, and makes
+        later busy() calls fail instead of starting work on a database about to be closed."""
+        with self._busy_lock:
+            if self._busy_n > 0:
+                raise JobError(f"{BUSY_REQUEST_LABEL}正在处理，等它结束再切换档案")
+            self.switching = True
+
+    def end_switch(self) -> None:
+        with self._busy_lock:
+            self.switching = False
+
+    def busy_reason(self) -> str | None:
+        """What blocks a profile switch right now: the running UI job's label, the busy request, or None."""
+        running = self.job_running()
+        if running:
+            return running
+        return BUSY_REQUEST_LABEL if self.request_busy() > 0 else None
+
+    def speaker_models_missing(self) -> list[str]:
+        """Model files the speaker engine needs that are absent ([] once the engine is loaded)."""
+        if self._engine is not None:
+            return []
+        return [k for k in ("embedding_model",) if not self.cfg.model_path(k).exists()]
 
     def other_pid(self) -> int | None:
         """pid of a service running in another process (None when it is us or nobody)."""
@@ -365,9 +419,33 @@ class Runtime:
         md, js = analyzer.run(day, force=bool(force))
         out: dict[str, Any] = {"day": day, "utterances": int(js.get("utterance_count") or 0),
                                "cached": analyzer.last_run_cached, "partial": analyzer.last_run_partial, "chars": len(md)}
+        try:
+            from .analysis import relations
+
+            out["relations"] = relations.maybe_infer_after_daily(self.cfg, self.db, self.client())
+        except Exception as e:  # noqa: BLE001 - relation inference never fails the digest
+            log.warning("relation inference after daily %s failed: %s", day, e)
+            out["relations"] = []
         if push:
             out["push"] = analyzer.push(day)
         return out
+
+    def _job_voices(self) -> dict[str, Any]:
+        """Compute the missing cluster embeddings so the speakers page can list unidentified voices."""
+        from .speech import voices
+
+        if self.speaker_models_missing():
+            raise JobError(VOICE_MODELS_MISSING_MSG)
+        stop = self._svc_stop if self.scheduler_running() else None
+        return dict(voices.backfill_cluster_embeddings(self.db, self.cfg, self.engine(), stop_event=stop))
+
+    def _job_relations(self, speaker_id: int | None = None, force: bool = False) -> dict[str, Any]:
+        """Ask the LLM how the enrolled speakers relate to the user (one speaker, or every candidate)."""
+        from .analysis import relations
+
+        ids = [int(speaker_id)] if speaker_id else None
+        results = list(relations.infer_relations(self.cfg, self.db, self.client(), speaker_ids=ids, force=bool(force)))
+        return {"speakers": len(results), "applied": sum(1 for r in results if r.get("applied")), "results": results}
 
     def _job_push(self, day: str) -> dict[str, Any]:
         from .analysis.daily import DailyAnalyzer
@@ -433,6 +511,8 @@ class Runtime:
         except ValueError:
             next_daily = None
         models_missing = [k for k in ("vad_model", "embedding_model", "segmentation_model") if not cfg.model_path(k).exists()]
+        me = db.self_speaker()
+        unknown = db.one("SELECT COUNT(*) AS n FROM utterances WHERE speaker_id IS NULL")
         return {
             "pid": os.getpid(),
             "started_at": self.started_at.isoformat(timespec="seconds"),
@@ -470,6 +550,8 @@ class Runtime:
                       "segments": int(seg_today["n"]) if seg_today else 0,
                       "recorded_speech_min": round(float(seg_today["s"]) / 60.0, 1) if seg_today else 0.0},
             "total": {"utterances": int(utt_all["n"]) if utt_all else 0, "days": int(utt_all["days"]) if utt_all else 0},
+            "self_name": me["name"] if me else None,
+            "unknown_utterances": int(unknown["n"]) if unknown else 0,
             "disk": {"audio_bytes": int(audio_bytes), "cap_gb": float(cfg.storage.max_disk_gb or 0), "free_bytes": free},
             "last_daily": dict(last) if last else None,
             "next_daily": next_daily,
@@ -503,7 +585,8 @@ class RuntimeHolder:
         """Switch the live runtime to profile `name`. The new Runtime (dirs, database, job thread) is
         built first; only once that succeeded is the old one torn down, so a profile whose data dir
         cannot be created or whose database cannot be opened leaves the current one untouched.
-        Refuses while a UI job is running (its database connection would be closed under it)."""
+        Refuses while a UI job is running or a request thread is inside Runtime.busy() (their database
+        connection would be closed under them)."""
         with self.lock:
             name = canonical_profile_name(name) or name
             if not profile_exists(name):
@@ -514,9 +597,15 @@ class RuntimeHolder:
             running = old.job_running() if old.alive else None
             if running:
                 raise JobError(f"{running}正在运行，等它结束再切换档案")
-            was_recording = old.recording()
-            cfg = load_config(profile=name)
-            new = Runtime(cfg)          # may raise: the old runtime is still intact
+            if old.alive:
+                old.begin_switch()      # JobError while a request is busy; new requests are refused from here on
+            try:
+                was_recording = old.recording()
+                cfg = load_config(profile=name)
+                new = Runtime(cfg)          # may raise: the old runtime is still intact
+            except BaseException:
+                old.end_switch()
+                raise
             new.ui_url = old.ui_url
             old.shutdown()
             self.rt = new
@@ -553,4 +642,4 @@ def _jsonable(v: Any) -> Any:
 
 
 __all__ = ["Runtime", "RuntimeHolder", "JobState", "JobError", "ReadOnly", "AlreadyRunning", "JOBS", "JOB_LABELS",
-           "profile_label"]
+           "profile_label", "VOICE_MODELS_MISSING_MSG", "BUSY_REQUEST_LABEL"]

@@ -78,7 +78,7 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "list_speakers",
-            "description": "列出已登记的说话人及其备注、记录条数，以及未识别说话人的条数。",
+            "description": "列出已登记的说话人（标出哪位是用户本人、与本人的关系）及其备注、记录条数，以及未识别说话人的条数。",
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -259,17 +259,31 @@ def list_days(args: dict, db: DB, cfg) -> str:
 def list_speakers(args: dict, db: DB, cfg) -> str:
     unknown = cfg.speakers.unknown_label
     rows = db.query(
-        "SELECT s.id, s.name, s.notes, (SELECT COUNT(*) FROM utterances u WHERE u.speaker_id = s.id) AS n,"
+        "SELECT s.id, s.name, s.notes, s.is_self, s.relation, s.relation_source,"
+        " (SELECT COUNT(*) FROM utterances u WHERE u.speaker_id = s.id) AS n,"
         " (SELECT COUNT(*) FROM speaker_embeddings e WHERE e.speaker_id = s.id) AS samples"
-        " FROM speakers s ORDER BY n DESC, s.name"
+        " FROM speakers s ORDER BY s.is_self DESC, n DESC, s.name"
     )
     unk = db.one("SELECT COUNT(*) AS n FROM utterances WHERE speaker_id IS NULL")["n"]
     if not rows:
         return f"还没有登记任何说话人（未识别的记录 {unk} 条，标为「{unknown}」）。可用 `audio-note speakers enroll <名字> <wav>` 登记。"
     lines = [f"已登记 {len(rows)} 位说话人："]
+    has_self = False
     for r in rows:
-        note = f"，备注：{r['notes']}" if r["notes"] else ""
-        lines.append(f"- {r['name']}: {r['n']} 条记录，{r['samples']} 个登记样本{note}")
+        tags: list[str] = []
+        if r["is_self"]:
+            has_self = True
+            name = f"{r['name']}（本人）"
+        else:
+            name = str(r["name"])
+            if r["relation"]:
+                tags.append(f"关系：{r['relation']}" + ("（自动推断）" if r["relation_source"] == "auto" else ""))
+        if r["notes"]:
+            tags.append(f"备注：{r['notes']}")
+        extra = ("，" + "，".join(tags)) if tags else ""
+        lines.append(f"- {name}: {r['n']} 条记录，{r['samples']} 个登记样本{extra}")
+    if not has_self:
+        lines.append("- 用户本人：未登记（记录里没有标出哪位是本人）")
     lines.append(f"- {unknown}（未识别）: {unk} 条记录")
     return _cap("\n".join(lines))
 

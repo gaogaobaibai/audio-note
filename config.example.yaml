@@ -58,6 +58,10 @@ speakers:
   min_turn_s: 0.3                # 最短说话轮次（秒）
   unknown_label: 未知            # 未识别出身份时显示的名字
   auto_enroll_from_diarization: false   # 是否把未识别的聚类自动注册为新说话人（默认关闭）
+  voice_group_threshold: 0.55    # 说话人页「未识别的声音」跨录音分组的相似度阈值（0~1，越高分得越细）
+  infer_relations: true          # 日报生成后自动让模型推断每位说话人与本人的关系（用户手动标过的不会被改）
+  relation_min_utterances: 15    # 说话人至少有多少句记录才会推断关系
+  relation_min_confidence: 0.6   # 推断结果的置信度低于此值不写入（0~1）
 
 correction:
   enabled: true                  # 是否用 LLM 对 ASR 结果做纠错

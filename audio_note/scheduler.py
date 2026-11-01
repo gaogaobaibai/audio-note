@@ -547,6 +547,12 @@ class Scheduler:
                 except Exception as e:  # noqa: BLE001  (a failed push must not re-run the LLM)
                     log.exception("daily push %s failed: %s", day, e)
                     self._note_push_result(day, {"push": f"{type(e).__name__}: {e}"})
+        try:
+            from .analysis.relations import maybe_infer_after_daily
+
+            maybe_infer_after_daily(self.cfg, self.db, client)
+        except Exception as e:  # noqa: BLE001  (relation inference is best effort)
+            log.warning("relation inference after daily %s failed: %s", day, e)
         return result
 
     def _default_push(self, day: str) -> dict[str, str | None]:

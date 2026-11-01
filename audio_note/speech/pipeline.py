@@ -13,6 +13,7 @@ transcribe_file()     one-off diarize + identify + ASR of any audio file (no DB 
 """
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import math
@@ -367,11 +368,12 @@ class Processor:
         # idempotency for retries: drop anything a previous attempt wrote
         self.db.delete_utterances_for_segment(seg_id)
         self.db.execute("DELETE FROM transcripts WHERE segment_id=?", (seg_id,))
+        self.db.delete_cluster_embeddings(seg_id)
 
         # 2. diarize + identify
         turns: list[Turn] = list(self.engine.diarize(audio))
         if turns:
-            turns = list(self.engine.identify_turns(audio, turns, self.db))
+            turns = self._identify(audio, turns, seg_id)
         chunks = build_chunks(turns, audio_len_s, float(self.cfg.mimo.asr_max_chunk_s)) if turns else []
         if not chunks:
             log.info("segment #%d: no speech turns -> no_speech, deleting %s", seg_id, path.name)
@@ -432,12 +434,25 @@ class Processor:
                 log.warning("cannot write markdown for %s: %s", day, e)
         return len(rows)
 
+    def _identify(self, audio: np.ndarray, turns: list[Turn], seg_id: int) -> list[Turn]:
+        """engine.identify_turns with the segment id (so cluster embeddings get stored); engines that do
+        not take `segment_id` (fakes in tests, older implementations) are called the old way."""
+        if _accepts_segment_id(self.engine.identify_turns):
+            return list(self.engine.identify_turns(audio, turns, self.db, segment_id=seg_id))
+        return list(self.engine.identify_turns(audio, turns, self.db))
+
     # --- re-identification without ASR ------------------------------------
     def relabel_segment(self, seg_id: int) -> int:
         """Re-run speaker identification on a 'done' segment using the stored utterances as turns
         (no diarization, no ASR, no billing) and update speaker_id/name/score + the day Markdown.
-        Returns the number of utterances whose speaker changed. Used after `speakers enroll/label`
-        so history picks up a newly enrolled voice."""
+        Utterances the user labelled by hand (speaker_source='user' with a speaker_id; a deleted speaker
+        leaves speaker_id NULL and the row is automatic again) are left untouched. Returns the number of
+        utterances whose speaker changed. Used after `speakers enroll/label` so history picks up a newly
+        enrolled voice; the segment's cluster_embeddings are refreshed on the way.
+
+        The write is conditional: between reading the rows and the UPDATE (the embedding takes seconds)
+        a request thread may hand-label one of them (name_voice / label); such a row is skipped by the
+        WHERE clause and not counted as changed."""
         seg = self.db.get_segment(seg_id)
         if seg is None:
             raise ValueError(f"segment {seg_id} not found")
@@ -450,17 +465,23 @@ class Processor:
         audio = read_segment(path)
         turns = [Turn(float(u["start_s"]), float(u["end_s"]), int(u["cluster_label"] if u["cluster_label"] is not None else i))
                  for i, u in enumerate(utts)]
-        turns = list(self.engine.identify_turns(audio, turns, self.db))
+        turns = self._identify(audio, turns, seg_id)
         unknown = self.cfg.speakers.unknown_label
         changed = 0
         days: set[str] = set()
         for u, t in zip(utts, turns):
+            if u["speaker_source"] == "user" and u["speaker_id"] is not None:
+                continue
             name = t.speaker_name or unknown
+            cur = self.db.execute(
+                "UPDATE utterances SET speaker_id=?, speaker_name=?, speaker_score=?, speaker_source=NULL WHERE id=?"
+                " AND (speaker_source IS NULL OR speaker_source<>'user' OR speaker_id IS NULL)",
+                (t.speaker_id, name, t.score, u["id"]))
+            if int(cur.rowcount or 0) != 1:
+                continue                        # hand-labelled meanwhile: leave it alone
             if u["speaker_id"] != t.speaker_id or (u["speaker_name"] or unknown) != name:
                 changed += 1
-            self.db.execute("UPDATE utterances SET speaker_id=?, speaker_name=?, speaker_score=? WHERE id=?",
-                            (t.speaker_id, name, t.score, u["id"]))
-            days.add(u["day"])
+                days.add(u["day"])
         if changed:
             for day in sorted(days):
                 try:
@@ -533,6 +554,17 @@ class Processor:
             log.warning("unusable correction result (%s), keeping raw text", e)
             return texts, None
         return out, (json.dumps(all_edits, ensure_ascii=False) if all_edits else None)
+
+
+def _accepts_segment_id(fn: Any) -> bool:
+    """True when `fn(audio, turns, db, segment_id=...)` is a valid call (keyword or **kwargs)."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if "segment_id" in params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 def _index_correction(result: Any) -> dict[int, dict[str, Any]]:
