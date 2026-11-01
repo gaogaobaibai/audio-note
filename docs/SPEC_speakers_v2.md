@@ -1,6 +1,6 @@
 # 说话人模块 v2：本人、关系、从记录里直接标记
 
-实现规格（给实现者看的；实现完成后 README / DESIGN 另写用户文档）。项目根 `C:\Users\enhua\Documents\docs\audio_note`，
+实现规格（给实现者看的；实现完成后 README / DESIGN 另写用户文档）。项目根 `C:\path\to\audio_note`，
 Python 在 `.venv/Scripts/python.exe`，测试命令：
 
     PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe -m pytest -q -p no:cacheprovider tests/<file>.py

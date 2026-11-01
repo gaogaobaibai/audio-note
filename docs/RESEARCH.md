@@ -77,7 +77,7 @@
 ### 3.1 目录
 
 ```
-C:\Users\enhua\Documents\docs\audio_note\
+C:\path\to\audio_note\
 ├─ .python-version            # 3.12
 ├─ pyproject.toml
 ├─ config.example.yaml        # 提交；config.yaml 本地填 key，.gitignore
@@ -522,7 +522,7 @@ process:
 ### 7.2 安装
 
 ```powershell
-cd C:\Users\enhua\Documents\docs\audio_note
+cd C:\path\to\audio_note
 uv python pin 3.12
 uv venv .venv
 uv pip install -p .venv\Scripts\python.exe `
@@ -553,7 +553,7 @@ uv pip install -p .venv\Scripts\python.exe `
 
 ```powershell
 schtasks /create /sc ONLOGON /tn "AudioNote Recorder" /rl LIMITED /delay 0000:30 /f `
-  /tr "\"C:\Users\enhua\Documents\docs\audio_note\.venv\Scripts\pythonw.exe\" \"C:\Users\enhua\Documents\docs\audio_note\run.py\""
+  /tr "\"C:\path\to\audio_note\.venv\Scripts\pythonw.exe\" \"C:\path\to\audio_note\run.py\""
 # taskschd.msc：设置 → 取消"如果任务运行时间超过 3 天则停止"；条件 → 取消"只有在使用交流电源时才启动"
 # Windows 设置 → 隐私和安全性 → 麦克风 → 允许桌面应用访问（未从文档验证，需本机确认）
 ```
@@ -768,7 +768,7 @@ CTX = 64                                    # v5/v6 context samples carried betw
 THRESH, NEG_THRESH = 0.5, 0.35              # hysteresis like VADIterator (neg = thr-0.15)
 PRE_ROLL_S, HANGOVER_S, MAX_SEG_S = 1.0, 0.8, 45.0
 OPUS_LEVEL = 1.0 - (24000 - 6000) / 250000  # libsndfile: bitrate=(1-q)*250000+6000 -> 24 kbps
-OUT = r"C:\Users\enhua\Documents\docs\audio_note\data\segments"
+OUT = r"C:\path\to\audio_note\data\segments"
 os.makedirs(OUT, exist_ok=True)
 
 class SileroOnnx:
@@ -1211,7 +1211,7 @@ class Pseudonymizer:
 ```powershell
 # Task Scheduler, runs at this user's logon, 30 s delay, least privilege; pythonw => no console
 schtasks /create /sc ONLOGON /tn "AudioNote Recorder" /rl LIMITED /delay 0000:30 /f `
-  /tr "\"C:\Users\enhua\Documents\docs\audio_note\.venv\Scripts\pythonw.exe\" \"C:\Users\enhua\Documents\docs\audio_note\run.py\""
+  /tr "\"C:\path\to\audio_note\.venv\Scripts\pythonw.exe\" \"C:\path\to\audio_note\run.py\""
 # then in taskschd.msc: Settings tab -> untick 'Stop the task if it runs longer than: 3 days';
 # Conditions tab -> untick 'Start only if on AC power'. Start it now: schtasks /run /tn "AudioNote Recorder"
 

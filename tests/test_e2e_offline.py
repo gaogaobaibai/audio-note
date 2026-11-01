@@ -137,7 +137,7 @@ def test_offline_end_to_end(e2e_cfg, db, silero):
     md_path = cfg.transcripts_dir / "2026-10-30.md"
     md = md_path.read_text(encoding="utf-8")
     assert md.startswith("# 2026-10-30 记录\n")
-    assert "（导入：lei-jun-test.wav）" in md
+    assert f"（导入：{SAMPLE_WAV.name}）" in md
     assert re.search(r"^- \*\*09:\d\d:\d\d 未知\*\*：这是第\d+段测试文本", md, re.M)
     assert "\r" not in md
 

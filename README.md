@@ -60,6 +60,7 @@ Silero VAD 门控 ──► 只存语音片段 data/audio/YYYY-MM-DD/HHMMSS_mmm.
 # 没装 uv 的话先装：
 powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 
+git clone git@github.com:gaogaobaibai/audio-note.git audio_note
 cd audio_note
 powershell -ExecutionPolicy Bypass -File scripts/install.ps1
 ```
@@ -384,5 +385,7 @@ $env:AUDIO_NOTE_CONFIG="config.yaml"; .\.venv\Scripts\python.exe scripts\memory_
 ```powershell
 .\.venv\Scripts\python.exe -m pytest tests -q      # 测试不联网，MimoClient 均为 mock；向量用无模型的哈希嵌入
 ```
+
+没下载 `models/` 时，依赖模型的测试会跳过。依赖真实语音的测试需要一段录音（16 kHz 单声道 wav，前 29 秒静音、之后有人说话），放到 `tests/data/sample.wav` 或用环境变量 `AUDIO_NOTE_TEST_WAV` 指定；没有就跳过。录音文件不进仓库。
 
 代码：Python 3.12，类型标注，`logging.getLogger(__name__)`，UTF-8 / LF（见 `.editorconfig`）。

@@ -1,6 +1,6 @@
 [project]
 name = "audio-note"
-version = "0.2.0"
+version = "0.3.0"
 description = "Always-on ambient audio recorder with VAD, MiMo ASR, speaker identification, LLM correction, daily digest and memory chat"
 requires-python = ">=3.12,<3.13"
 dependencies = [

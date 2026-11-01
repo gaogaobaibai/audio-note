@@ -14,10 +14,9 @@ import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MODELS_DIR = PROJECT_ROOT / "models"
-SAMPLE_WAV = Path(
-    "C:/Users/enhua/AppData/Local/Temp/claude/C--Users-enhua-Documents-docs-audio-note/"
-    "1c76d8f8-f5b3-4e7c-8d51-086cd541bced/scratchpad/lei-jun-test.wav"
-)
+# Real speech recording for the tests that run the CPU models: 16 kHz mono wav, silent for the first 29 s, speech after.
+# Not in the repository (tests/data/ is ignored); those tests skip without it. Override with AUDIO_NOTE_TEST_WAV.
+SAMPLE_WAV = Path(os.environ.get("AUDIO_NOTE_TEST_WAV") or PROJECT_ROOT / "tests" / "data" / "sample.wav")
 
 
 def _deep_merge(base: dict, override: dict) -> dict:

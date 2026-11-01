@@ -5,7 +5,7 @@
 更糟的是用户给混合的声音组起名后，从混合簇提取的"声纹样本"混进了别人的声音（用户 7 个样本里 4 个和麦克风录的 3 个相似度只有 0.24–0.49），
 之后谁都被认成用户。逐 turn（≥ 0.8 s）的声纹和干净样本比对是能分开的：用户 0.5–0.74，朋友 0.1–0.3。
 
-实现规格。项目根 `C:\Users\enhua\Documents\docs\audio_note`，Python `.venv/Scripts/python.exe`，测试：
+实现规格。项目根 `C:\path\to\audio_note`，Python `.venv/Scripts/python.exe`，测试：
 `PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe -m pytest -q -p no:cacheprovider tests/<file>.py`。测试约定见 `tests/conftest.py`
 （`cfg_factory`、会话级真实 `speaker_engine`、`SAMPLE_WAV` 29–37 s 有语音、`chirp/noise/sine` 合成信号的 CAM++ embedding 彼此近乎正交，
 可以当"两个人"用）。不碰根目录 config.yaml / profiles/*，不联网，不用麦克风。

@@ -7,5 +7,7 @@ models/
 config.yaml
 glossary.txt
 *.log
+tests/data/
+tmp*/
 .pytest_cache/
 .coverage
