@@ -868,7 +868,7 @@ def test_reindex_vectors(tmp_cfg, monkeypatch: pytest.MonkeyPatch, out: io.Strin
 def test_init_with_existing_config_does_not_overwrite(tmp_cfg, out: io.StringIO):
     cfg_path = Path(tmp_cfg["_config_path"]) if "_config_path" in tmp_cfg else None
     before = cfg_path.read_text(encoding="utf-8") if cfg_path else None
-    rc = cli.main(["init"])
+    rc = cli.main(["--config", str(cfg_path), "init"])       # without --config, init targets the project's own config.yaml
     text = out.getvalue()
     assert rc in (0, 1)
     assert "配置文件已存在" in text and "（不覆盖）" in text
@@ -890,7 +890,7 @@ def test_init_missing_models_returns_1(tmp_path: Path, monkeypatch: pytest.Monke
     monkeypatch.setenv("AUDIO_NOTE_CONFIG", str(cfg_path))
     monkeypatch.delenv("MIMO_API_KEY", raising=False)
     try:
-        assert cli.main(["init"]) == 1
+        assert cli.main(["--config", str(cfg_path), "init"]) == 1
         text = out.getvalue()
         assert "缺失模型文件" in text and "sherpa-onnx releases" in text and "缺失" in text
         assert "mimo.api_key 未填写" not in text

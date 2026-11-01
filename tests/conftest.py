@@ -5,6 +5,8 @@ Nothing here touches the network; MimoClient is never constructed with a real ke
 from __future__ import annotations
 
 import os
+
+os.environ.setdefault("HF_HUB_OFFLINE", "1")   # tests never download models, whatever a code path under test asks for
 from pathlib import Path
 from typing import Any, Callable
 
@@ -17,6 +19,47 @@ MODELS_DIR = PROJECT_ROOT / "models"
 # Real speech recording for the tests that run the CPU models: 16 kHz mono wav, silent for the first 29 s, speech after.
 # Not in the repository (tests/data/ is ignored); those tests skip without it. Override with AUDIO_NOTE_TEST_WAV.
 SAMPLE_WAV = Path(os.environ.get("AUDIO_NOTE_TEST_WAV") or PROJECT_ROOT / "tests" / "data" / "sample.wav")
+
+
+#: Tests that need the files from scripts/download_models.ps1 without using a model fixture: they go through the
+#: real "models present?" checks of the API / CLI / recorder. Skipped on a checkout that has no models yet.
+_NEEDS_MODELS = {
+    "test_api_label_and_voices_name_report_mismatch_and_accept_force",
+    "test_api_split_needs_api_key_then_splits",
+    "test_api_split_runs_under_the_scheduler_lock_preview_does_not",
+    "test_delete_speaker_releases_hand_labelled_rows_and_relation_cache",
+    "test_inactive_stream_raises_immediately",
+    "test_job_already_running_and_read_only_are_409",
+    "test_partial_write_failure_keeps_recording",
+    "test_reanchors_after_gap_in_delivered_samples",
+    "test_recording_start_and_stop",
+    "test_speaker_add_sample_rejections",
+    "test_speaker_label_error_cases",
+    "test_speakers_voices_assign_after_a_scan_asks_for_a_fresh_number",
+    "test_speakers_voices_assign_too_short_is_cli_error",
+    "test_speakers_voices_engine_failure_is_a_cli_error",
+    "test_speakers_voices_scan_list_and_assign",
+    "test_speakers_voices_shows_keys_and_assign_accepts_index_or_key",
+    "test_stall_raises_so_the_service_reopens_the_device",
+    "test_status_shape_on_empty_db",
+    "test_voices_name_and_label_hold_the_busy_counter",
+    "test_voices_name_assigns_group_and_starts_relabel",
+    "test_voices_name_errors",
+    "test_voices_name_mismatch_is_400_with_flag_and_force_retries",
+    "test_voices_name_relabel_is_skipped_when_a_job_blocks_it",
+}
+
+
+def pytest_collection_modifyitems(config: Any, items: list[Any]) -> None:
+    from audio_note.config import DEFAULTS
+
+    sp = DEFAULTS["speakers"]
+    if all((MODELS_DIR / sp[k]).exists() for k in ("vad_model", "embedding_model", "segmentation_model")):
+        return
+    skip = pytest.mark.skip(reason="models missing: run scripts/download_models.ps1")
+    for item in items:
+        if item.name in _NEEDS_MODELS:
+            item.add_marker(skip)
 
 
 def _deep_merge(base: dict, override: dict) -> dict:

@@ -60,7 +60,7 @@ Silero VAD 门控 ──► 只存语音片段 data/audio/YYYY-MM-DD/HHMMSS_mmm.
 # 没装 uv 的话先装：
 powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 
-git clone git@github.com:gaogaobaibai/audio-note.git audio_note
+git clone https://github.com/gaogaobaibai/audio-note.git audio_note
 cd audio_note
 powershell -ExecutionPolicy Bypass -File scripts/install.ps1
 ```
