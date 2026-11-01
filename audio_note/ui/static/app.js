@@ -25,6 +25,9 @@
   };
   const spkColor = (name) => { let h = 0; for (const ch of String(name || "")) h = (h * 31 + ch.charCodeAt(0)) >>> 0; return h % 8; };
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  // loudness in dBFS, shown as "−32 dB" (real minus sign); null / NaN → ""
+  const fmtDb = (v) => { if (v == null || !Number.isFinite(Number(v))) return ""; const n = Math.round(Number(v)); return `${n < 0 ? "−" : ""}${Math.abs(n)} dB`; };
+  const ORIGIN_LABEL = { mic: "麦克风", file: "文件", label: "标记", voice: "声音组", cluster: "簇" };
 
   async function api(path, opts = {}) {
     const init = { method: opts.method || "GET", headers: {} };
@@ -38,8 +41,16 @@
       return res;
     }
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || `${res.status} ${res.statusText}`);
+    if (!res.ok) { const err = new Error(data.error || `${res.status} ${res.statusText}`); err.status = res.status; err.data = data; throw err; }
     return data;
+  }
+  // 400 {"error", "mismatch": true, "score", "threshold", "name"}: the voice does not resemble the person's samples;
+  // the same request with force resends it anyway ("仍然加入")
+  const isMismatch = (e) => !!(e && e.data && e.data.mismatch);
+  function mismatchBox(e, attr) {
+    const d = e.data || {};
+    const why = d.score != null && d.threshold != null ? `相似度 ${Number(d.score).toFixed(2)} < ${Number(d.threshold).toFixed(2)}，` : "";
+    return `<div class="alert warn mismatch-note"><span>这段声音和 ${esc(d.name || "TA")} 已有的样本不像，没有加入。${why}确定是同一个人再加：</span><span class="right"><button class="btn sm" ${attr}>仍然加入</button></span></div>`;
   }
 
   function toast(msg, kind = "", ms = 3500) {
@@ -148,7 +159,17 @@
   }
 
   // ------------------------------------------------------------------ state & router
-  const state = { status: null, page: "", speakers: [], jobsSeen: {}, refresh: null };
+  // minDbfs: audio.min_speech_dbfs (number = utterances quieter than this are "远", null = off, undefined = not loaded yet)
+  const state = { status: null, page: "", speakers: [], jobsSeen: {}, refresh: null, minDbfs: undefined };
+  // the threshold rides on /api/status when the backend exposes it; otherwise one /api/config read per transcript page load
+  async function loadMinDbfs(force = false) {
+    const st = state.status;
+    if (st && st.min_speech_dbfs !== undefined) { state.minDbfs = st.min_speech_dbfs; return state.minDbfs; }
+    if (!force && state.minDbfs !== undefined) return state.minDbfs;
+    try { const cfg = await api("/api/config"); const a = cfg && cfg.values && cfg.values.audio; state.minDbfs = a && a.min_speech_dbfs != null ? Number(a.min_speech_dbfs) : null; }
+    catch (e) { if (state.minDbfs === undefined) state.minDbfs = null; }
+    return state.minDbfs;
+  }
   let pollTimer = null;
   const main = $("#main");
   let routeGen = 0;                       // bumped on every route(); pages compare to drop stale renders
@@ -229,6 +250,7 @@
     if (name === "push") return `：${Object.entries(r.channels || {}).map(([k, v]) => `${k} ${v ? "失败" : "成功"}`).join("，")}`;
     if (name === "voices") return `：分析 ${r.segments} 段录音，${r.clusters} 个声音${r.skipped ? `，${r.skipped} 段跳过` : ""}`;
     if (name === "relations") return `：检查 ${r.speakers} 人，写入 ${r.applied} 条关系`;
+    if (name === "loudness") return `：补算 ${r.computed ?? 0} 句音量，${r.threshold != null ? `${r.below ?? 0} 句低于门槛 ${fmtDb(r.threshold)}` : "门槛未设置（没有句子会被滤掉）"}`;
     return "";
   }
 
@@ -297,6 +319,7 @@
   // ------------------------------------------------------------------ dashboard
   async function pageDashboard(arg, my) {
     await refreshStatus();
+    await loadMinDbfs();                    // cached after the first read: the 最近的记录 rows mark 「远」 like the transcript page
     if (stale(my)) return;
     const render = async () => {
       const st = state.status; if (!st) return;
@@ -385,19 +408,27 @@
     const c = isUnk ? "" : `spk-c${spkColor(u.speaker)}`;
     const selfName = state.status && state.status.self_name;
     const meBadge = !isUnk && selfName && u.speaker === selfName ? `<span class="badge me" title="本人">我</span>` : "";
-    return `<div class="utt ${isUnk ? "unknown" : ""} ${hl ? "hl" : ""}" data-id="${u.id}" id="u${u.id}">
-      <span class="time">${esc(u.time.slice(0, 5))}</span>
-      <span class="spk ${c}" title="${esc(u.speaker)}${u.score != null ? ` 相似度 ${u.score}` : ""}">${esc(u.speaker)}${meBadge}${u.score != null && !isUnk ? `<span class="sc">${u.score.toFixed(2)}</span>` : ""}</span>
+    // loudness (dBFS) from the backend; quieter than audio.min_speech_dbfs → faded row + 「远」
+    const db = u.loudness_db != null && Number.isFinite(Number(u.loudness_db)) ? Number(u.loudness_db) : null;
+    const thr = state.minDbfs != null && Number.isFinite(Number(state.minDbfs)) ? Number(state.minDbfs) : null;
+    const far = db != null && thr != null && db < thr;
+    const dbTitle = db != null ? `音量 ${fmtDb(db)}${thr != null ? `（门槛 ${fmtDb(thr)}${far ? "，低于门槛：远处 / 不清晰的声音" : ""}）` : ""}` : "";
+    const dbHtml = db != null ? `<span class="db" title="${esc(dbTitle)}">${fmtDb(db)}</span>` : "";
+    const farBadge = far ? `<span class="badge far" title="${esc(dbTitle)}">远</span>` : "";
+    return `<div class="utt ${isUnk ? "unknown" : ""} ${hl ? "hl" : ""} ${far ? "far" : ""}" data-id="${u.id}" id="u${u.id}" ${dbTitle ? `title="${esc(dbTitle)}"` : ""}>
+      <span class="time">${esc(u.time.slice(0, 5))}${dbHtml}</span>
+      <span class="spk ${c}" title="${esc(u.speaker)}${u.score != null ? ` 相似度 ${u.score}` : ""}">${esc(u.speaker)}${meBadge}${u.score != null && !isUnk ? `<span class="sc">${u.score.toFixed(2)}</span>` : ""}${farBadge}</span>
       <span class="text">${esc(u.text)}${u.text_raw ? `<div class="raw" title="纠错前的原始转写">原文：${esc(u.text_raw)}</div>` : ""}</span>
-      <span class="acts">${noActs ? "" : `${u.audio ? `<button class="icon-btn" data-u="play" title="播放这句">▶</button>` : ""}<button class="icon-btn" data-u="label" title="标记这句话是谁说的">👤</button><button class="icon-btn" data-u="ctx" title="前后文">↕</button>`}</span>
+      <span class="acts">${noActs ? "" : `${u.audio ? `<button class="icon-btn" data-u="play" title="播放这句">▶</button>` : ""}<button class="icon-btn" data-u="label" title="标记这句话是谁说的">👤</button>${u.audio ? `<button class="icon-btn" data-u="split" title="拆分这句（两个人的话混在一起时）">✂</button>` : ""}<button class="icon-btn" data-u="ctx" title="前后文">↕</button>`}</span>
     </div>`;
   }
 
   async function pageTranscript(arg, my) {
-    const days = await api("/api/days");
+    const [days] = await Promise.all([api("/api/days"), loadMinDbfs(true)]);     // threshold for the 「远」 marking, once per page load
     if (stale(my)) return;
     let day = arg && /^\d{4}-\d{2}-\d{2}$/.test(arg.split("?")[0]) ? arg.split("?")[0] : (days[0] ? days[0].day : today());
     const hlId = (arg.match(/u=(\d+)/) || [])[1];
+    let hlIds = new Set();                  // rows to highlight on the next render (the pieces of a split), then forgotten
     let speakerFilter = "";
     let data = null;
     const listHtml = () => days.length ? days.map((d) => `<div class="item ${d.day === day ? "active" : ""}" data-day="${d.day}">
@@ -416,8 +447,10 @@
       view.innerHTML = `<div class="muted">加载中…</div>`;
       data = await api(`/api/transcript/${day}`);
       if (stale(my)) return;
+      if (data.min_speech_dbfs !== undefined) state.minDbfs = data.min_speech_dbfs;     // if the backend sends it with the transcript, prefer that
       renderDay();
       if (hlId) { const el = $(`#u${hlId}`); if (el) { el.scrollIntoView({ block: "center" }); el.classList.add("hl"); } }
+      if (hlIds.size) { const first = $(`#u${[...hlIds][0]}`); if (first) first.scrollIntoView({ block: "center" }); hlIds = new Set(); }
     }
     function renderDay() {
       const info = days.find((d) => d.day === day) || { pending: 0, failed: 0 };
@@ -426,10 +459,12 @@
       const sessions = data.sessions.filter((s) => !speakerFilter || s.utterances.some((u) => u.speaker === speakerFilter));
       const body = sessions.length ? sessions.map((s) => {
         const utts = speakerFilter ? s.utterances.filter((u) => u.speaker === speakerFilter) : s.utterances;
-        return `<div class="session"><div class="session-head">第 ${s.index} 段 · ${esc(s.start)}–${esc(s.end)} · ${utts.length} 条</div>${utts.map((u) => uttRow(u, { hl: String(u.id) === hlId })).join("")}</div>`;
+        return `<div class="session"><div class="session-head">第 ${s.index} 段 · ${esc(s.start)}–${esc(s.end)} · ${utts.length} 条</div>${utts.map((u) => uttRow(u, { hl: String(u.id) === hlId || hlIds.has(u.id) })).join("")}</div>`;
       }).join("") : `<div class="empty-state"><div class="big">${data.segments.length ? "这天的录音还没有转写" : "这天没有记录"}</div>${info.pending ? `${info.pending} 段等待转写` : ""}</div>`;
       const segs = data.segments;
-      const segLine = segs.length ? `<span class="small muted">${segs.length} 段录音 · ${fmtMin(segs.reduce((a, s) => a + (s.duration_s || 0), 0) / 60)}${info.pending ? ` · ${info.pending} 待转写` : ""}${info.failed ? ` · <span class="badge danger">${info.failed} 失败</span>` : ""}</span>` : "";
+      const thr = state.minDbfs != null ? Number(state.minDbfs) : null;
+      const farN = thr == null ? 0 : data.sessions.flatMap((s) => s.utterances).filter((u) => u.loudness_db != null && Number(u.loudness_db) < thr).length;
+      const segLine = segs.length ? `<span class="small muted">${segs.length} 段录音 · ${fmtMin(segs.reduce((a, s) => a + (s.duration_s || 0), 0) / 60)}${info.pending ? ` · ${info.pending} 待转写` : ""}${info.failed ? ` · <span class="badge danger">${info.failed} 失败</span>` : ""}${farN ? ` · <span title="音量低于设置里的最低音量 ${esc(fmtDb(thr))}，显示为淡色；新录音里这样的轮次会直接滤掉">${farN} 句偏远</span>` : ""}</span>` : "";
       view.innerHTML = `
         <div class="card">
           <div class="card-head"><div><h2>${esc(day)} <span class="muted small">${esc(dayLabel(day))}</span></h2>${segLine}</div>
@@ -460,6 +495,7 @@
         const u = data.sessions.flatMap((s) => s.utterances).find((x) => x.id === id);
         if (ub.dataset.u === "play") playUtt(row, id);
         else if (ub.dataset.u === "label") labelUtt(u, () => loadDay());
+        else if (ub.dataset.u === "split") splitUtt(u, (ids) => { hlIds = new Set(ids || []); loadDay(); });
         else if (ub.dataset.u === "ctx") showContext(id);
         return;
       }
@@ -523,9 +559,10 @@
         const syncNew = () => newBox.classList.toggle("hidden", !isNew());      // 本人 / 关系 only for a name not registered yet
         inp.oninput = syncNew; inp.onchange = syncNew; syncNew();
         el.querySelector('[data-x="cancel"]').onclick = close;
-        const ok = async () => {
+        const ok = async (force = false) => {
           const name = inp.value.trim(); if (!name) return;
           const body = { utterance_id: u.id, name, whole_cluster: el.querySelector("#lb-whole").checked };
+          if (force) body.force = true;
           if (isNew()) {
             body.is_self = el.querySelector("#lb-self").checked;
             const rel = relationValue(newBox); if (rel) body.relation = rel;
@@ -533,13 +570,118 @@
           const b = el.querySelector('[data-x="ok"]'); b.disabled = true; b.innerHTML = `<span class="spin"></span>处理中…`;
           try {
             const r = await api("/api/speakers/label", { method: "POST", json: body });
-            toast(`已标记为 ${name}：${r.assigned != null ? `${r.assigned} 句` : "已更新"}${r.relabeled_changed ? `，这段录音里另有 ${r.relabeled_changed} 句自动更新` : ""}`, "ok", 6000);
+            // sample_note: the backend says why the sample was not (fully) usable, e.g. too quiet / ambiguous → warn colour
+            const note = r.sample_note ? `；${r.sample_note}` : "";
+            toast(`已标记为 ${name}：${r.assigned != null ? `${r.assigned} 句` : "已更新"}${r.relabeled_changed ? `，这段录音里另有 ${r.relabeled_changed} 句自动更新` : ""}${note}`, note ? "warn" : "ok", note ? 8000 : 6000);
             if (body.is_self) await refreshStatus();        // so the 我 badge shows on the very next render, not after the next poll
             close(); if (after) after();
-          } catch (e) { toastErr(e); b.disabled = false; b.textContent = "标记"; }
+          } catch (e) {
+            b.disabled = false; b.textContent = "标记";
+            const old = el.querySelector(".mismatch-note"); if (old) old.remove();
+            if (isMismatch(e)) {
+              toast(e.message, "err", 8000);
+              el.querySelector(".actions").insertAdjacentHTML("beforebegin", mismatchBox(e, 'data-x="force"'));
+              el.querySelector('[data-x="force"]').onclick = () => ok(true);
+            } else toastErr(e);
+          }
         };
-        el.querySelector('[data-x="ok"]').onclick = ok;
-        inp.onkeydown = (e) => { if (e.key === "Enter") ok(); };
+        el.querySelector('[data-x="ok"]').onclick = () => ok(false);
+        inp.onkeydown = (e) => { if (e.key === "Enter") ok(false); };
+      });
+  }
+
+  // ✂ split one utterance that mixes two people: points taken from the player position ("在当前位置拆分") or an
+  // automatic by-voice preview; the preview endpoint identifies who speaks in each piece without ASR, the POST
+  // transcribes the pieces again and replaces the row. `after(ids)` gets the new utterance ids.
+  async function splitUtt(u, after) {
+    const dur = Math.max(0, Number(u.end_s) - Number(u.start_s));
+    const lo = 0.3, hi = dur - 0.3;
+    modal(`<h2>拆分这句</h2>
+      <div class="muted small mb">${esc(u.time.slice(0, 5))} ${esc(u.speaker)}：${esc(u.text)}</div>
+      <audio id="sp-audio" controls src="/api/audio/utterance/${u.id}?pad=0" style="width:100%"></audio>
+      <div class="row mt"><button class="btn sm" data-x="here" title="把播放器当前的位置加为一个拆分点">在当前位置拆分</button><button class="btn sm" data-x="auto" title="自动找出换人的位置，并识别每段是谁">自动按声音拆</button><span class="small muted">共 ${dur.toFixed(1)} 秒：听到换人的地方暂停，点「在当前位置拆分」，可以加多个点</span></div>
+      <div class="split-chips mt" id="sp-chips"></div>
+      <div id="sp-preview" class="mt"></div>
+      <div class="help mt">确认后每一段会重新转写（按秒数计费）并各自识别说话人，原来这句会被替换。</div>
+      <div class="actions"><button class="btn" data-x="cancel">取消</button><button class="btn primary" data-x="ok" disabled>确认拆分</button></div>`,
+      (el, close) => {
+        const audio = el.querySelector("#sp-audio");
+        const chipsBox = el.querySelector("#sp-chips"); const prev = el.querySelector("#sp-preview"); const okBtn = el.querySelector('[data-x="ok"]');
+        let pts = [];                 // manual split points, seconds from the utterance start, ascending
+        let mode = "";                // "at" | "auto": what 确认拆分 sends
+        let preview = null;           // last preview-split result (piece bounds + who was recognised)
+        let gen = 0;                  // drops a preview answer that arrives after the points changed again
+        let autoErr = "";             // why the last 自动按声音拆 failed; shown above the manual preview until the next attempt
+        audio.onerror = () => toast("音频无法播放（文件可能已删除）", "err");
+        const renderChips = () => {
+          chipsBox.innerHTML = pts.length ? `<span class="small muted">拆分点：</span>` + pts.map((p, i) => `<span class="chip static">${p.toFixed(1)}s<button class="x" data-rm="${i}" title="去掉这个拆分点">✕</button></span>`).join("") : `<span class="small muted">还没有拆分点</span>`;
+        };
+        const errBox = () => (autoErr ? `<div class="alert warn" style="margin:0 0 8px">自动拆分失败：${esc(autoErr)}${pts.length ? "（手动拆分点还在）" : ""}</div>` : "");
+        const renderPreview = () => {
+          if (!preview) { prev.innerHTML = errBox(); return; }
+          prev.innerHTML = `${errBox()}<div class="small muted mb">${mode === "auto" ? "按声音分出" : "按拆分点分出"} ${preview.pieces.length} 段（▶ 试听确认）：</div>${preview.pieces.map((p, i) => `<div class="split-piece" data-i="${i}"><span class="n">${i + 1}</span><span class="t">${Number(p.rel_start).toFixed(1)}–${Number(p.rel_end).toFixed(1)}s</span><span class="spk ${p.speaker_id ? `spk-c${spkColor(p.speaker)}` : "muted"}">${esc(p.speaker)}${p.score != null ? `<span class="sc">${Number(p.score).toFixed(2)}</span>` : ""}</span><button class="icon-btn" data-pplay="${i}" title="试听这段（第 ${i + 1} 段）">▶</button></div>`).join("")}<div class="voice-player" id="sp-player"></div>`;
+        };
+        const setPreview = (p, m) => { preview = p; mode = p ? m : ""; okBtn.disabled = !p; renderPreview(); };
+        const loadPreview = async (m) => {
+          const g = ++gen;
+          okBtn.disabled = true;
+          prev.innerHTML = `${errBox()}<div class="thinking"><span class="spin"></span>${m === "auto" ? "正在按声音分析…" : "正在识别每段的说话人…"}</div>`;
+          const q = m === "auto" ? "auto=1" : `auto=0&at=${encodeURIComponent(pts.map((p) => p.toFixed(2)).join(","))}`;
+          try {
+            const r = await api(`/api/utterances/${u.id}/preview-split?${q}`);
+            if (g !== gen) return;
+            autoErr = "";
+            if (m === "auto" && pts.length) { pts = []; renderChips(); }     // manual points are dropped only once the automatic preview succeeded
+            setPreview(r, m);
+          } catch (e) {
+            if (g !== gen) return;
+            if (m === "auto") {
+              // keep the manual points: fall back to the manual preview (or just the error when there are none)
+              autoErr = e.message || String(e);
+              if (pts.length) { await loadPreview("at"); return; }
+              setPreview(null, "");
+              return;
+            }
+            setPreview(null, "");
+            prev.innerHTML = `${errBox()}<div class="alert warn" style="margin:0">${esc(e.message)}</div>`;
+          }
+        };
+        renderChips();
+        el.querySelector('[data-x="cancel"]').onclick = close;
+        el.querySelector('[data-x="here"]').onclick = () => {
+          if (dur < 1.2) { toast("这句太短，无法拆分", "err"); return; }
+          const t = Math.round((audio.currentTime || 0) * 10) / 10;
+          if (t <= lo || t >= hi) { toast(`拆分点要在 ${lo.toFixed(1)}s 和 ${hi.toFixed(1)}s 之间（先播放到换人的位置再点）`, "err", 5000); return; }
+          if (pts.some((p) => Math.abs(p - t) < 0.05)) return;
+          pts = [...pts, t].sort((a, b) => a - b); renderChips(); loadPreview("at");
+        };
+        el.querySelector('[data-x="auto"]').onclick = () => { autoErr = ""; loadPreview("auto"); };     // pts stay until the auto preview succeeds
+        el.onclick = (ev) => {
+          const rm = ev.target.closest("[data-rm]");
+          if (rm) { pts = pts.filter((_, i) => i !== Number(rm.dataset.rm)); renderChips(); if (pts.length) loadPreview("at"); else { gen++; setPreview(null, ""); } return; }
+          const pp = ev.target.closest("[data-pplay]");
+          if (pp && preview) {
+            const p = preview.pieces[Number(pp.dataset.pplay)]; if (!p) return;
+            audio.pause();
+            $$(".split-piece.playing", el).forEach((x) => x.classList.remove("playing"));
+            pp.closest(".split-piece").classList.add("playing");
+            const player = el.querySelector("#sp-player");
+            player.innerHTML = `<audio controls autoplay src="/api/audio/segment/${preview.segment_id}?from=${encodeURIComponent(p.start_s)}&to=${encodeURIComponent(p.end_s)}"></audio><button class="icon-btn" title="关闭">✕</button>`;
+            player.querySelector("button").onclick = () => { player.innerHTML = ""; $$(".split-piece.playing", el).forEach((x) => x.classList.remove("playing")); };
+            player.querySelector("audio").onerror = () => toast("音频无法播放（文件可能已删除）", "err");
+          }
+        };
+        okBtn.onclick = async () => {
+          if (!preview || !mode) return;
+          const body = mode === "auto" ? { auto: true } : { at: pts };
+          okBtn.disabled = true; okBtn.innerHTML = `<span class="spin"></span>拆分并重新转写…`;
+          $$("audio", el).forEach((a) => a.pause());
+          try {
+            const r = await api(`/api/utterances/${u.id}/split`, { method: "POST", json: body });
+            toast(`已拆成 ${r.pieces.length} 句，重新转写了 ${Number(r.billed_s || 0).toFixed(1)} 秒`, "ok", 6000);
+            close(); if (after) after(r.pieces.map((p) => p.id));
+          } catch (e) { toastErr(e); okBtn.disabled = false; okBtn.textContent = "确认拆分"; }
+        };
       });
   }
 
@@ -757,12 +899,14 @@
   const voicesAutoScanned = {};            // profile name -> true: the speakers page submits the "voices" scan job at most once per profile per session
   const currentProfile = () => (state.status && state.status.profile && state.status.profile.name) || "";
   const voiceDrafts = {};                  // what the user typed into a voice card, kept across a re-render (keyed by group key)
+  const voiceMismatch = {};                // group key -> the 400 mismatch payload whose 「仍然加入」 note is showing on that card
   const voiceLetter = (i) => (i < 26 ? String.fromCharCode(65 + i) : String(i + 1));
   function stashVoiceDrafts() {
     for (const c of $$(".voice-card")) {
       const f = c.querySelector(".voice-form"); if (!f) continue;
       const d = { name: f.querySelector("[data-vname]").value, sel: f.querySelector("[data-rel-sel]").value, custom: f.querySelector("[data-rel-custom]").value, self: f.querySelector("[data-vself]").checked };
-      if (d.name || d.sel || d.self) voiceDrafts[c.dataset.key] = d;
+      if (c.querySelector(".mismatch-note") && voiceMismatch[c.dataset.key]) d.mismatch = voiceMismatch[c.dataset.key];   // the note survives a job-triggered re-render
+      if (d.name || d.sel || d.self || d.mismatch) voiceDrafts[c.dataset.key] = d;
     }
   }
 
@@ -782,6 +926,8 @@
     };
     const cards = people.map((s) => `<div class="card spk-card ${s.is_self ? "me" : ""}" data-sid="${s.id}">
         <div class="row"><span class="avatar bg-c${spkColor(s.name)}">${esc(s.name.slice(0, 1))}</span><div class="grow"><div class="name">${esc(s.name)}${s.is_self ? `<span class="badge me">我</span>` : ""}${relationChip(s)}</div><div class="small muted">${s.samples} 个声纹样本 · ${s.duration_s.toFixed(0)} 秒语音 · ${s.utterances} 条语句${s.notes ? ` · ${esc(s.notes)}` : ""}</div></div></div>
+        ${s.outlier_samples ? `<div class="alert warn sm"><span>有 ${s.outlier_samples} 个样本和其他样本不像（可能混了别人）</span><span class="right"><button class="btn sm" data-act="outliers" title="删掉这些样本；在「样本列表」里可以先看每个样本的一致性">移除不像的样本</button></span></div>` : ""}
+        ${s.ambiguous_samples ? `<div class="alert warn sm"><span>这个人的样本分成两组互不相像（${s.ambiguous_samples} 个有歧义），请打开样本列表自己判断（试听后删掉不是 TA 的）</span><span class="right"><button class="btn sm" data-act="samples">样本列表</button></span></div>` : ""}
         <div class="row">${s.is_self ? `<button class="btn sm ghost" data-act="unself" title="不再把 TA 当作本人">取消本人</button>` : `<button class="btn sm" data-act="self" title="日报、推送和问答都站在本人的视角；记录里本人的话就是“我”说的">${me ? "改为本人" : "设为本人"}</button>`}<button class="btn sm" data-act="add" data-name="${esc(s.name)}">补充样本</button><button class="btn sm" data-act="samples">样本列表</button><button class="btn sm" data-act="rename">重命名</button><button class="btn sm ghost" data-act="notes">备注</button><button class="btn sm danger right" data-act="delete">删除</button></div>
         <div class="samples hidden"></div></div>`).join("");
     main.innerHTML = `
@@ -837,6 +983,7 @@
         custom.classList.toggle("hidden", d.sel !== CUSTOM_REL);     // not sel.onchange(): that would focus() the custom box and steal focus from another card
         custom.value = d.custom;
         f.querySelector("[data-vself]").checked = d.self;
+        if (d.mismatch) { voiceMismatch[c.dataset.key] = d.mismatch; f.insertAdjacentHTML("beforebegin", mismatchBox({ data: d.mismatch }, "data-vforce")); }
       }
     };
     const loadVoices = async () => {
@@ -862,9 +1009,11 @@
       p.querySelector("button").onclick = () => { p.innerHTML = ""; if (row) row.classList.remove("playing"); };
       p.querySelector("audio").onerror = () => toast("音频无法播放（文件可能已删除）", "err");
     };
-    const nameVoice = async (card) => {
+    const nameVoice = async (card, force = false) => {
       const g = voices && (voices.groups || []).find((x) => x.key === card.dataset.key); if (!g) return;
       const f = card.querySelector(".voice-form");
+      const oldNote = card.querySelector(".mismatch-note"); if (oldNote) oldNote.remove();
+      delete voiceMismatch[card.dataset.key];
       const inp = f.querySelector("[data-vname]"); const name = inp.value.trim();
       if (!name) { toast("先填上这是谁", "err"); inp.focus(); return; }
       const isSelf = f.querySelector("[data-vself]").checked;
@@ -872,13 +1021,20 @@
       const rel = relationValue(f);
       const btn = f.querySelector("[data-vok]"); btn.disabled = true; btn.innerHTML = `<span class="spin"></span>提取声纹…`;
       try {
-        const r = await api("/api/voices/name", { method: "POST", json: { members: g.members, name, is_self: isSelf, relation: rel || null, auto_relabel: true } });
-        toast(`已标记为 ${name}：${r.utterances_assigned} 句，补充 ${r.samples_added} 个声纹样本${r.relabel_started ? "；正在用新声纹重新识别其他记录" : ""}`, "ok", 7000);
+        const r = await api("/api/voices/name", { method: "POST", json: { members: g.members, name, is_self: isSelf, relation: rel || null, auto_relabel: true, force } });
+        const rejected = r.samples_rejected ? `，${r.samples_rejected} 段声音和已有样本不像没有加入` : "";
+        const note = r.sample_note ? `；${r.sample_note}` : "";
+        const noSample = !r.samples_added;                   // named, but no voiceprint sample came out of it (too quiet / all rejected): warn colour
+        toast(`已标记为 ${name}：${r.utterances_assigned} 句，补充 ${r.samples_added} 个声纹样本${rejected}${noSample && !note && !rejected ? "（没有可用的声纹样本，之后不会自动认出 TA）" : ""}${note}${r.relabel_started ? "；正在用新声纹重新识别其他记录" : ""}`, noSample || note ? "warn" : "ok", noSample || note ? 9000 : 7000);
         stashVoiceDrafts();                                  // keep what was typed into the OTHER cards across the re-render
         delete voiceDrafts[card.dataset.key];                // (after the stash, or the named card's draft would be re-added)
         if (isSelf) await refreshStatus();                   // 我 badge / self_name are read from state.status by the next render
         await pageSpeakers(arg, my);
-      } catch (err) { toastErr(err); btn.disabled = false; btn.textContent = "就是 TA"; }
+      } catch (err) {
+        btn.disabled = false; btn.textContent = "就是 TA";
+        if (isMismatch(err)) { toast(err.message, "err", 8000); voiceMismatch[card.dataset.key] = err.data; f.insertAdjacentHTML("beforebegin", mismatchBox(err, "data-vforce")); }
+        else toastErr(err);
+      }
     };
 
     // a finished job re-renders the page, but only for jobs that change what this page shows, and never while the user is
@@ -933,6 +1089,8 @@
       if (va) { if (va.dataset.vact === "scan" && !va.disabled) { voicesAutoScanned[currentProfile()] = true; await runJob("voices"); await loadVoices(); } return; }
       const vok = e.target.closest("[data-vok]");
       if (vok) { await nameVoice(vok.closest(".voice-card")); return; }
+      const vforce = e.target.closest("[data-vforce]");
+      if (vforce) { await nameVoice(vforce.closest(".voice-card"), true); return; }
       const vf = e.target.closest("[data-vfill]");
       if (vf) { const inp = vf.closest(".voice-card").querySelector("[data-vname]"); inp.value = vf.dataset.vfill; inp.dispatchEvent(new Event("input")); inp.focus(); return; }
       const b = e.target.closest("[data-act]"); if (!b) return;
@@ -949,12 +1107,22 @@
       else if (a === "rename") { const n = await promptModal("重命名", { label: "新名字", value: spk.name }); if (n && n !== spk.name) { try { await api(`/api/speakers/${sid}`, { method: "PATCH", json: { name: n } }); toast("已重命名", "ok"); route(); } catch (err) { toastErr(err); } } }
       else if (a === "notes") { const n = await promptModal("备注", { label: "例如：项目组的同事、楼下邻居", value: spk.notes }); if (n !== null) { try { await api(`/api/speakers/${sid}`, { method: "PATCH", json: { notes: n } }); route(); } catch (err) { toastErr(err); } } }
       else if (a === "delete") { if (await confirmModal(`删除 ${spk.name}`, `删除声纹和 ${spk.utterances} 条语句上的名字（语句会变成「${data.unknown_label}」，文字不会丢）。`, "删除", true)) { try { await api(`/api/speakers/${sid}`, { method: "DELETE" }); toast("已删除"); route(); } catch (err) { toastErr(err); } } }
+      else if (a === "outliers") {
+        if (await confirmModal("移除不像的样本", `删除 ${spk.name} 的 ${spk.outlier_samples} 个和其他样本不像的声纹样本（多半是混进来的别人的声音）。删掉后建议点「重新识别全部记录」。`, "移除", true)) {
+          try { const r = await api(`/api/speakers/${sid}/samples/outliers`, { method: "DELETE" }); toast(`已移除 ${r.deleted} 个样本，还剩 ${r.remaining} 个`, "ok"); route(); } catch (err) { toastErr(err); }
+        }
+      }
       else if (a === "samples") {
         const box = card.querySelector(".samples");
         if (!box.classList.contains("hidden")) { box.classList.add("hidden"); return; }
-        const rows = await api(`/api/speakers/${sid}/samples`);
+        let rows;
+        try { rows = await api(`/api/speakers/${sid}/samples`); } catch (err) { toastErr(err); return; }
         box.classList.remove("hidden");
-        box.innerHTML = `<table class="tbl small">${rows.map((r) => `<tr><td>#${r.id}</td><td>${esc(r.file)}</td><td class="num">${(r.duration_s || 0).toFixed(1)}s</td><td>${fmtDT(r.created_at)}</td><td class="nowrap">${r.audio ? `<button class="icon-btn" data-play="${r.id}" title="试听">▶</button>` : ""}<button class="icon-btn" data-delsample="${r.id}" title="删除样本">✕</button></td></tr>`).join("")}</table><div class="sample-player"></div>`;
+        const cons = (r) => r.consistency == null ? `<span class="faint" title="只有这一个样本，没法比">-</span>` : `${Number(r.consistency).toFixed(2)}${r.outlier ? " ⚠" : r.ambiguous ? " ?" : ""}`;
+        const consCls = (r) => (r.outlier ? "bad" : r.ambiguous ? "amb" : "");
+        const consTitle = (r) => (r.outlier ? "和其他样本不像，可能混了别人" : r.ambiguous ? "歧义：样本分成两组互不相像，这个属于其中一组；试听后删掉不是 TA 的" : "");
+        const origin = (r) => (r.origin && ORIGIN_LABEL[r.origin] ? `<span class="badge plain" title="${esc(r.origin)}">${ORIGIN_LABEL[r.origin]}</span>` : `<span class="faint" title="老样本，没有记录来源">-</span>`);
+        box.innerHTML = `<table class="tbl small"><tr><th></th><th>文件</th><th title="样本是怎么来的：麦克风 = 说话人页录的；文件 = 上传的；标记 = 记录页标记的句子；声音组 = 给未识别的声音起名；簇 = 音频过期后留下的簇声纹。麦克风 / 文件的样本不可能混进别人，判一致性时以它们为准">来源</th><th class="num">时长</th><th class="num" title="和这个人其他样本的最高相似度；低于设置里的 sample_consistency_min 时标红（可能混了别人）；标 ? 的是歧义样本（分成两组互不相像，程序没法判断哪组是 TA）">一致性</th><th>加入时间</th><th></th></tr>${rows.map((r) => `<tr><td>#${r.id}</td><td>${esc(r.file)}</td><td>${origin(r)}</td><td class="num">${(r.duration_s || 0).toFixed(1)}s</td><td class="num consistency ${consCls(r)}" title="${esc(consTitle(r))}">${cons(r)}</td><td>${fmtDT(r.created_at)}</td><td class="nowrap">${r.audio ? `<button class="icon-btn" data-play="${r.id}" title="试听">▶</button>` : ""}<button class="icon-btn" data-delsample="${r.id}" title="删除样本">✕</button></td></tr>`).join("")}</table><div class="sample-player"></div>`;
         box.onclick = async (ev) => {
           const p = ev.target.closest("[data-play]"); if (p) { box.querySelector(".sample-player").innerHTML = `<audio controls autoplay src="/api/speakers/samples/${p.dataset.play}/audio"></audio>`; return; }
           const d = ev.target.closest("[data-delsample]"); if (d && await confirmModal("删除样本", "删除这个声纹样本。", "删除", true)) { try { await api(`/api/speakers/samples/${d.dataset.delsample}`, { method: "DELETE" }); route(); } catch (err) { toastErr(err); } }
@@ -977,20 +1145,48 @@
       </div>`;
     $("#enroll-close").onclick = () => { stopRecording(); panel.classList.add("hidden"); };
     const getName = () => { const n = $("#en-name").value.trim(); if (!n) { toast("先填姓名", "err"); $("#en-name").focus(); } return n; };
-    const upload = async (blob, filename, where) => {
-      const n = getName(); if (!n) return false;
+    // re-render the page (new sample counts) and reopen this panel — but not while a 「仍然加入」 note is still waiting for an answer,
+    // or the note would vanish under the user; the forced upload that answers it triggers the refresh itself
+    const scheduleRefresh = (n) => setTimeout(() => {
+      if (state.page !== "speakers") return;
+      const p = $("#enroll-panel"); if (p && p.querySelector("[data-enforce]")) return;
+      pageSpeakers(undefined, routeGen).then(() => enrollPanel(n));
+    }, 1500);
+    // returns "ok" | "mismatch" | "error"; `refresh: false` lets a multi-file batch refresh once at the end instead of per file
+    const upload = async (blob, filename, where, { force = false, refresh = true } = {}) => {
+      const n = getName(); if (!n) return "error";
       where.innerHTML = `<div class="thinking"><span class="spin"></span>正在提取声纹…</div>`;
       try {
-        const r = await api(`/api/speakers/${encodeURIComponent(n)}/samples?filename=${encodeURIComponent(filename)}`, { method: "POST", body: blob });
+        const r = await api(`/api/speakers/${encodeURIComponent(n)}/samples?filename=${encodeURIComponent(filename)}${force ? "&force=true" : ""}`, { method: "POST", body: blob });
         where.innerHTML = `<div class="alert info" style="margin:0">已登记 ${esc(n)}：这段有 ${r.speech_s} 秒语音，现在共 ${r.samples} 个样本。</div>`;
         toast(`已注册 ${n}`, "ok");
-        setTimeout(() => { if (state.page === "speakers") pageSpeakers(undefined, routeGen).then(() => enrollPanel(n)); }, 1500);
-        return true;
-      } catch (e) { where.innerHTML = `<div class="alert danger" style="margin:0">${esc(e.message)}</div>`; return false; }
+        if (refresh) scheduleRefresh(n);
+        return "ok";
+      } catch (e) {
+        if (isMismatch(e)) {
+          toast(e.message, "err", 8000);
+          where.innerHTML = mismatchBox(e, "data-enforce");
+          where.querySelector("[data-enforce]").onclick = () => upload(blob, filename, where, { force: true });
+          return "mismatch";
+        }
+        where.innerHTML = `<div class="alert danger" style="margin:0">${esc(e.message)}</div>`;
+        return "error";
+      }
     };
     $("#en-file").onchange = async (e) => {
-      for (const f of e.target.files) { const ok = await upload(f, f.name, $("#file-result")); if (!ok) break; }
-      e.target.value = "";
+      const files = Array.from(e.target.files); e.target.value = "";
+      if (!files.length) return;
+      if (!getName()) return;
+      const box = $("#file-result");
+      // one result box per file; a mismatch (「仍然加入」) on one file does not stop the rest of the batch
+      box.innerHTML = files.map((f, i) => `<div class="file-res" data-fi="${i}">${files.length > 1 ? `<div class="small muted">${esc(f.name)}</div>` : ""}<div data-body><span class="faint small">等待上传…</span></div></div>`).join("");
+      let okN = 0; const n = $("#en-name").value.trim();
+      for (let i = 0; i < files.length; i++) {
+        const body = box.querySelector(`[data-fi="${i}"] [data-body]`); if (!body) break;     // panel was closed / re-rendered meanwhile
+        const res = await upload(files[i], files[i].name, body, { refresh: false });
+        if (res === "ok") okN++;
+      }
+      if (okN) scheduleRefresh(n);
     };
     $("#rec-btn").onclick = async () => {
       if (recState) { recState.stop(false); return; }
@@ -1068,7 +1264,9 @@
           <div class="form-grid">${sel("audio.device", "麦克风", devVal, devOpts, "拔插设备后重新打开这页会刷新列表")}
             ${num("audio.vad_threshold", "语音检测阈值", v.audio.vad_threshold, "0–1，越高越保守（环境嘈杂时调高）", "0.05", "0")}
             ${num("audio.min_silence_s", "结束片段的静音秒数", v.audio.min_silence_s, "", "0.5", "0.5")}${num("audio.max_segment_s", "单片段最长秒数", v.audio.max_segment_s, "", "30", "30")}
-            ${num("audio.gain", "输入增益", v.audio.gain, "录得太小声就调大，如 2", "0.1", "0.1")}</div>
+            ${num("audio.gain", "输入增益", v.audio.gain, "录得太小声就调大，如 2", "0.1", "0.1")}
+            <div class="field"><label>最低音量 (dBFS)</label><div class="row"><input class="input grow" type="number" data-path="audio.min_speech_dbfs" data-nullable value="${esc(v.audio.min_speech_dbfs ?? "")}" step="1" min="-90" max="0" placeholder="留空 = 关闭"><button class="btn sm" id="loudness-stats" type="button" title="给没算过音量的句子补算（读音频，不花钱），然后统计有多少句低于门槛；不会删除任何记录">统计音量分布</button></div>
+              <div class="help">低于此音量的说话轮次视为远处 / 不清晰的声音：不转写、不入声纹。本人近讲大约 −26 dB，两米外的人大约 −53 dB，默认 −40；留空 = 关闭。记录页每句都显示音量，调之前先看看。</div><div class="help" id="loudness-note"></div></div></div>
           <div class="mt" style="border-top:1px solid var(--border);padding-top:12px"><h3 class="mb">系统声音（会议 / 通话对方的声音）</h3>
           <div class="form-grid">${bool("audio.system_audio", "同时录系统声音", v.audio.system_audio, "把扬声器 / 耳机里放出来的声音和麦克风混在一起录；总览页也有开关。用耳机效果最好，外放时对方的声音会被录两次")}
             ${sel("audio.system_device", "录哪个输出设备", v.audio.system_device == null ? "" : String(v.audio.system_device), sysOpts, sysDevices.available ? "" : "当前环境没有可用的系统声音源（需要 Windows 和 PyAudioWPatch）")}
@@ -1113,7 +1311,7 @@
         const [a, b, c] = el.dataset.path.split(".");
         let val;
         if (el.type === "checkbox") val = el.checked;
-        else if (el.type === "number") { if (el.value === "") continue; val = Number(el.value); }
+        else if (el.type === "number") { if (el.value === "") { if (el.dataset.nullable === undefined) continue; val = null; } else val = Number(el.value); }   // data-nullable: empty = off (null)
         else if (el.type === "password") { if (!el.value) continue; val = el.value; }
         else val = el.value;
         if (el.dataset.path === "audio.device") val = val === "" ? null : (/^\d+$/.test(val) ? Number(val) : val);
@@ -1131,11 +1329,31 @@
         const r = await api("/api/config", { method: "PUT", json: collect() });
         $("#save-note").textContent = r.saved.length ? `已保存（${r.saved.length} 项）${r.notes.length ? "：" + r.notes.join("；") : ""}` : "没有改动";
         toast(r.saved.length ? "设置已保存" : "没有需要保存的修改", "ok");
+        { const m = $('[data-path="audio.min_speech_dbfs"]'); if (m) state.minDbfs = m.value === "" ? null : Number(m.value); }   // the transcript page marks 「远」 against the saved value
         await refreshStatus();
         $$('[data-path][type="password"]').forEach((e) => { e.value = ""; });
         if (r.saved.some((k) => k.endsWith("api_key") || k.includes("webhook") || k.includes("token") || k.includes("sendkey") || k.includes("spt"))) route();
       } catch (e) { toastErr(e); } finally { b.disabled = false; }
     };
+    // 统计音量分布: the "loudness" job (compute missing loudness_db + count rows below the threshold); its finish arrives through the
+    // status poll → toast with jobSummary("loudness") + state.refresh("loudness"), which repaints the note under the field
+    const loudnessNote = () => {
+      const el = $("#loudness-note"); if (!el) return;
+      const j = state.status && state.status.jobs && state.status.jobs.loudness;
+      const b = $("#loudness-stats"); if (b) b.disabled = !!(j && j.running);
+      if (!j) { el.textContent = ""; return; }
+      if (j.running) el.innerHTML = `<span class="thinking"><span class="spin"></span>正在统计（读音频补算音量）…</span>`;
+      else if (j.error) el.innerHTML = `<span style="color:var(--danger)">上次统计失败：${esc(j.error)}</span>`;
+      else if (j.finished_at) el.textContent = `上次统计 ${fmtDT(j.finished_at)}${jobSummary("loudness", j.result)}`;
+      else el.textContent = "";
+    };
+    loudnessNote();
+    state.refresh = async (job) => { if (job === undefined || job === "loudness") loudnessNote(); };
+    $("#loudness-stats").onclick = async () => {
+      const b = $("#loudness-stats"); b.disabled = true;
+      try { await runJob("loudness"); loudnessNote(); } finally { if (!(state.status && state.status.jobs && state.status.jobs.loudness && state.status.jobs.loudness.running)) b.disabled = false; }
+    };
+    startPagePoll(async () => { const j = state.status && state.status.jobs && state.status.jobs.loudness; if (j && j.running) { await refreshStatus(); loudnessNote(); } }, 3000, my);
     $("#test-api").onclick = async () => {
       const b = $("#test-api"); b.disabled = true; b.innerHTML = `<span class="spin"></span>测试中`;
       try { const r = await api("/api/config/test-api", { method: "POST" }); toast(`连接正常：${r.model} 在 ${r.seconds}s 内回复「${r.reply}」`, "ok", 6000); }

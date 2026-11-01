@@ -118,7 +118,7 @@ class FakeEngine:
         self.too_short = too_short
         self.calls: list[tuple] = []
 
-    def enroll_from_audio(self, db, name, audio, source=None, copy_as_source=False):
+    def enroll_from_audio(self, db, name, audio, source=None, copy_as_source=False, **kw):
         self.calls.append(("enroll_from_audio", name, source, round(len(audio) / SR, 1)))
         if self.too_short:
             raise ValueError("选中的范围只有 0.3s 语音（至少需要 1s），未注册")
@@ -126,7 +126,7 @@ class FakeEngine:
         db.add_speaker_embedding(sid, _voice(hash(name) % 97), source, len(audio) / SR)
         return sid
 
-    def enroll_from_segment_turns(self, db, name, seg_path, turns):
+    def enroll_from_segment_turns(self, db, name, seg_path, turns, **kw):
         self.calls.append(("label", name, Path(seg_path), turns))
         if self.too_short:
             raise ValueError("选中的范围只有 0.3s 语音（至少需要 1s），未注册")
@@ -583,7 +583,7 @@ def test_voices_name_and_label_hold_the_busy_counter(client: TestClient, rt: Run
     assert seen == [1] and rt.request_busy() == 0
     orig = fake_engine.enroll_from_segment_turns
     monkeypatch.setattr(fake_engine, "enroll_from_segment_turns",
-                        lambda db, name, seg_path, turns: (seen.append(rt.request_busy()), orig(db, name, seg_path, turns))[1])
+                        lambda db, name, seg_path, turns, **kw: (seen.append(rt.request_busy()), orig(db, name, seg_path, turns, **kw))[1])
     r = client.post("/api/speakers/label", json={"name": "张伟", "utterance_id": d["utts"]["a1"]})
     assert r.status_code == 200, r.text
     assert seen == [1, 1] and rt.request_busy() == 0
@@ -610,3 +610,42 @@ def test_voices_name_and_job_report_missing_models_in_chinese(client: TestClient
     assert client.post("/api/jobs/voices").status_code == 200 and rt.wait_jobs(5)
     job = client.get("/api/jobs").json()["voices"]
     assert job["running"] is False and job["error"] and "模型文件缺失" in job["error"] and "Error" not in job["error"]
+
+
+# --- v3: force / mismatch on the naming endpoints (more in tests/test_mixed_speakers.py) -----------------------------
+
+def test_voices_name_mismatch_is_400_with_flag_and_force_retries(client: TestClient, rt: Runtime, monkeypatch: pytest.MonkeyPatch):
+    from audio_note.speech.speakers import SampleMismatch
+
+    class Engine(FakeEngine):
+        def enroll_from_audio(self, db, name, audio, source=None, copy_as_source=False, force=False, **kw):
+            self.calls.append(("enroll_from_audio", name, force))
+            if not force:
+                raise SampleMismatch(name, 0.31, 0.5)
+            return super().enroll_from_audio(db, name, audio, source, copy_as_source)
+
+    eng = Engine()
+    monkeypatch.setattr(rt, "engine", lambda: eng)
+    d = _two_unknown_groups(rt)
+    _speaker_with_samples(rt, "张三")
+    r = client.post("/api/voices/name", json={"members": [[d["seg1"], 0]], "name": "张三", "auto_relabel": False})
+    assert r.status_code == 400
+    assert r.json()["mismatch"] is True and r.json()["score"] == 0.31 and r.json()["threshold"] == 0.5 and "张三" in r.json()["error"]
+    assert rt.db.one("SELECT speaker_id FROM utterances WHERE id=?", (d["utts"]["a1"],))["speaker_id"] is None
+    r = client.post("/api/voices/name", json={"members": [[d["seg1"], 0]], "name": "张三", "auto_relabel": False, "force": True})
+    assert r.status_code == 200, r.text
+    assert r.json()["samples_added"] == 1 and r.json()["utterances_assigned"] == 2
+    assert ("enroll_from_audio", "张三", True) in eng.calls and ("enroll_from_audio", "张三", False) in eng.calls
+    sp = {s["name"]: s for s in client.get("/api/speakers").json()["speakers"]}
+    assert "outlier_samples" in sp["张三"]
+    assert rt.wait_jobs(5)
+
+
+def test_speakers_list_and_samples_expose_v3b_fields(client: TestClient, rt: Runtime):
+    sid = _speaker_with_samples(rt, "张三", n=2)
+    rows = client.get(f"/api/speakers/{sid}/samples").json()
+    assert [r["origin"] for r in rows] == [None, None] and all(r["ambiguous"] is False for r in rows)
+    sp = {s["name"]: s for s in client.get("/api/speakers").json()["speakers"]}
+    assert sp["张三"]["outlier_samples"] == 0 and sp["张三"]["ambiguous_samples"] == 0
+    rt.db.add_speaker_embedding(sid, _voice(5), "rec.wav", 2.0, origin="mic")
+    assert client.get(f"/api/speakers/{sid}/samples").json()[-1]["origin"] == "mic"

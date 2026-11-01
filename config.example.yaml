@@ -39,6 +39,8 @@ audio:
   system_audio: false            # 同时录系统声音（会议 / 通话里对方的声音，WASAPI loopback）；界面总览可一键开关
   system_device: null            # null = 默认输出设备；或输出设备序号 / 名称子串（`audio-note devices` 查看）
   system_gain: 1.0               # 系统声音混入时的音量倍数
+  min_speech_dbfs: -40.0         # 最低音量（dBFS）：低于此音量的说话轮次视为远处 / 不清晰的声音，不转写、不入声纹；null = 关闭。
+                                 # 记录页每句都显示音量（本人近讲约 -26，两米外的人约 -53），调门槛前先看看；`audio-note loudness` 看分布
 
 storage:
   cleanup_enabled: true          # 是否定时清理
@@ -62,6 +64,10 @@ speakers:
   infer_relations: true          # 日报生成后自动让模型推断每位说话人与本人的关系（用户手动标过的不会被改）
   relation_min_utterances: 15    # 说话人至少有多少句记录才会推断关系
   relation_min_confidence: 0.6   # 推断结果的置信度低于此值不写入（0~1）
+  min_label_sample_s: 2.5        # 从记录里标记 / 给声音起名时，取样至少要有这么多秒语音（太短的远场片段声纹不可靠；句子照样会被标上名字）
+  sample_consistency_min: 0.5    # 新样本和此人已有样本（以时长加权的中位样本为基准）的相似度低于它就拒绝加入（防止混了别人的声音；可用「仍然加入」强制）
+  turn_check_min_s: 1.0          # 簇级识别后，≥ 此秒数的说话轮次再逐个核对声纹（两人被并成一簇时能分开）；0 = 关闭
+  turn_reject_margin: 0.15       # 轮次与簇内说话人的相似度低于 identify_threshold - 此值且不像任何人时，标为未知
 
 correction:
   enabled: true                  # 是否用 LLM 对 ASR 结果做纠错

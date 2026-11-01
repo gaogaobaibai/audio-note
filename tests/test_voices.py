@@ -431,7 +431,7 @@ def test_name_voice_keeps_rows_hand_labelled_as_somebody_else(cfg, db):
     """Finding 3: naming a group never overwrites utterances the user labelled to a different speaker;
     rows labelled to the same speaker, automatic rows and orphaned 'user' rows are assigned."""
     class Engine:
-        def enroll_from_audio(self, db_, name, audio, source=None, copy_as_source=False):
+        def enroll_from_audio(self, db_, name, audio, source=None, copy_as_source=False, **kw):
             sid = db_.upsert_speaker(name)
             db_.add_speaker_embedding(sid, _voice(1), source, 2.0)
             return sid
@@ -521,3 +521,55 @@ def test_backfill_marks_unreadable_or_empty_segments_so_they_are_not_rescanned(c
         name_voice(db, cfg, eng, [[s2, -1]], "甲")
     assert db.delete_cluster_embeddings(s2) == 1
     assert [r["id"] for r in voices.missing_segments(db)] == [s2]
+
+
+# --- v3: member consistency / sample rejection (more in tests/test_mixed_speakers.py) -------------------------------
+
+def test_name_voice_reports_inconsistent_members_and_rejected_samples(cfg, db):
+    from audio_note.speech.speakers import SampleMismatch
+
+    class Engine:
+        def __init__(self):
+            self.calls: list[tuple[str, bool]] = []
+
+        def enroll_from_audio(self, db_, name, audio, source=None, copy_as_source=False, force=False, **kw):
+            self.calls.append((name, force))
+            if not force:
+                raise SampleMismatch(name, 0.2, 0.5)
+            sid = db_.upsert_speaker(name)
+            db_.add_speaker_embedding(sid, _voice(1), source, len(audio) / SR)
+            return sid
+
+    a = _voice(1)
+    seg1, _ = _seg(cfg, db, datetime(2026, 10, 30, 9, 0), audio=_tone(8.0))
+    seg2, _ = _seg(cfg, db, datetime(2026, 10, 31, 9, 0), audio=_tone(8.0))
+    u1 = _utt(db, seg1, DAY, "09:00", "一", None, None, 0.0, 5.0, cluster=0)
+    u2 = _utt(db, seg2, "2026-10-31", "09:00", "二", None, None, 0.0, 3.0, cluster=0)
+    db.upsert_cluster_embedding(seg1, 0, a, 5.0)
+    db.upsert_cluster_embedding(seg2, 0, _voice(2), 3.0)                 # unlike the anchor: not used as a sample
+    old = db.upsert_speaker("老张")
+    db.add_speaker_embedding(old, _voice(5), None, 3.0)
+    eng = Engine()
+    with pytest.raises(SampleMismatch):
+        name_voice(db, cfg, eng, [[seg1, 0], [seg2, 0]], "老张")
+    assert eng.calls == [("老张", False)]                                 # only the consistent member was tried
+    assert db.one("SELECT speaker_id FROM utterances WHERE id=?", (u1,))["speaker_id"] is None    # nothing assigned
+    res = name_voice(db, cfg, eng, [[seg1, 0], [seg2, 0]], "老张", force=True)
+    assert res["samples_added"] == 1 and res["samples_rejected"] == 0 and res["members_inconsistent"] == 1
+    assert res["utterances_assigned"] == 2 and eng.calls[-1] == ("老张", True)
+    assert db.one("SELECT speaker_id FROM utterances WHERE id=?", (u2,))["speaker_id"] == old
+
+
+def test_unknown_utterance_count_and_grouping_skip_faint_sentences(cfg, db):
+    """v3b: sentences below audio.min_speech_dbfs are neither counted as unidentified nor shown in a group."""
+    seg, _ = _seg(cfg, db, datetime(2026, 10, 30, 9, 0))
+    _store(db, seg, 0, _voice(1), 4.0)
+    _utt(db, seg, DAY, "09:00", "近", None, None, 0.0, 1.0, cluster=0)
+    far = _utt(db, seg, DAY, "09:00", "远", None, None, 1.0, 2.0, cluster=0)
+    db.execute("UPDATE utterances SET loudness_db=-55 WHERE id=?", (far,))
+    assert voices.unknown_utterance_count(db) == 2 and voices.unknown_utterance_count(db, -40.0) == 1
+    out = group_unknown_voices(db, cfg)
+    assert out["unknown_utterances"] == 1 and out["groups"][0]["utterances"] == 1
+    assert [s["utterance_id"] for s in out["groups"][0]["samples"]] != [far]
+    cfg["audio"]["min_speech_dbfs"] = None
+    assert group_unknown_voices(db, cfg)["groups"][0]["utterances"] == 2

@@ -8,13 +8,14 @@ Commands
   import <files...> [--start]     import existing recordings
   process [--retry-failed] [--limit N]
   transcribe <file>               one-off transcription, printed, not stored
-  speakers enroll|record|list|label|relabel|calibrate
+  speakers enroll|record|list|label|relabel|calibrate|audit   (enroll/label/voices --assign take --force to add a sample that sounds unlike the person)
   speakers voices|scan            unidentified voices in the recordings: list / name a group (no enrollment recording needed)
   speakers set-self|relation|relations   who the user is, relations to the user (by hand / inferred by the LLM)
   daily [--day] [--push] [--force]
   push-test <text>
   chat [question...]              one question, or an interactive REPL without arguments
   cleanup
+  loudness [--day D] [--apply --yes]   speech level per sentence; --apply deletes the ones below audio.min_speech_dbfs
   init                            create config.yaml, check model files
 
 Modules written by other parts of the project (speech.pipeline, speech.correct, memory.chat,
@@ -651,9 +652,15 @@ def cmd_speakers_enroll(cfg: Config, args: argparse.Namespace) -> int:
     files = _expand_files(args.files)
     db = _db(cfg)
     engine = SpeakerEngine(cfg)
-    sid = engine.enroll(db, args.name, files, notes=args.notes)
+    before = db.one("SELECT COUNT(*) AS n FROM speaker_embeddings e JOIN speakers s ON s.id=e.speaker_id WHERE s.name=?", (args.name,))
+    n0 = int(before["n"]) if before else 0
+    sid = engine.enroll(db, args.name, files, notes=args.notes, **_force_kwargs(args))
     n = db.one("SELECT COUNT(*) AS n FROM speaker_embeddings WHERE speaker_id=?", (sid,))
-    console.print(f"已注册 {args.name} (id {sid})，共 {n['n'] if n else 0} 个样本（副本保存在 {cfg.speakers_dir}）。")
+    n1 = int(n["n"]) if n else 0
+    console.print(f"已注册 {args.name} (id {sid})，共 {n1} 个样本（副本保存在 {cfg.speakers_dir}）。")
+    skipped = len(files) - (n1 - n0)
+    if skipped > 0:
+        console.print(f"[yellow]{skipped} 个文件没有加入：语音太短，或和 {args.name} 已有的样本不像（确定是同一个人可加 --force）。[/yellow]")
     _reindex_after_enroll(cfg, db)
     done = db.one("SELECT COUNT(*) AS n FROM segments WHERE status='done'")
     if done and done["n"]:
@@ -712,10 +719,71 @@ def cmd_speakers_record(cfg: Config, args: argparse.Namespace) -> int:
         console.print(f"[red]只检测到 {speech_s:.1f} 秒语音，样本不可用；请重录并持续说话[/red]")
         return 2
     sid = db.upsert_speaker(args.name, args.notes)
-    db.add_speaker_embedding(sid, emb, str(out), speech_s)
+    db.add_speaker_embedding(sid, emb, str(out), speech_s, origin="mic")
     n = db.one("SELECT COUNT(*) AS n FROM speaker_embeddings WHERE speaker_id=?", (sid,))
     console.print(f"已注册 {args.name} (id {sid})，语音 {speech_s:.1f}s，共 {n['n'] if n else 0} 个样本。建议在不同场合再录 1–2 次以提高稳定性。")
     _reindex_after_enroll(cfg, db)
+    return 0
+
+
+def _force_kwargs(args: argparse.Namespace) -> dict[str, Any]:
+    """{"force": True} only when --force was given (engines without the keyword keep working)."""
+    return {"force": True} if getattr(args, "force", False) else {}
+
+
+SAMPLE_ORIGIN_LABELS = {"mic": "麦克风", "file": "文件", "label": "标记", "voice": "声音组", "cluster": "簇"}
+
+
+def cmd_speakers_audit(cfg: Config, args: argparse.Namespace) -> int:
+    """Table of every enrolled sample with its consistency to the person's other samples; --fix deletes
+    the outliers (samples that probably hold somebody else's voice)."""
+    from .speech.speakers import audit_samples, sample_consistency_min
+
+    db = _db(cfg)
+    min_cos = sample_consistency_min(cfg)
+    speakers = db.query("SELECT id, name FROM speakers ORDER BY is_self DESC, name")
+    t = Table(title=f"声纹样本一致性（阈值 {min_cos:.2f}）")
+    for col in ("人", "样本", "来源", "时长", "一致性", "离群"):
+        t.add_column(col)
+    outliers: list[tuple[int, str, int]] = []
+    ambiguous: list[str] = []
+    total = 0
+    for sp in speakers:
+        rows = audit_samples(db, int(sp["id"]), min_cos)
+        if any(a["ambiguous"] for a in rows):
+            ambiguous.append(sp["name"])
+        for a in rows:
+            total += 1
+            cons = "-" if a["consistency"] is None else f"{a['consistency']:.2f}"
+            flag = "[red]是[/red]" if a["outlier"] else ("[yellow]歧义[/yellow]" if a["ambiguous"] else "")
+            if a["outlier"]:
+                outliers.append((int(sp["id"]), sp["name"], int(a["id"])))
+            src = Path(str(a["source_path"]).split("#")[0]).name if a["source_path"] else "（扫描时保存的声纹）"
+            dur = f"{float(a['duration_s']):.1f}s" if a["duration_s"] is not None else "-"
+            t.add_row(sp["name"], f"#{a['id']} {src}", SAMPLE_ORIGIN_LABELS.get(a.get("origin") or "", "-"), dur, cons, flag)
+    console.print(t)
+    if not total:
+        console.print("（没有样本）")
+        return 0
+    if ambiguous:
+        console.print(f"[yellow]{'、'.join(ambiguous)} 的样本分成两组互不相像，没有麦克风 / 文件样本可以判断哪组才是本人："
+                      "请在说话人页试听后删掉不是 TA 的（或用 speakers record 录一段作为基准）。[/yellow]")
+    if not outliers:
+        if not ambiguous:
+            console.print("所有样本都和同一人的其他样本一致。")
+        return 0
+    names = sorted({n for _, n, _ in outliers})
+    console.print(f"[yellow]{len(outliers)} 个样本和其他样本不像（可能混了别人的声音）：{'、'.join(names)}[/yellow]")
+    if not getattr(args, "fix", False):
+        console.print("删除它们：audio-note speakers audit --fix")
+        return 0
+    ids = [e for _, _, e in outliers]
+    cur = db.execute(f"DELETE FROM speaker_embeddings WHERE id IN ({','.join('?' * len(ids))})", ids)
+    console.print(f"已删除 {int(cur.rowcount or 0)} 个离群样本。")
+    for sp in speakers:
+        left = db.one("SELECT COUNT(*) AS n FROM speaker_embeddings WHERE speaker_id=?", (int(sp["id"]),))
+        if sp["name"] in names and left and int(left["n"]) == 0:
+            console.print(f"[yellow]{sp['name']} 已没有样本：在说话人页重新标记一段，或 speakers enroll 补充。[/yellow]")
     return 0
 
 
@@ -905,11 +973,15 @@ def cmd_speakers_voices(cfg: Config, args: argparse.Namespace) -> int:
     console.print(f"第 {idx} 组 = 编号 {g.get('key', '')}（{g.get('utterances', 0)} 句）")
     try:
         out = voices.name_voice(db, cfg, engine(), g["members"], args.name, is_self=bool(args.self),
-                                relation=(args.relation or "").strip() or None)
+                                relation=(args.relation or "").strip() or None, **_force_kwargs(args))
     except ValueError as e:
-        raise CLIError(str(e)) from e
+        raise CLIError(str(e) + ("" if getattr(args, "force", False) or "不像" not in str(e) else "（命令行用 --force）")) from e
     console.print(f"已标记为 [bold]{out['name']}[/bold] (id {out['id']})：{out['utterances_assigned']} 句，"
                   f"补充 {out['samples_added']} 个声纹样本（{len(out['segments'])} 段 / {len(out['days'])} 天）。")
+    if out.get("samples_rejected"):
+        console.print(f"[yellow]{out['samples_rejected']} 个样本和 {out['name']} 已有的样本不像，没有加入（确定是同一个人可加 --force）。[/yellow]")
+    if out.get("members_inconsistent"):
+        console.print(f"[yellow]这组里有 {out['members_inconsistent']} 段声音和其他成员不像，没有用来做样本。[/yellow]")
     if out.get("samples_from_clusters"):
         console.print(f"这组的录音已过期，{out['samples_from_clusters']} 个样本直接取自扫描时保存的声纹。")
     if out.get("skipped_user_labels"):
@@ -919,7 +991,9 @@ def cmd_speakers_voices(cfg: Config, args: argparse.Namespace) -> int:
     if args.relation:
         console.print(f"关系：{args.relation}")
     _reindex_after_enroll(cfg, db)
-    left = voices.unknown_utterance_count(db)
+    from .audio.loudness import min_speech_dbfs
+
+    left = voices.unknown_utterance_count(db, min_speech_dbfs(cfg))
     if left and out["samples_added"]:
         console.print(f"还有 {left} 句未识别：audio-note speakers relabel 可用新声纹重新识别其他记录。")
     return 0
@@ -1011,9 +1085,15 @@ def cmd_speakers_label(cfg: Config, args: argparse.Namespace) -> int:
         raise CLIError("--to 必须大于 --from")
     engine = SpeakerEngine(cfg)
     try:
-        sid = engine.enroll_from_segment_turns(db, args.name, path, [(a, b)])
+        min_s = float(cfg.speakers.get("min_label_sample_s", 2.5))
+    except (TypeError, ValueError, AttributeError):
+        min_s = 2.5
+    try:
+        sid = engine.enroll_from_segment_turns(db, args.name, path, [(a, b)], min_speech_s=min_s, **_force_kwargs(args))
     except ValueError as e:
-        raise CLIError(str(e)) from e
+        if getattr(e, "min_s", None) is not None:       # speakers.TooShortSample (checked by attribute: tests stub the module)
+            raise CLIError(f"{e}（命令行的 label 只能提取声纹，请选 ≥ {min_s:g} 秒语音的范围，或在界面的「记录」页标记这句）") from e
+        raise CLIError(str(e) + ("" if getattr(args, "force", False) or "不像" not in str(e) else "（命令行用 --force）")) from e
     console.print(f"已把 {path.name} 的 {a:.1f}s–{b:.1f}s 标记为 {args.name} (id {sid})。")
     if getattr(args, "self", False):
         db.set_self_speaker(int(sid))
@@ -1174,6 +1254,66 @@ def cmd_cleanup(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_loudness(cfg: Config, args: argparse.Namespace) -> int:
+    """Speech level of the stored sentences: fill in the missing loudness_db (reads the audio), print the
+    distribution per speaker and how many sentences fall below audio.min_speech_dbfs; `--apply --yes` deletes
+    those (far-away voices recorded before the gate existed) and rewrites the day's Markdown."""
+    from .audio.loudness import backfill_loudness, loudness_stats, min_speech_dbfs
+
+    db = _db(cfg)
+    day = _parse_day(args.day) if args.day else None
+    thr = min_speech_dbfs(cfg)
+    computed = backfill_loudness(db, day=day)
+    if computed:
+        console.print(f"补算了 {computed} 句的音量。")
+    st = loudness_stats(db, thr, day=day, unknown_label=str(cfg.speakers.unknown_label or "未知"))
+    title = "每句音量分布（dBFS）" + (f"，门槛 {thr:g}" if thr is not None else "，门槛已关闭") + (f"，{day}" if day else "")
+    t = Table(title=title)
+    for col in ("人", "句数", "中位", "p10", "p90", "低于门槛"):
+        t.add_column(col)
+    for s in st["speakers"]:
+        t.add_row(s["name"], str(s["n"]), f"{s['median']:.0f}", f"{s['p10']:.0f}", f"{s['p90']:.0f}", str(s["below"]))
+    console.print(t)
+    if not st["total"]:
+        console.print("（没有记录）")
+        return 0
+    if st["missing"]:
+        console.print(f"[yellow]{st['missing']} 句的音频已删除，算不出音量。[/yellow]")
+    if thr is None:
+        console.print("audio.min_speech_dbfs 为 null（关闭），不会过滤。")
+        return 0
+    console.print(f"{st['below']} 句低于 {thr:g} dBFS（远处 / 不清晰的声音）。")
+    if not getattr(args, "apply", False):
+        if st["below"]:
+            console.print("删除它们：audio-note loudness --apply --yes（手动标过说话人的句子不删）")
+        return 0
+    rows = db.query("SELECT id, day FROM utterances WHERE loudness_db IS NOT NULL AND loudness_db < ?"
+                    " AND (speaker_source IS NULL OR speaker_source<>'user')" + (" AND day=?" if day else ""),
+                    (float(thr), day) if day else (float(thr),))
+    if not rows:
+        console.print("没有可删除的句子（低于门槛的都是手动标过的）。")
+        return 0
+    console.print(f"将删除 {len(rows)} 句（文字、索引和向量一起删除，音频不动）。")
+    if not getattr(args, "yes", False):
+        console.print("[yellow]确认请加 --yes。[/yellow]")
+        return 1
+    ids = [int(r["id"]) for r in rows]
+    days = sorted({str(r["day"]) for r in rows})
+    deleted = 0
+    for k in range(0, len(ids), 500):
+        chunk = ids[k:k + 500]
+        cur = db.execute(f"DELETE FROM utterances WHERE id IN ({','.join('?' * len(chunk))})", chunk)
+        deleted += int(cur.rowcount or 0)
+    write_day_markdown = _lazy("speech.pipeline", "write_day_markdown")
+    for d in days:
+        try:
+            write_day_markdown(db, cfg, d)
+        except Exception as e:  # noqa: BLE001
+            log.warning("cannot write markdown for %s: %s", d, e)
+    console.print(f"已删除 {deleted} 句，重写了 {len(days)} 天的记录文件。")
+    return 0
+
+
 def cmd_init(cfg: Config, args: argparse.Namespace) -> int:
     """Create the root config.yaml (the file every profile inherits from) unless --config names another."""
     path = Path(args.config) if args.config else PROJECT_ROOT / "config.yaml"
@@ -1265,6 +1405,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("name")
     s.add_argument("files", nargs="+", help="wav/mp3/... 样本文件")
     s.add_argument("--notes", default=None)
+    s.add_argument("--force", action="store_true", help="样本和此人已有样本不像时仍然加入")
     s.set_defaults(func=cmd_speakers_enroll)
     s = ssub.add_parser("record", help="用麦克风现场录一段样本并注册说话人（注册自己最方便）")
     s.add_argument("name")
@@ -1281,12 +1422,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--dur", type=float, default=None, metavar="S", help="配合 --at：从该句开始取多少秒（默认取整句）")
     s.add_argument("--self", dest="self", action="store_true", help="这个人就是我（本人）")
     s.add_argument("--relation", default=None, metavar="R", help="和本人的关系，如 同事 / 朋友 / 领导")
+    s.add_argument("--force", action="store_true", help="这段声音和此人已有样本不像时仍然加入")
     s.set_defaults(func=cmd_speakers_label)
     s = ssub.add_parser("voices", help="列出记录里还没认出来的声音（按声音分组），--assign 给一组起名字")
     s.add_argument("--assign", default=None, metavar="N|编号", help="给第 N 组（或编号为 N 的组）命名；序号和编号见不带参数的输出")
     s.add_argument("name", nargs="?", default=None, help="配合 --assign：这组声音是谁")
     s.add_argument("--self", dest="self", action="store_true", help="配合 --assign：这组声音是我自己")
     s.add_argument("--relation", default=None, metavar="R", help="配合 --assign：和本人的关系")
+    s.add_argument("--force", action="store_true", help="配合 --assign：这组声音和此人已有样本不像时仍然加入")
     s.set_defaults(func=cmd_speakers_voices)
     ssub.add_parser("scan", help="只扫描还没分析过声音的录音段（voices 会自动做）").set_defaults(func=cmd_speakers_scan)
     s = ssub.add_parser("set-self", help="标出哪位说话人是本人（日报 / 问答以本人视角）")
@@ -1306,6 +1449,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--segment", type=int, default=None, help="只处理某个 segment id")
     s.set_defaults(func=cmd_speakers_relabel)
     ssub.add_parser("calibrate", help="根据注册样本估计识别阈值").set_defaults(func=cmd_speakers_calibrate)
+    s = ssub.add_parser("audit", help="检查每个声纹样本和同一人其他样本是否一致（--fix 删除离群样本）")
+    s.add_argument("--fix", action="store_true", help="删除离群样本")
+    s.set_defaults(func=cmd_speakers_audit)
 
     s = sub.add_parser("daily", help="生成（并推送）某天的日报")
     s.add_argument("--day", default=None, help="YYYY-MM-DD，默认今天")
@@ -1330,6 +1476,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_reindex)
 
     sub.add_parser("cleanup", help="清理无语音/过期音频").set_defaults(func=cmd_cleanup)
+    s = sub.add_parser("loudness", help="每句音量分布；--apply --yes 删除低于 audio.min_speech_dbfs 的句子（远处的声音）")
+    s.add_argument("--day", default=None, help="只看 / 只处理某天 YYYY-MM-DD")
+    s.add_argument("--apply", action="store_true", help="删除低于门槛且没有手动标过说话人的句子，并重写当天记录")
+    s.add_argument("--yes", "-y", action="store_true", help="配合 --apply：确认删除")
+    s.set_defaults(func=cmd_loudness)
     pp = sub.add_parser("profile", help="档案：给不同的人 / 用途分开的录音、记录和说话人")
     psub = pp.add_subparsers(dest="profile_cmd", metavar="<sub>")
     psub.required = True

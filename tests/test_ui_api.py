@@ -250,7 +250,7 @@ def test_audio_utterance_returns_padded_wav_and_404_when_file_gone(client: TestC
     uid = seed["ids"][1]                                   # 1.0s-2.0s of a 5 s file
     r = client.get(f"/api/audio/utterance/{uid}", params={"pad": 0.5})
     assert r.status_code == 200 and r.headers["content-type"] == "audio/wav"
-    assert r.headers["cache-control"] == "private, max-age=3600"
+    assert r.headers["cache-control"] == "no-store"       # v3b: utterance ids get reused by splits, never cache the clip
     assert _wav_len(r.content) == int(2.0 * SR)           # 0.5 .. 2.5
     assert _wav_len(client.get(f"/api/audio/utterance/{uid}", params={"pad": 0}).content) == SR
     assert _wav_len(client.get(f"/api/audio/utterance/{uid}", params={"pad": 99}).content) == 5 * SR     # pad capped, clipped to file
@@ -455,8 +455,9 @@ def test_speaker_label_error_cases(client: TestClient, rt: Runtime):
     r = post({"name": "甲", "segment_id": 999, "from": 0, "to": 1})
     assert r.status_code == 404 and "已不存在" in r.json()["error"]
     assert post({"name": "甲", "utterance_id": gone_uid}).status_code == 404
-    r = post({"name": "甲", "utterance_id": uid})                               # 0.3 s: too little speech
-    assert r.status_code == 400 and "语音" in r.json()["error"]
+    r = post({"name": "甲", "utterance_id": uid})                               # 0.3 s: too little speech for a sample,
+    assert r.status_code == 200 and r.json()["samples"] == 0 and "语音" in r.json()["sample_note"]   # but the sentence is assigned
+    assert r.json()["assigned"] == 1 and rt.db.one("SELECT speaker_name, speaker_source FROM utterances WHERE id=?", (uid,))["speaker_name"] == "甲"
     assert rt.db.one("SELECT COUNT(*) AS n FROM speaker_embeddings")["n"] == 0
 
 

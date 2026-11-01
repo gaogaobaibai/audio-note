@@ -162,3 +162,32 @@ def test_enroll_from_files_skips_short_speech(speaker_engine, db, tmp_path):
     sid = speaker_engine.enroll(db, "赵六", [p])
     assert db.one("SELECT name FROM speakers WHERE id=?", (sid,))["name"] == "赵六"
     assert db.speaker_embeddings() == []  # 0.5 s < 1.0 s speech -> skipped
+
+
+# ---------------------------------------------------------------------------
+# v3: sample consistency + turn-level identification (docs/SPEC_speakers_v3_mixed.md; more in tests/test_mixed_speakers.py)
+# ---------------------------------------------------------------------------
+
+def test_enroll_from_audio_mismatch_is_a_value_error_with_force_override(speaker_engine, db):
+    from audio_note.speech.speakers import SampleMismatch
+
+    sid = speaker_engine.enroll_from_audio(db, "周七", noise(3.0, amp=0.1, seed=42), source="a")
+    with pytest.raises(ValueError) as ex:                                   # SampleMismatch subclasses ValueError
+        speaker_engine.enroll_from_audio(db, "周七", chirp(3.0), source="b")
+    assert isinstance(ex.value, SampleMismatch) and ex.value.name == "周七" and 0 <= ex.value.score < 0.5
+    assert len(db.speaker_embeddings()) == 1
+    assert speaker_engine.enroll_from_audio(db, "周七", chirp(3.0), source="b", force=True) == sid
+    assert len(db.speaker_embeddings()) == 2
+
+
+def test_identify_turns_turn_level_pass_splits_a_mixed_cluster(speaker_engine, db):
+    """chirp enrolled as A; a noise turn in the same cluster becomes an unknown turn in a new cluster, and the
+    reverse: a chirp turn inside an unknown (noise) cluster is recognised as A."""
+    a = db.upsert_speaker("A")
+    db.add_speaker_embedding(a, speaker_engine.embed(chirp(3.0)), None, 3.0)
+    out = speaker_engine.identify_turns(np.concatenate([chirp(3.0), noise(3.0, amp=0.1, seed=42)]), [Turn(0.0, 3.0, 0), Turn(3.0, 6.0, 0)], db)
+    assert (out[0].speaker_id, out[1].speaker_id) == (a, None) and out[0].cluster != out[1].cluster and max(t.cluster for t in out) == 1
+    out = speaker_engine.identify_turns(np.concatenate([noise(3.0, amp=0.1, seed=42), chirp(2.0), noise(3.0, amp=0.1, seed=43)]),
+                                        [Turn(0.0, 3.0, 0), Turn(3.0, 5.0, 0), Turn(5.0, 8.0, 0)], db)
+    assert [t.speaker_id for t in out] == [None, a, None] and out[1].cluster != out[0].cluster
+    assert out[0].cluster == out[2].cluster

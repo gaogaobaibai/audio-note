@@ -7,13 +7,15 @@ only (no auth): ui.host must stay 127.0.0.1.
 
 Endpoints (see the handlers for parameters)
   status / service        GET /api/status   POST /api/recording/{start,stop}   POST /api/service/{start,stop}
-  jobs                    GET /api/jobs     POST /api/jobs/{name}   (process, daily, cleanup, reindex, relabel, push, voices, relations)
+  jobs                    GET /api/jobs     POST /api/jobs/{name}   (process, daily, cleanup, reindex, relabel, push, voices, relations, loudness)
   transcripts             GET /api/days  /api/transcript/{day}  /api/search  /api/context/{id}  /api/segments
   audio                   GET /api/audio/utterance/{id}  /api/audio/segment/{id}?from=&to=
   daily digests / notes   GET /api/daily  /api/daily/{day}   GET,DELETE /api/notes
-  speakers                GET /api/speakers  POST /api/speakers/{name}/samples  POST /api/speakers/label
-                          PATCH,DELETE /api/speakers/{id}  DELETE /api/speakers/samples/{id}  POST /api/speakers/calibrate
+  speakers                GET /api/speakers  POST /api/speakers/{name}/samples?force=  POST /api/speakers/label
+                          PATCH,DELETE /api/speakers/{id}  GET /api/speakers/{id}/samples  DELETE /api/speakers/samples/{id}
+                          DELETE /api/speakers/{id}/samples/outliers  POST /api/speakers/calibrate
   unknown voices          GET /api/voices   POST /api/voices/name   (name a group of not-yet-identified voices)
+  mixed utterances        POST /api/utterances/{id}/split {auto | at: [s, ...]}   GET /api/utterances/{id}/preview-split?auto=1
   memory chat             POST /api/chat   (NDJSON stream: tool / answer / error / ping events)
   settings                GET,PUT /api/config   GET,PUT /api/glossary   GET /api/devices   POST /api/config/test-api
                           POST /api/push/test   GET /api/logs   POST /api/import
@@ -52,10 +54,11 @@ DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 EDITABLE: dict[str, set[str]] = {
     "mimo": {"api_key", "base_url", "chat_model", "analysis_model", "asr_model", "asr_language", "asr_concurrency"},
     "audio": {"device", "vad_threshold", "min_silence_s", "min_speech_s", "max_segment_s", "gain", "codec",
-              "system_audio", "system_device", "system_gain"},
+              "system_audio", "system_device", "system_gain", "min_speech_dbfs"},
     "storage": {"cleanup_enabled", "keep_audio_days", "max_disk_gb"},
     "speakers": {"identify_threshold", "cluster_threshold", "unknown_label", "num_threads",
-                 "voice_group_threshold", "infer_relations", "relation_min_utterances", "relation_min_confidence"},
+                 "voice_group_threshold", "infer_relations", "relation_min_utterances", "relation_min_confidence",
+                 "sample_consistency_min", "turn_check_min_s", "turn_reject_margin", "min_label_sample_s"},
     "correction": {"enabled"},
     "pipeline": {"process_interval_min", "min_segment_age_s"},
     "memory": {"strategy", "retrieval", "query_expansion", "prefetch_k", "chat_model", "max_tool_rounds", "embedding_model"},
@@ -79,15 +82,20 @@ _CHOICES: dict[tuple[str, ...], tuple[str, ...]] = {
 _RANGES: dict[tuple[str, ...], tuple[float, float]] = {
     ("audio", "vad_threshold"): (0.0, 1.0), ("audio", "min_silence_s"): (0.2, 60.0), ("audio", "min_speech_s"): (0.0, 10.0),
     ("audio", "max_segment_s"): (10.0, 3600.0), ("audio", "gain"): (0.05, 50.0), ("audio", "system_gain"): (0.05, 50.0),
+    ("audio", "min_speech_dbfs"): (-90.0, 0.0),
     ("storage", "keep_audio_days"): (0, 100000), ("storage", "max_disk_gb"): (0, 100000),
     ("speakers", "identify_threshold"): (0.0, 1.0), ("speakers", "cluster_threshold"): (0.0, 1.0), ("speakers", "num_threads"): (1, 64),
     ("speakers", "voice_group_threshold"): (0.0, 1.0), ("speakers", "relation_min_utterances"): (1, 1000),
-    ("speakers", "relation_min_confidence"): (0.0, 1.0),
+    ("speakers", "relation_min_confidence"): (0.0, 1.0), ("speakers", "sample_consistency_min"): (0.0, 1.0),
+    ("speakers", "turn_check_min_s"): (0.0, 60.0), ("speakers", "turn_reject_margin"): (0.0, 1.0),
+    ("speakers", "min_label_sample_s"): (1.0, 60.0),
     ("pipeline", "process_interval_min"): (1, 1440), ("pipeline", "min_segment_age_s"): (0, 3600),
     ("mimo", "asr_concurrency"): (1, 32), ("memory", "prefetch_k"): (1, 100), ("memory", "max_tool_rounds"): (0, 50),
     ("analysis", "session_gap_min"): (1, 1440), ("analysis", "catchup_days"): (1, 365), ("ui", "port"): (1024, 65535),
 }
 _PUSH_CHANNELS = ("toast", "feishu", "wecom", "serverchan", "pushplus", "wxpusher", "ntfy")
+#: numeric settings that may also be null (= feature off); an empty form field means null
+_NULLABLE = {("audio", "min_speech_dbfs")}
 
 
 def _default_for(path: tuple[str, ...]) -> Any:
@@ -126,6 +134,8 @@ def coerce_setting(path: tuple[str, ...], value: Any) -> Any:
         if not isinstance(value, list):
             raise HTTPException(400, f"{dotted} 必须是列表")
         return [str(v) for v in value]
+    if path in _NULLABLE and (value is None or (isinstance(value, str) and not value.strip())):
+        return None
     if path in (("audio", "device"), ("audio", "system_device")):
         if value is None or value == "":
             return None
@@ -194,6 +204,44 @@ def _err(status: int, msg: str) -> JSONResponse:
     return JSONResponse({"error": msg}, status_code=status)
 
 
+def _value_error_http(e: Exception, status: int = 400) -> HTTPException:
+    """ValueError -> HTTPException(400, message); a SampleMismatch carries "mismatch": true plus the score so
+    the page can offer "仍然加入" (the handler passes a dict detail through as the JSON body)."""
+    from ..speech.speakers import SampleMismatch
+
+    if isinstance(e, SampleMismatch):
+        return HTTPException(status, {"error": str(e), "mismatch": True, "score": round(e.score, 3),
+                                      "threshold": e.threshold, "name": e.name})
+    return HTTPException(status, str(e))
+
+
+def _force_kwargs(force: Any) -> dict[str, Any]:
+    """`force=True` only when asked, so engines without the keyword (older fakes) keep working."""
+    return {"force": True} if force else {}
+
+
+def _force_arg(v: Any) -> bool:
+    """A `force` flag from a body / query: JSON true / false / 0 / 1 (or those as text); anything else is 400."""
+    if v is None:
+        return False
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, int) and v in (0, 1):
+        return bool(v)
+    if isinstance(v, str) and v.strip().lower() in ("true", "false", "0", "1"):
+        return v.strip().lower() in ("true", "1")
+    raise HTTPException(400, "force 应为 true/false")
+
+
+def _loudness_of(r: Any) -> float | None:
+    """utterances.loudness_db of a row, rounded for display (None when not computed / column absent)."""
+    try:
+        v = r["loudness_db"]
+    except (IndexError, KeyError):
+        return None
+    return round(float(v), 1) if v is not None else None
+
+
 def _hint(secret: str | None) -> str:
     s = str(secret or "")
     if not s:
@@ -209,7 +257,7 @@ def _utt_dict(r: Any, unknown: str, audio_ok: bool | None = None) -> dict[str, A
         "time": (r["abs_start"] or "")[11:19], "start_s": float(r["start_s"]), "end_s": float(r["end_s"]),
         "speaker": r["speaker_name"] or unknown, "speaker_id": r["speaker_id"],
         "score": round(float(r["speaker_score"]), 3) if r["speaker_score"] is not None else None,
-        "text": text, "cluster": r["cluster_label"],
+        "text": text, "cluster": r["cluster_label"], "loudness_db": _loudness_of(r),
     }
     if raw and raw != text:
         d["text_raw"] = raw
@@ -299,6 +347,10 @@ def create_app(rt_or_holder: Runtime | RuntimeHolder) -> FastAPI:
 
     @app.exception_handler(HTTPException)
     async def _http_error(request: Request, exc: HTTPException):
+        if isinstance(exc.detail, dict):
+            body = dict(exc.detail)
+            body["error"] = str(body.get("error") or "")
+            return JSONResponse(body, status_code=exc.status_code)
         return _err(exc.status_code, str(exc.detail))
 
     @app.exception_handler(Exception)
@@ -505,8 +557,11 @@ def create_app(rt_or_holder: Runtime | RuntimeHolder) -> FastAPI:
         for r in db.query("SELECT speaker_name, COUNT(*) AS n FROM utterances WHERE day=? GROUP BY speaker_name", (day,)):
             counts[r["speaker_name"] or unk] = int(r["n"])
         md = rt.cfg.transcripts_dir / f"{day}.md"
+        from ..audio.loudness import min_speech_dbfs
+
         return {"day": day, "sessions": out_sessions, "segments": segs, "speakers": counts,
-                "markdown_path": str(md) if md.exists() else None, "unknown_label": unk}
+                "markdown_path": str(md) if md.exists() else None, "unknown_label": unk,
+                "min_speech_dbfs": min_speech_dbfs(rt.cfg)}
 
     @app.get("/api/segments")
     def segments(status: str | None = None, day: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
@@ -577,7 +632,8 @@ def create_app(rt_or_holder: Runtime | RuntimeHolder) -> FastAPI:
             raise HTTPException(404, "没有这条记录")
         pad = max(0.0, min(float(pad), 5.0))
         data = _segment_audio(int(u["segment_id"]), float(u["start_s"]) - pad, float(u["end_s"]) + pad)
-        return Response(data, media_type="audio/wav", headers={"Cache-Control": "private, max-age=3600"})
+        # utterance ids are reused by splits / re-processing: never let the browser play a stale clip
+        return Response(data, media_type="audio/wav", headers={"Cache-Control": "no-store"})
 
     @app.get("/api/audio/segment/{seg_id}")
     def audio_segment(seg_id: int, start: float = Query(0.0, alias="from"), end: float = Query(0.0, alias="to")) -> Response:
@@ -651,11 +707,21 @@ def create_app(rt_or_holder: Runtime | RuntimeHolder) -> FastAPI:
             " FROM speakers s LEFT JOIN speaker_embeddings e ON e.speaker_id=s.id GROUP BY s.id ORDER BY s.name")
         counts = {r["speaker_id"]: int(r["n"]) for r in rt.db.query(
             "SELECT speaker_id, COUNT(*) AS n FROM utterances WHERE speaker_id IS NOT NULL GROUP BY speaker_id")}
-        return [{"id": int(r["id"]), "name": r["name"], "notes": r["notes"] or "", "created_at": r["created_at"],
-                 "samples": int(r["samples"]), "duration_s": round(float(r["dur"]), 1), "utterances": counts.get(r["id"], 0),
-                 "is_self": bool(r["is_self"]), "relation": r["relation"], "relation_source": r["relation_source"],
-                 "relation_note": r["relation_note"]}
-                for r in rows]
+        out = []
+        for r in rows:
+            audit = _audit(int(r["id"])) if int(r["samples"]) > 1 else []
+            out.append({"id": int(r["id"]), "name": r["name"], "notes": r["notes"] or "", "created_at": r["created_at"],
+                        "samples": int(r["samples"]), "duration_s": round(float(r["dur"]), 1), "utterances": counts.get(r["id"], 0),
+                        "is_self": bool(r["is_self"]), "relation": r["relation"], "relation_source": r["relation_source"],
+                        "relation_note": r["relation_note"],
+                        "outlier_samples": sum(1 for a in audit if a["outlier"]),
+                        "ambiguous_samples": sum(1 for a in audit if a["ambiguous"])})
+        return out
+
+    def _audit(sid: int) -> list[dict[str, Any]]:
+        from ..speech.speakers import audit_samples, sample_consistency_min
+
+        return audit_samples(rt.db, int(sid), sample_consistency_min(rt.cfg))
 
     def _assign_utterances(sid: int, name: str, seg_id: int, ids: list[int], whole_cluster: bool) -> tuple[int, int]:
         """Hand-label utterances (speaker_source='user': relabel leaves them alone). With whole_cluster every
@@ -713,10 +779,11 @@ def create_app(rt_or_holder: Runtime | RuntimeHolder) -> FastAPI:
     @app.get("/api/speakers")
     def speakers_list() -> dict[str, Any]:
         from ..analysis.relations import RELATION_CHOICES
+        from ..audio.loudness import min_speech_dbfs
+        from ..speech.voices import unknown_utterance_count
 
-        unk = rt.db.one("SELECT COUNT(*) AS n FROM utterances WHERE speaker_id IS NULL")
         me = rt.db.self_speaker()
-        return {"speakers": _speakers(), "unknown_utterances": int(unk["n"]) if unk else 0,
+        return {"speakers": _speakers(), "unknown_utterances": unknown_utterance_count(rt.db, min_speech_dbfs(rt.cfg)),
                 "identify_threshold": float(rt.cfg.speakers.identify_threshold), "unknown_label": unknown(),
                 "self_id": int(me["id"]) if me else None, "relation_choices": list(RELATION_CHOICES)}
 
@@ -746,15 +813,16 @@ def create_app(rt_or_holder: Runtime | RuntimeHolder) -> FastAPI:
         is_self = bool(body.get("is_self", False))
         relation = body.get("relation")
         relation = str(relation).strip() if relation is not None else None
+        force = _force_arg(body.get("force"))
         if rt.speaker_models_missing():
             raise HTTPException(400, VOICE_MODELS_MISSING_MSG)
         db = rt.db
         with rt.busy():                      # a profile switch waits (JobError -> 409) instead of closing the DB under us
             try:
                 res = await _to_thread(lambda: voices.name_voice(db, rt.cfg, rt.engine(), members, name,
-                                                                 is_self=is_self, relation=relation or None))
+                                                                 is_self=is_self, relation=relation or None, force=force))
             except ValueError as e:
-                raise HTTPException(400, str(e))
+                raise _value_error_http(e)
             extra = await _to_thread(_after_enroll)
         relabel_started = False
         if body.get("auto_relabel", True):
@@ -769,14 +837,35 @@ def create_app(rt_or_holder: Runtime | RuntimeHolder) -> FastAPI:
 
     @app.get("/api/speakers/{sid}/samples")
     def speaker_samples(sid: int) -> list[dict[str, Any]]:
-        rows = rt.db.query("SELECT id, source_path, duration_s, created_at FROM speaker_embeddings WHERE speaker_id=? ORDER BY id", (int(sid),))
+        rows = rt.db.query("SELECT id, source_path, duration_s, created_at, origin FROM speaker_embeddings WHERE speaker_id=? ORDER BY id",
+                           (int(sid),))
+        audit = {a["id"]: a for a in _audit(int(sid))} if rows else {}
         out = []
         for r in rows:
             d = dict(r)
             d["file"] = Path(str(d["source_path"]).split("#")[0]).name if d["source_path"] else ""
             d["audio"] = bool(d["source_path"]) and Path(str(d["source_path"]).split("#")[0]).exists()
+            a = audit.get(int(r["id"])) or {}
+            d["consistency"] = a.get("consistency")
+            d["outlier"] = bool(a.get("outlier", False))
+            d["ambiguous"] = bool(a.get("ambiguous", False))
             out.append(d)
         return out
+
+    @app.delete("/api/speakers/{sid}/samples/outliers")
+    def speaker_delete_outlier_samples(sid: int) -> dict[str, Any]:
+        """Remove every sample of the speaker that does not resemble the others (speakers.sample_consistency_min).
+        The speaker row stays even when no sample is left."""
+        db = rt.db
+        if db.one("SELECT id FROM speakers WHERE id=?", (int(sid),)) is None:
+            raise HTTPException(404, "没有这个说话人")
+        bad = [a["id"] for a in _audit(int(sid)) if a["outlier"]]
+        deleted = 0
+        if bad:
+            cur = db.execute(f"DELETE FROM speaker_embeddings WHERE speaker_id=? AND id IN ({','.join('?' * len(bad))})", [int(sid), *bad])
+            deleted = int(cur.rowcount or 0)
+        left = db.one("SELECT COUNT(*) AS n FROM speaker_embeddings WHERE speaker_id=?", (int(sid),))
+        return {"ok": True, "deleted": deleted, "remaining": int(left["n"]) if left else 0}
 
     @app.get("/api/speakers/samples/{emb_id}/audio")
     def speaker_sample_audio(emb_id: int) -> Response:
@@ -806,10 +895,12 @@ def create_app(rt_or_holder: Runtime | RuntimeHolder) -> FastAPI:
         return {"ok": True, "deleted": int(cur.rowcount or 0)}
 
     @app.post("/api/speakers/{name}/samples")
-    async def speaker_add_sample(name: str, request: Request, filename: str = "sample.webm", notes: str | None = None) -> dict[str, Any]:
+    async def speaker_add_sample(name: str, request: Request, filename: str = "sample.webm", notes: str | None = None,
+                                 force: str | None = None) -> dict[str, Any]:
         name = name.strip()
         if not name:
             raise HTTPException(400, "姓名不能为空")
+        force = _force_arg(force)
         data = await request.body()
         if len(data) < 1000:
             raise HTTPException(400, "没有收到音频数据")
@@ -826,19 +917,46 @@ def create_app(rt_or_holder: Runtime | RuntimeHolder) -> FastAPI:
             tmp.write_bytes(data)
             before = db.one("SELECT COUNT(*) AS n FROM speaker_embeddings e JOIN speakers s ON s.id=e.speaker_id WHERE s.name=?", (name,))
             n0 = int(before["n"]) if before else 0
-            sid = rt.engine().enroll(db, name, [tmp], notes)
+            sid = rt.engine().enroll(db, name, [tmp], notes, **_force_kwargs(force))
             after = db.one("SELECT COUNT(*) AS n, COALESCE(MAX(duration_s),0) AS last FROM speaker_embeddings WHERE speaker_id=?", (sid,))
             return sid, n0, int(after["n"]) if after else 0, float(after["last"]) if after else 0.0
+
+        def mismatch_of_upload() -> HTTPException | None:
+            """enroll() skips a mismatching file silently: re-check it so the page can offer "仍然加入"."""
+            engine = rt.engine()
+            try:
+                from ..audio.importer import decode_any
+                from ..speech.speakers import MIN_ENROLL_SPEECH_S, SampleMismatch, sample_consistency_min
+                from ..audio.vad import SAMPLE_RATE
+
+                row = db.one("SELECT id FROM speakers WHERE name=?", (name,))
+                if row is None:
+                    return None
+                speech = engine.speech_only(decode_any(tmp))
+                if len(speech) / SAMPLE_RATE < MIN_ENROLL_SPEECH_S:
+                    return None
+                score, ok = engine.check_sample(db, int(row["id"]), engine.embed(speech))
+                if ok or score is None:
+                    return None
+                return _value_error_http(SampleMismatch(name, float(score), sample_consistency_min(rt.cfg)))
+            except Exception as e:  # noqa: BLE001 - diagnostics only
+                log.debug("mismatch re-check failed: %s", e)
+                return None
 
         with rt.busy():
             try:
                 sid, n0, n1, last = await _to_thread(enroll)
+                exc = None
+                if n1 <= n0 and n0 > 0 and not force:
+                    exc = await _to_thread(mismatch_of_upload)
             finally:
                 try:
                     tmp.unlink()
                 except OSError:
                     pass
             if n1 <= n0:
+                if exc is not None:
+                    raise exc
                 if n1 == 0 and not existed:
                     # a brand-new speaker row without samples is useless and confusing: remove it again
                     # (a pre-existing speaker keeps its row: utterances still carry its id and name)
@@ -874,12 +992,22 @@ def create_app(rt_or_holder: Runtime | RuntimeHolder) -> FastAPI:
         seg = db.get_segment(seg_id)
         if seg is None or not Path(seg["path"]).exists():
             raise HTTPException(404, "这段音频已不存在（超过保留期），无法取声纹")
+        force_kw = _force_kwargs(_force_arg(body.get("force")))
+        sample_note: str | None = None
         with rt.busy():
             try:
+                from ..speech.speakers import TooShortSample, min_label_sample_s
+
                 seg_path = Path(seg["path"])
-                sid = await _to_thread(lambda: rt.engine().enroll_from_segment_turns(db, name, seg_path, [(a, b)]))
+                min_s = min_label_sample_s(rt.cfg)
+                sid = await _to_thread(lambda: rt.engine().enroll_from_segment_turns(db, name, seg_path, [(a, b)],
+                                                                                     min_speech_s=min_s, **force_kw))
+            except TooShortSample as e:
+                # the user said who spoke: assign the sentence anyway, just without a voice sample
+                sample_note = str(e)
+                sid = db.upsert_speaker(name)
             except ValueError as e:
-                raise HTTPException(400, str(e))
+                raise _value_error_http(e)
             assigned, skipped = _assign_utterances(sid, name, seg_id, utt_ids, whole_cluster)
             extra = await _to_thread(_after_enroll, seg_id)       # relabel_segment leaves the hand-labelled ones alone
             _apply_self_relation(sid, body.get("is_self"), body.get("relation"))
@@ -893,7 +1021,7 @@ def create_app(rt_or_holder: Runtime | RuntimeHolder) -> FastAPI:
                     log.warning("rewrite markdown after label failed: %s", e)
         n = db.one("SELECT COUNT(*) AS n FROM speaker_embeddings WHERE speaker_id=?", (sid,))
         return {"ok": True, "id": sid, "name": name, "samples": int(n["n"]) if n else 0, "segment_id": seg_id,
-                "assigned": assigned, "skipped_user_labels": skipped, **extra}
+                "assigned": assigned, "skipped_user_labels": skipped, "sample_note": sample_note, **extra}
 
     @app.patch("/api/speakers/{sid}")
     def speaker_update(sid: int, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
@@ -966,6 +1094,84 @@ def create_app(rt_or_holder: Runtime | RuntimeHolder) -> FastAPI:
         r = calibrate_threshold(embs)
         r["current"] = float(rt.cfg.speakers.identify_threshold)
         return r
+
+    # ------------------------------------------------------------------ mixed utterances
+    def _split_args(body: dict[str, Any]) -> tuple[list[float] | None, bool]:
+        auto = bool(body.get("auto", False))
+        at = body.get("at")
+        if at is None or at == "":
+            return None, auto
+        if not isinstance(at, list):
+            raise HTTPException(400, "at 应为秒数列表")
+        pts: list[float] = []
+        for x in at:
+            if isinstance(x, bool) or not isinstance(x, (int, float, str)):
+                raise HTTPException(400, "at 应为秒数列表")
+            try:
+                pts.append(float(x))
+            except ValueError:
+                raise HTTPException(400, "at 应为秒数列表")
+        if not pts and not auto:
+            raise HTTPException(400, "需要给出拆分点（at）或选择自动拆分（auto）")
+        return (pts or None), auto
+
+    def _split_processor(with_asr: bool) -> Any:
+        from ..speech.pipeline import Processor
+
+        if rt.speaker_models_missing():
+            raise HTTPException(400, VOICE_MODELS_MISSING_MSG)
+        client = rt.client() if with_asr else None          # JobError (409) without an API key, like /api/chat
+        return Processor(rt.cfg, rt.db, client=client, engine=rt.engine())
+
+    @app.get("/api/utterances/{uid}/preview-split")
+    def utterance_preview_split(uid: int, auto: bool = True, at: str | None = None) -> dict[str, Any]:
+        """Pieces an auto split would make (bounds + who was recognised in each), no ASR and no DB change.
+        `at=1.8,4.2` previews a manual split instead."""
+        if rt.db.one("SELECT id FROM utterances WHERE id=?", (int(uid),)) is None:
+            raise HTTPException(404, "没有这条记录")
+        pts: list[float] | None = None
+        if at:
+            try:
+                pts = [float(x) for x in str(at).replace("，", ",").split(",") if x.strip()]
+            except ValueError:
+                raise HTTPException(400, "at 应为秒数列表")
+        proc = _split_processor(with_asr=False)
+        with rt.busy():
+            try:
+                return proc.preview_split(int(uid), at=pts, auto=auto if pts is None else False)
+            except FileNotFoundError as e:
+                raise HTTPException(404, str(e))
+            except ValueError as e:
+                raise HTTPException(400, str(e))
+
+    @app.post("/api/utterances/{uid}/split")
+    async def utterance_split(uid: int, body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+        """Split a mixed utterance: {"auto": true} (by voice) or {"at": [1.8, 4.2]} (seconds from its start).
+        The pieces are transcribed again (needs the API key: 409 without one) and replace the row."""
+        from ..llm.client import LLMError
+
+        if rt.db.one("SELECT id FROM utterances WHERE id=?", (int(uid),)) is None:
+            raise HTTPException(404, "没有这条记录")
+        at, auto = _split_args(body)
+        if not auto and not at:
+            raise HTTPException(400, "需要给出拆分点（at）或选择自动拆分（auto）")
+        proc = _split_processor(with_asr=True)
+        sched_lock = rt.sched.lock
+
+        def work() -> dict[str, Any]:
+            with sched_lock:                     # never interleave with a running job (process / relabel) on the same rows
+                return proc.split_utterance(int(uid), at=at, auto=auto)
+
+        with rt.busy():
+            try:
+                res = await _to_thread(work)
+            except FileNotFoundError as e:
+                raise HTTPException(404, str(e))
+            except ValueError as e:
+                raise HTTPException(400, str(e))
+            except LLMError as e:
+                raise HTTPException(502, f"重新转写失败，没有修改：{e}")
+        return {"ok": True, **res}
 
     # ------------------------------------------------------------------ memory chat
     @app.post("/api/chat")

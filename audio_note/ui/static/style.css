@@ -177,6 +177,8 @@ textarea.input { width: 100%; resize: vertical; }
 .badge.danger { background: var(--danger-soft); color: var(--danger); }
 .badge.info { background: var(--accent-soft); color: var(--accent-text); }
 .badge.plain { background: var(--surface-2); color: var(--muted); }
+.chip .x { border: 0; background: transparent; padding: 0 0 0 4px; margin-right: -3px; cursor: pointer; color: var(--muted); font-size: 11px; line-height: 1; }
+.chip .x:hover { color: var(--danger); }
 
 /* alerts */
 .alert { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-radius: 10px; border: 1px solid; margin-bottom: 12px; }
@@ -184,6 +186,8 @@ textarea.input { width: 100%; resize: vertical; }
 .alert.danger { background: var(--danger-soft); border-color: rgba(220, 38, 38, .35); }
 .alert.info { background: var(--accent-soft); border-color: rgba(37, 99, 235, .3); }
 .alert .right { margin-left: auto; display: flex; gap: 6px; }
+.alert.sm { padding: 6px 10px; font-size: 12.5px; margin-bottom: 0; }
+.alert.mismatch-note { margin: 6px 0 0; padding: 6px 10px; font-size: 12.5px; }
 
 /* lists / tables */
 table.tbl { width: 100%; border-collapse: collapse; }
@@ -191,6 +195,8 @@ table.tbl { width: 100%; border-collapse: collapse; }
 .tbl td { padding: 7px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
 .tbl tr:last-child td { border-bottom: 0; }
 .tbl td.num, .tbl th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.tbl td.consistency.bad { color: var(--danger); font-weight: 600; }
+.tbl td.consistency.amb { color: var(--warn); font-weight: 600; }
 
 /* two pane */
 .two { display: grid; grid-template-columns: 250px minmax(0, 1fr); gap: 16px; align-items: start; }
@@ -215,6 +221,12 @@ table.tbl { width: 100%; border-collapse: collapse; }
 .utt .spk .sc { color: var(--faint); font-weight: 400; font-size: 11px; margin-left: 3px; }
 .utt .text { white-space: pre-wrap; word-break: break-word; }
 .utt .text .raw { color: var(--faint); font-size: 12px; margin-top: 2px; }
+/* loudness: small grey "−32 dB" under the time; rows quieter than audio.min_speech_dbfs are faded and carry a 「远」 badge */
+.utt .time .db { display: block; color: var(--faint); font-size: 10.5px; line-height: 1.2; margin-top: 1px; white-space: nowrap; }
+.utt.far .spk, .utt.far .text, .utt.far .time { opacity: .55; }
+.utt.far:hover .spk, .utt.far:hover .text, .utt.far:hover .time { opacity: .85; }
+.utt.far .text { font-style: italic; }
+.badge.far { background: var(--surface-2); color: var(--muted); border: 1px dashed var(--faint); font-size: 10.5px; padding: 0 5px; margin-left: 4px; vertical-align: 1px; line-height: 1.5; font-weight: 500; }
 .utt .acts { display: flex; gap: 2px; opacity: 0; transition: opacity .12s; }
 .utt:hover .acts, .utt.playing .acts { opacity: 1; }
 .utt.unknown .spk { color: var(--muted); font-weight: 500; }
@@ -227,6 +239,17 @@ table.tbl { width: 100%; border-collapse: collapse; }
 .search-hit { padding: 8px 10px; border-radius: 8px; cursor: pointer; display: grid; grid-template-columns: 110px 80px minmax(0, 1fr); gap: 10px; }
 .search-hit:hover { background: var(--surface-2); }
 .search-hit .d { color: var(--faint); font-size: 12.5px; }
+
+/* ✂ split dialog */
+.split-chips { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; min-height: 24px; }
+.split-piece { display: grid; grid-template-columns: 20px 96px minmax(0, 1fr) 26px; gap: 8px; align-items: center; padding: 4px 6px; border-radius: 6px; font-size: 13px; }
+.split-piece:hover { background: var(--surface-2); }
+.split-piece.playing { background: var(--accent-soft); }
+.split-piece .n { color: var(--faint); font-size: 12px; }
+.split-piece .t { color: var(--muted); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+.split-piece .spk { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.split-piece .spk.muted { font-weight: 500; }
+.split-piece .spk .sc { color: var(--faint); font-weight: 400; font-size: 11px; margin-left: 3px; }
 
 /* digest */
 .digest-stats { color: var(--muted); font-size: 12.5px; margin-bottom: 10px; }
@@ -329,12 +352,18 @@ table.tbl { width: 100%; border-collapse: collapse; }
 .level { height: 8px; border-radius: 4px; background: var(--surface-2); overflow: hidden; width: 160px; }
 .level i { display: block; height: 100%; background: var(--ok); width: 0; transition: width .08s; }
 .rec-timer { font-variant-numeric: tabular-nums; font-weight: 600; font-size: 18px; min-width: 60px; }
+.file-res + .file-res { margin-top: 8px; }
+.file-res .mismatch-note { margin-top: 2px; }
 
 /* settings */
 .settings-nav { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; }
 .sticky-save { position: sticky; bottom: 0; background: var(--bg); padding: 10px 0; display: flex; gap: 8px; align-items: center; border-top: 1px solid var(--border); margin-top: 14px; }
 .kv { display: grid; grid-template-columns: 140px 1fr; gap: 4px 12px; font-size: 13px; }
 .kv .k { color: var(--muted); }
+.field .row .input.grow { flex: 1; width: auto; }
+#loudness-note:empty { display: none; }
+#loudness-note .thinking { font-size: 11.5px; gap: 6px; }
+#loudness-note .thinking .spin { width: 10px; height: 10px; }
 
 /* logs */
 .logbox { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; max-height: calc(100vh - 170px); overflow: auto; }
@@ -348,6 +377,7 @@ table.tbl { width: 100%; border-collapse: collapse; }
 .toast { background: var(--text); color: var(--bg); padding: 10px 14px; border-radius: 10px; box-shadow: 0 6px 20px rgba(0,0,0,.2); max-width: 420px; font-size: 13px; animation: fadein .15s; }
 .toast.err { background: var(--danger); color: #fff; }
 .toast.ok { background: var(--ok); color: #fff; }
+.toast.warn { background: var(--warn); color: #fff; }
 @keyframes fadein { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 .modal-root:empty { display: none; }
 .modal-root { position: fixed; inset: 0; background: rgba(0,0,0,.35); display: flex; align-items: center; justify-content: center; z-index: 40; }

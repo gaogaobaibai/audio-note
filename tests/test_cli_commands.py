@@ -390,7 +390,7 @@ class FakeEngine:
             db.add_speaker_embedding(sid, np.ones(8, dtype=np.float32), str(s), 5.0)
         return sid
 
-    def enroll_from_segment_turns(self, db, name, seg_path, turns):
+    def enroll_from_segment_turns(self, db, name, seg_path, turns, **kw):
         self.calls.append(("label", name, Path(seg_path), turns))
         if name == "太短":
             raise ValueError("选中的范围只有 0.5s 语音")
@@ -921,7 +921,7 @@ class VoiceEngine:
         self.calls.append(("cluster", len(turns)))
         return _unit_vec(7)
 
-    def enroll_from_audio(self, db, name, audio, source=None, copy_as_source=False):
+    def enroll_from_audio(self, db, name, audio, source=None, copy_as_source=False, **kw):
         self.calls.append(("enroll", name, source))
         sid = db.upsert_speaker(name)
         db.add_speaker_embedding(sid, _unit_vec(8), source, len(audio) / SR)
@@ -1163,3 +1163,115 @@ def test_speakers_voices_engine_failure_is_a_cli_error(tmp_cfg, voice_engine, mo
     assert cli.main(["speakers", "scan"]) == 2
     assert "模型文件缺失" in out.getvalue() and "download_models" in out.getvalue()
     assert db.one("SELECT COUNT(*) AS n FROM cluster_embeddings")["n"] == 0
+
+
+# --- speakers v3: audit [--fix], --force ------------------------------------------------------------
+
+def test_speakers_audit_lists_outliers_and_fix_deletes_them(tmp_cfg, out: io.StringIO):
+    db = DB(tmp_cfg.db_path)
+    assert cli.main(["speakers", "audit"]) == 0
+    assert "没有样本" in out.getvalue()
+    a = db.upsert_speaker("甲")
+    base = _unit_vec(1)
+    good1 = db.add_speaker_embedding(a, base, "a.wav", 3.0)
+    good2 = db.add_speaker_embedding(a, base * 0.9 + 0.1 * _unit_vec(2), "b.wav", 4.0)
+    bad = db.add_speaker_embedding(a, _unit_vec(9), None, 5.0)
+    b = db.upsert_speaker("乙")
+    db.add_speaker_embedding(b, _unit_vec(3), "c.wav", 2.0)
+    out.truncate(0); out.seek(0)
+    assert cli.main(["speakers", "audit"]) == 0
+    text = out.getvalue()
+    assert "声纹样本一致性" in text and "a.wav" in text and "扫描时保存的声纹" in text and "c.wav" in text
+    assert "1 个样本和其他样本不像" in text and "甲" in text and "audit --fix" in text
+    assert db.one("SELECT COUNT(*) AS n FROM speaker_embeddings")["n"] == 4
+    out.truncate(0); out.seek(0)
+    assert cli.main(["speakers", "audit", "--fix"]) == 0
+    assert "已删除 1 个离群样本" in out.getvalue()
+    assert [r["id"] for r in db.query("SELECT id FROM speaker_embeddings WHERE speaker_id=? ORDER BY id", (a,))] == [good1, good2]
+    assert bad not in [r["id"] for r in db.query("SELECT id FROM speaker_embeddings")]
+    out.truncate(0); out.seek(0)
+    assert cli.main(["speakers", "audit", "--fix"]) == 0
+    assert "所有样本都" in out.getvalue()
+    # two samples that disagree: the (longer) medoid is the reference and stays, the other one is the outlier
+    db.add_speaker_embedding(b, _unit_vec(11), None, 1.0)
+    out.truncate(0); out.seek(0)
+    assert cli.main(["speakers", "audit", "--fix"]) == 0
+    assert "已删除 1 个离群样本" in out.getvalue() and "乙 已没有样本" not in out.getvalue()
+    assert [r["source_path"] for r in db.query("SELECT source_path FROM speaker_embeddings WHERE speaker_id=?", (b,))] == ["c.wav"]
+    assert db.one("SELECT name FROM speakers WHERE id=?", (b,))["name"] == "乙"
+
+
+def test_speakers_enroll_and_label_pass_force_only_when_asked(tmp_cfg, tmp_path: Path, speakers_stubs, monkeypatch: pytest.MonkeyPatch, out: io.StringIO):
+    class SampleMismatch(ValueError):          # the CLI only relies on it being a ValueError whose message says 不像
+        def __init__(self, name, score, threshold):
+            super().__init__(f"这段声音和 {name} 已有的样本不像（相似度 {score:.2f} < {threshold:.2f}），没有加入")
+
+    class ForceEngine(FakeEngine):
+        def enroll(self, db, name, sources, notes=None, **kw):
+            self.calls.append(("enroll-force", kw.get("force", False)))
+            sid = db.upsert_speaker(name, notes)
+            if kw.get("force"):
+                db.add_speaker_embedding(sid, np.ones(8, dtype=np.float32), str(sources[0]), 5.0)
+            return sid
+
+        def enroll_from_segment_turns(self, db, name, seg_path, turns, **kw):
+            self.calls.append(("label-force", kw.get("force", False)))
+            if not kw.get("force"):
+                raise SampleMismatch(name, 0.2, 0.5)
+            sid = db.upsert_speaker(name)
+            db.add_speaker_embedding(sid, np.ones(8, dtype=np.float32), None, 2.0)
+            return sid
+
+    stub_module(monkeypatch, "audio_note.speech.speakers", SpeakerEngine=ForceEngine)
+    wav = write_wav(tmp_path / "s.wav")
+    assert cli.main(["speakers", "enroll", "甲", str(wav)]) == 0
+    assert "1 个文件没有加入" in out.getvalue() and "--force" in out.getvalue()
+    assert cli.main(["speakers", "enroll", "甲", str(wav), "--force"]) == 0
+    assert ForceEngine.instances[-1].calls[-1] == ("enroll-force", True) and ForceEngine.instances[0].calls[0] == ("enroll-force", False)
+    seg_wav = write_wav(tmp_cfg.audio_dir / "seg.wav", 3.0)
+    db = DB(tmp_cfg.db_path)
+    seg = add_done_segment(db, tmp_cfg, datetime(2026, 10, 31, 8, 0), path=seg_wav)
+    out.truncate(0); out.seek(0)
+    assert cli.main(["speakers", "label", str(seg), "甲", "--from", "0", "--to", "2"]) == 2
+    assert "不像" in out.getvalue() and "--force" in out.getvalue()
+    assert cli.main(["speakers", "label", str(seg), "甲", "--from", "0", "--to", "2", "--force"]) == 0
+    assert ForceEngine.instances[-1].calls[-1] == ("label-force", True)
+
+
+# --- v3b: sample origins / ambiguity in `speakers audit`, mic origin of `speakers record` --------------------
+
+def test_speakers_audit_shows_origin_and_fix_keeps_ambiguous_samples(tmp_cfg, out: io.StringIO):
+    db = DB(tmp_cfg.db_path)
+    rng = np.random.default_rng(0)
+
+    def unit(v: np.ndarray) -> np.ndarray:
+        return (v / np.linalg.norm(v)).astype(np.float32)
+
+    def near(base: np.ndarray, seed: int) -> np.ndarray:
+        return unit(base + 0.03 * np.random.default_rng(seed).standard_normal(base.shape[0]))
+
+    a, b = unit(rng.standard_normal(192)), unit(rng.standard_normal(192))
+    sid = db.upsert_speaker("谁")
+    for i in range(3):
+        db.add_speaker_embedding(sid, near(a, i), None, 10.0, origin="voice")
+    for i in range(2):
+        db.add_speaker_embedding(sid, near(b, 10 + i), f"l{i}.wav", 5.0, origin="label")
+    lone = db.add_speaker_embedding(sid, unit(rng.standard_normal(192)), None, 5.0, origin="cluster")
+    assert cli.main(["speakers", "audit"]) == 0
+    text = out.getvalue()
+    assert "来源" in text and "声音组" in text and "标记" in text and "簇" in text
+    assert "分成两组互不相像" in text and "歧义" in text and "1 个样本和其他样本不像" in text
+    out.truncate(0), out.seek(0)
+    assert cli.main(["speakers", "audit", "--fix"]) == 0
+    assert "已删除 1 个离群样本" in out.getvalue()
+    assert db.one("SELECT COUNT(*) AS n FROM speaker_embeddings")["n"] == 5          # the two factions stay
+    assert db.one("SELECT id FROM speaker_embeddings WHERE id=?", (lone,)) is None
+
+
+def test_speakers_record_stores_mic_origin(tmp_cfg, record_stubs, out: io.StringIO):
+    FakeMic.blocks = [sine(1.0) for _ in range(7)]
+    assert cli.main(["speakers", "record", "我", "--seconds", "5"]) == 0
+    assert DB(tmp_cfg.db_path).one("SELECT origin FROM speaker_embeddings")["origin"] == "mic"
+    with pytest.raises(SystemExit) as ex:
+        cli.main(["loudness", "--help"])
+    assert ex.value.code == 0

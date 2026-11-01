@@ -400,3 +400,65 @@ def test_cluster_embeddings_sentinel_is_hidden_and_cleared(db):
     db.upsert_cluster_embedding(a, 0, np.ones(4, dtype=np.float32), 1.0)
     assert [r[1] for r in db.cluster_embeddings([a])] == [0]
     assert db.delete_cluster_embeddings(a) == 2 and db.cluster_embeddings() == []
+
+
+def test_v3b_columns_origin_faint_s_loudness_db(cfg):
+    """speaker_embeddings.origin / segments.faint_s / utterances.loudness_db arrive through the same migration
+    path on an old database and on a fresh one; add_speaker_embedding / add_utterances fill them."""
+    import sqlite3
+
+    from audio_note.db import MIGRATION_COLUMNS, TRUSTED_SAMPLE_ORIGINS
+
+    assert {(t, c) for t, c, _ in MIGRATION_COLUMNS} >= {("speaker_embeddings", "origin"), ("segments", "faint_s"),
+                                                         ("utterances", "loudness_db")}
+    assert TRUSTED_SAMPLE_ORIGINS == {"mic", "file"}
+    raw = sqlite3.connect(cfg.db_path)
+    raw.executescript(_old_schema())
+    raw.execute("INSERT INTO speakers(name) VALUES ('老用户')")
+    raw.commit()
+    raw.close()
+    db = DB(cfg.db_path)
+    assert "origin" in {r["name"] for r in db.query("PRAGMA table_info(speaker_embeddings)")}
+    assert "faint_s" in {r["name"] for r in db.query("PRAGMA table_info(segments)")}
+    assert "loudness_db" in {r["name"] for r in db.query("PRAGMA table_info(utterances)")}
+    sid = int(db.one("SELECT id FROM speakers WHERE name='老用户'")["id"])
+    db.add_speaker_embedding(sid, np.ones(4, dtype=np.float32), "a.wav", 1.0)
+    db.add_speaker_embedding(sid, np.ones(4, dtype=np.float32), "b.wav", 1.0, origin="mic")
+    assert [r["origin"] for r in db.query("SELECT origin FROM speaker_embeddings ORDER BY id")] == [None, "mic"]
+    seg = db.add_segment("s.opus", datetime(2026, 10, 31, 9, 0, 0), 60.0)
+    assert db.get_segment(seg)["faint_s"] is None
+    db.add_utterances([_utt(seg, 0, "一", "一"), _utt(seg, 1, "二", "二", loudness_db=-31.5)])
+    assert [r["loudness_db"] for r in db.query("SELECT loudness_db FROM utterances ORDER BY id")] == [None, -31.5]
+    fresh = DB(cfg.db_path.parent / "fresh.sqlite3")
+    assert "origin" in {r["name"] for r in fresh.query("PRAGMA table_info(speaker_embeddings)")}
+    assert DB._migrate(fresh.conn()) == []
+
+
+def test_migration_backfills_sample_origin_from_source_path(tmp_path):
+    """Rows written before speaker_embeddings.origin existed get a guessed origin: '#a-b' slices are
+    transcript labels, 'enroll_*' copies came from the page (trusted), anything else stays NULL."""
+    import sqlite3
+
+    from audio_note.db import DB, MIGRATION_COLUMNS, SCHEMA
+
+    p = tmp_path / "old.sqlite3"
+    c = sqlite3.connect(p)
+    old_schema = SCHEMA.replace("origin TEXT,", "").replace("faint_s REAL,", "").replace("loudness_db REAL,", "")
+    c.executescript(old_schema)
+    for table, col, _ in MIGRATION_COLUMNS:
+        cols = [r[1] for r in c.execute(f"PRAGMA table_info({table})")]
+        if col in cols:
+            c.execute(f"ALTER TABLE {table} DROP COLUMN {col}")
+    c.execute("INSERT INTO speakers(id, name) VALUES (1, '甲')")
+    rows = [(1, b"\x00" * 8, 2, r"C:\d\speakers\甲\enroll_20261101_1.wav", 20.0),
+            (1, b"\x00" * 8, 2, r"C:\d\audio\2026-11-01\120721_593.opus#11.2-12.9", 1.3),
+            (1, b"\x00" * 8, 2, r"C:\d\speakers\甲\123724_327.wav", 60.0),
+            (1, b"\x00" * 8, 2, None, 3.0)]
+    c.executemany("INSERT INTO speaker_embeddings(speaker_id, embedding, dim, source_path, duration_s) VALUES (?,?,?,?,?)", rows)
+    c.commit(); c.close()
+    db = DB(p)
+    got = [r["origin"] for r in db.query("SELECT origin FROM speaker_embeddings ORDER BY id")]
+    assert got == ["file", "label", None, None]
+    db.execute("UPDATE speaker_embeddings SET origin='voice' WHERE id=3")
+    DB(p)                                                   # a second open does not touch rows any more
+    assert [r["origin"] for r in db.query("SELECT origin FROM speaker_embeddings ORDER BY id")] == ["file", "label", "voice", None]

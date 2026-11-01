@@ -183,7 +183,7 @@ class Notifier: def __init__(cfg); def send(msg) -> dict[str, str|None]   # chan
 - `speakers enroll <name> <wav...>` / `speakers list` / `speakers label <segment_id|path> <name> --from s --to s [--self] [--relation R]` / `speakers calibrate` / `speakers voices [--assign N name]` / `speakers scan` / `speakers set-self <name>` / `speakers relation <name> <R|->` / `speakers relations [--force]`（见 10.3）
 - `daily [--day YYYY-MM-DD] [--push] [--force]`；`push-test "文本"`
 - `chat [question]`（无参进入 REPL）
-- `cleanup`；`init`（生成 config.yaml、检查模型文件、打印缺失项）
+- `cleanup`；`loudness [--day D] [--apply --yes]` 每句音量分布 / 删除低于门槛的句子（§10.4）；`init`（生成 config.yaml、检查模型文件、打印缺失项）
 调度：`process_interval_min` 处理新段；`cleanup_interval_min` 清理；每天 `analysis.daily_time` 跑前一天/当天日报并推送（`kv` 记录 last_daily_day 防重复）。日志：rich console + `data/audio_note.log`（RotatingFileHandler）。单实例：`data/service.lock` 写 pid + 进程创建时间，启动时检测进程存活且创建时间一致（防 pid 复用）。`process` 启动时把超过 10 min 的 `processing` 行放回 `new`；日报前先跑 `process`，次日复检前一天的 utterance 数有变化则重生成并推送。
 
 ### 10.1 运行时与网页界面（runtime.py / ui/）
@@ -218,6 +218,35 @@ class Notifier: def __init__(cfg); def send(msg) -> dict[str, str|None]   # chan
 - **关系**：`speakers.relation / relation_source('user'|'auto') / relation_note`。`relations.infer_relations()`：候选 = 非本人、不是用户手标、语句数 ≥ `relation_min_utterances`；证据 = 该人最多 60 句（跨天均匀抽样，带同片段前后句，本人标「本人」）+ 该人的 person 笔记；JSON 模式问模型 `{relation ∈ 候选表|不确定, confidence, reason, address}`，`confidence ≥ relation_min_confidence` 才写入（source='auto'）。kv `relation_inferred_n:<sid>` 记上次推断时的语句数，不涨到 1.5 倍不重问；用户手标永不覆盖。日报任务之后自动跑（`speakers.infer_relations`），界面「自动推断关系」/ `speakers relations` 手动跑。
 - **未识别的声音**：`group_unknown_voices()` 取所有含未识别语句的 (segment, cluster) 的 `cluster_embeddings`，按 speech_s 加权质心做贪心平均连接聚类（cosine ≥ `voice_group_threshold`，默认 0.55），每组给句数 / 时长 / 天数 / 最长的 5 句示例（可试听）/ 与已登记声纹最接近的人（提示用）。老片段没有 cluster_embeddings 时 `backfill_cluster_embeddings()` 用已存的 utterance 区间当 turn 补算（`voices` 任务，界面自动触发一次）。`name_voice()`：从最长的 ≤3 个成员拼出语音做声纹样本（存纯语音副本到 `data/speakers/<name>/`），组内所有语句直接指派给该人并标 `speaker_source='user'`，可同时设本人 / 关系，重写当天 markdown；API 层随后排队 `relabel` 让其他片段用新声纹重识别。记录页的 👤 标记默认把同片段同簇的句子一起标，同样写 `speaker_source='user'`。
 - 阈值取舍：0.55 比识别阈值 0.45 高，宁可把一个人分成两组（都起同一个名字即可合并）也不把两个人合成一组。合成的 demo 数据里 TTS 音色有限，「可能是 X」提示会很高（0.67），真实数据里留在未识别组的声音对已登记人的相似度通常 < 0.45。
+
+### 10.4 混合句子的防与治（speech/speakers.py, pipeline.split_utterance；spec 见 docs/SPEC_speakers_v3_mixed.md）
+
+用户真实数据上的探针（2026-11-01）：面对面两人聊天时 fast clustering（阈值 0.5）常把两人并成一簇，`build_chunks` 再按簇合并成 30–60 s 的句子；
+更糟的是从混合簇取的"声纹样本"混进了别人的声音（用户 7 个样本里 4 个和麦克风样本相似度只有 0.24–0.49），此后谁都被认成用户。逐轮次（≥ 0.8 s）
+和干净样本比对是能分开的（本人 0.5–0.74，对方 0.1–0.3），但近讲麦克风样本与远场对话之间存在通道差异，本人的远场轮次也只有 0.5–0.7。
+
+- **样本一致性**：`check_sample()` / `audit_samples()` 以"核心参考向量"为基准——时长加权的中位样本（与其他样本平均相似度最高者，平手取更长的）
+  加上与它相似度 ≥ `sample_consistency_min` 的样本做加权平均；新样本与之相似度低于阈值 → `SampleMismatch`（API 400 `mismatch: true`，可 `force`）。
+  不用"与任意其他样本的最高相似度"，否则两条混进来的坏样本会互相作证（用户数据里 1.3 s / 3.2 s 两条短片段彼此 0.60）。
+  从记录里取样（label / name_voice）要求 ≥ `min_label_sample_s`（2.5 s）语音，否则 `TooShortSample`：句子仍然指派给此人，只是不入样本。
+- **逐轮次识别**：`identify_turns()` 簇级识别后，对 ≥ `turn_check_min_s` 的轮次单独比对：与簇内人的相似度 < 阈值且另一登记人 ≥ 阈值 → 归到那个人（新簇号）；
+  低于 阈值 − `turn_reject_margin` 且不像任何人 → 未知（新簇号）；未知簇里单独匹配上的轮次 → 归到那个人。`relabel` 改为逐句比对（`identify_utterances`），短句沿用簇结果。
+- **拆分**：`Processor.split_utterance(utt_id, at=[...] | auto=True)`：auto = 对这句音频重新分离 + 逐轮次识别，按说话人合并相邻轮次；手动 = 指定相对秒数；
+  每段 ≥ 0.6 s，重新 ASR + 纠错，事务里删旧插新（tokens / vectors 重建，cluster_embeddings 更新），重写当天 markdown。`GET /api/utterances/{id}/preview-split`
+  只给边界与识别结果，不花钱；`POST /api/utterances/{id}/split` 执行。
+- 实测（用户数据副本，去掉两条离群样本后）：两人对话段的逐句识别本人 0.46–0.6、对方 0.45–0.5、不确定的 0.35–0.45，仍贴着阈值；
+  给本人补几段远场对话样本（一致性检查会放行 0.5–0.7 的）能拉开差距。
+- **锚点规则（v3b，spec 见 docs/SPEC_speakers_v3b.md A1）**：中位样本会被"多数派"绑架——混进来的样本多 / 长时它们成了核心，干净的麦克风样本反被判离群。
+  现在 `speaker_embeddings.origin` 记每条样本的来源（`mic` = speakers record，`file` = enroll 上传 / 文件，`label` = 记录页标记，`voice` = 给声音组起名，
+  `cluster` = 过期音频用存的簇声纹；老行 NULL），核心的中位样本只在 origin ∈ {mic, file} 里选（这些不可能混入别人）；一条都没有时才在全部样本里选，
+  且时长权重封顶 10 s。没有可信锚点、非核心样本又自成一派（≥ 2 条两两相似 ≥ `sample_consistency_min`）时判为**歧义**：两派都 `ambiguous`、都不是 outlier，
+  `check_sample` 退回"对全部样本取最大 cosine"且不拒绝，界面 / `speakers audit` 提示用户试听后自己删；真正的单个离群仍是 outlier（`--fix` / 「移除不像的样本」只删这些）。
+- **远处 / 不清晰声音的音量门槛（v3b B，audio/loudness.py）**：用户数据实测（50 ms 帧、取能量最高的一半帧的 RMS，dBFS）本人近讲 132 句中位 −26 / p10 −30，
+  两米外的朋友 7 句中位 −53，本人偶尔侧身 −35 ~ −45，相差 20 dB 以上，门槛 `audio.min_speech_dbfs` 默认 **−40 dBFS**（null 关闭；loopback 的系统声音有 AGC，永远在门槛之上）。
+  `process_segment` 在 diarize 之后、识别之前丢掉低于门槛的 turn（`segments.faint_s` 记被滤掉的秒数；全部被滤掉 → no_speech，文件删除），每条 utterance 存自己的
+  `loudness_db`（拆分的 piece 也算）。`relabel_segment` 顺便给 NULL 的补上，低于门槛的句子不参与逐句识别（保持原状、`speaker_score=NULL`）；
+  `voices.group_unknown_voices` / `name_voice` / `unknown_utterances` 都不算低于门槛的句子。已有记录：`audio-note loudness` 补算 + 分布，`--apply --yes` 删除；
+  UI 任务 `loudness` 只补算 + 统计（`{computed, below, threshold}`），记录页每句带 `loudness_db`。
 
 ## 11. 默认参数
 

@@ -25,15 +25,24 @@ from typing import Any
 import numpy as np
 
 from ..analysis.relations import RELATION_CHOICES  # noqa: F401  (re-exported for the API / CLI)
+from ..audio.loudness import min_speech_dbfs
 from ..audio.storage import read_segment
 from ..config import Config
 from ..db import DB
-from .speakers import MIN_CLUSTER_SPEECH_S, Turn
+from .speakers import MIN_CLUSTER_SPEECH_S, SampleMismatch, Turn, check_sample, sample_consistency_min, min_label_sample_s
 
 log = logging.getLogger(__name__)
 
 MAX_SAMPLES_PER_GROUP = 5
 DEFAULT_GROUP_THRESHOLD = 0.55
+
+
+def _loud_clause(min_dbfs: float | None, alias: str = "u") -> tuple[str, list[Any]]:
+    """SQL fragment keeping only utterances at or above the loudness gate (rows without a stored level pass).
+    Faint (far-away) sentences are not grouped, sampled or counted: their voice cannot be told apart."""
+    if min_dbfs is None:
+        return "", []
+    return f" AND ({alias}.loudness_db IS NULL OR {alias}.loudness_db >= ?)", [float(min_dbfs)]
 
 
 # --------------------------------------------------------------------------- helpers
@@ -76,8 +85,10 @@ def missing_segments(db: DB) -> list[Any]:
     return [r for r in rows if Path(r["path"]).exists()]
 
 
-def unknown_utterance_count(db: DB) -> int:
-    row = db.one("SELECT COUNT(*) AS n FROM utterances WHERE speaker_id IS NULL")
+def unknown_utterance_count(db: DB, min_dbfs: float | None = None) -> int:
+    """Unidentified utterances, leaving out the ones below the loudness gate `min_dbfs` (None = count all)."""
+    clause, params = _loud_clause(min_dbfs)
+    row = db.one(f"SELECT COUNT(*) AS n FROM utterances u WHERE u.speaker_id IS NULL{clause}", params)
     return int(row["n"]) if row else 0
 
 
@@ -134,15 +145,17 @@ def group_unknown_voices(db: DB, cfg: Config, threshold: float | None = None, ma
     similar enrolled speaker, a hint "maybe X") or None.
     """
     thr = _threshold(cfg, threshold)
+    min_db = min_speech_dbfs(cfg)
+    loud, loud_params = _loud_clause(min_db)
     out: dict[str, Any] = {"groups": [], "missing_segments": len(missing_segments(db)), "threshold": thr,
-                           "unknown_utterances": unknown_utterance_count(db)}
+                           "unknown_utterances": unknown_utterance_count(db, min_db)}
     rows = db.query(
         "SELECT ce.segment_id, ce.cluster_label, ce.embedding, ce.dim, ce.speech_s, s.path"
         " FROM cluster_embeddings ce JOIN segments s ON s.id = ce.segment_id"
         " WHERE ce.cluster_label >= 0"
         " AND EXISTS (SELECT 1 FROM utterances u WHERE u.segment_id=ce.segment_id AND u.cluster_label=ce.cluster_label"
-        "             AND u.speaker_id IS NULL)"
-        " ORDER BY s.started_at DESC, ce.segment_id DESC, ce.cluster_label LIMIT ?", (int(max_members),))
+        f"             AND u.speaker_id IS NULL{loud})"
+        " ORDER BY s.started_at DESC, ce.segment_id DESC, ce.cluster_label LIMIT ?", (*loud_params, int(max_members)))
     if not rows:
         return out
     # members must share one embedding dimension (a model change leaves old rows behind): keep the majority
@@ -161,9 +174,9 @@ def group_unknown_voices(db: DB, cfg: Config, threshold: float | None = None, ma
     for k in range(0, len(seg_ids), 500):
         chunk = seg_ids[k:k + 500]
         for u in db.query(
-                "SELECT id, segment_id, cluster_label, day, abs_start, start_s, end_s, text FROM utterances"
-                f" WHERE speaker_id IS NULL AND cluster_label IS NOT NULL AND segment_id IN ({','.join('?' * len(chunk))})"
-                " ORDER BY abs_start, start_s, id", chunk):
+                "SELECT u.id, u.segment_id, u.cluster_label, u.day, u.abs_start, u.start_s, u.end_s, u.text FROM utterances u"
+                f" WHERE u.speaker_id IS NULL AND u.cluster_label IS NOT NULL AND u.segment_id IN ({','.join('?' * len(chunk))}){loud}"
+                " ORDER BY u.abs_start, u.start_s, u.id", [*chunk, *loud_params]):
             utts.setdefault((int(u["segment_id"]), int(u["cluster_label"])), []).append(u)
 
     enrolled = db.speaker_embeddings()
@@ -262,8 +275,37 @@ def _parse_members(members: list[Any]) -> list[tuple[int, int]]:
     return out
 
 
+def _consistent_members(member_rows: dict[tuple[int, int], tuple[np.ndarray, float]], mem: list[tuple[int, int]],
+                        min_cos: float) -> tuple[set[tuple[int, int]], int]:
+    """Members whose stored cluster embedding resembles the anchor (the member with the most speech):
+    (usable members, number of inconsistent ones). Members without a comparable embedding count as usable."""
+    anchor: tuple[int, int] | None = None
+    for m in mem:
+        got = member_rows.get(m)
+        if got is None or got[0].size == 0:
+            continue
+        if anchor is None or got[1] > member_rows[anchor][1]:
+            anchor = m
+    if anchor is None:
+        return set(mem), 0
+    a = _unit(member_rows[anchor][0])
+    ok: set[tuple[int, int]] = set()
+    bad = 0
+    for m in mem:
+        got = member_rows.get(m)
+        if got is None or got[0].size == 0 or got[0].shape != a.shape:
+            ok.add(m)
+            continue
+        if float(np.dot(a, _unit(got[0]))) >= min_cos:
+            ok.add(m)
+        else:
+            bad += 1
+            log.info("name_voice: member %s/%s does not resemble the group's anchor; not used as a sample", m[0], m[1])
+    return ok, bad
+
+
 def name_voice(db: DB, cfg: Config, engine: Any, members: list[Any], name: str, *, is_self: bool = False,
-               relation: str | None = None, max_samples: int = 3) -> dict[str, Any]:
+               relation: str | None = None, max_samples: int = 3, force: bool = False) -> dict[str, Any]:
     """Give a voice group a name: enroll up to `max_samples` embeddings from its longest members (audio
     concatenated per cluster), assign every utterance of every member to the speaker (speaker_source='user'),
     optionally mark the speaker as the user / store the relation, and rewrite the affected days' Markdown.
@@ -274,7 +316,12 @@ def name_voice(db: DB, cfg: Config, engine: Any, members: list[Any], name: str, 
     Utterances the user already labelled by hand as somebody else are kept and counted in
     'skipped_user_labels'. Raises ValueError for an empty name, malformed members, or when a brand-new
     speaker got no usable sample (the speaker row is removed again in that case). FTS rebuild is the
-    caller's job."""
+    caller's job.
+
+    Consistency (v3): members whose stored embedding does not resemble the group's anchor (the member
+    with the most speech) are not used as samples ('members_inconsistent'); a sample that does not resemble
+    the person's existing samples is skipped ('samples_rejected') unless `force`. When every candidate was
+    rejected that way and nothing was added, SampleMismatch is raised before any utterance is assigned."""
     from .pipeline import write_day_markdown
 
     name = (name or "").strip()
@@ -289,19 +336,32 @@ def name_voice(db: DB, cfg: Config, engine: Any, members: list[Any], name: str, 
     member_rows = {(seg, cl): (emb, s) for seg, cl, emb, s in db.cluster_embeddings(sorted({seg for seg, _ in mem}))}
     speech_by_member = {k: v[1] for k, v in member_rows.items()}
     seg_rows = {seg: db.get_segment(seg) for seg in {seg for seg, _ in mem}}
-    ranked = sorted(mem, key=lambda m: -speech_by_member.get(m, 0.0))
+    min_cos = sample_consistency_min(cfg)
+    usable, members_inconsistent = _consistent_members(member_rows, mem, min_cos)
+    ranked = sorted((m for m in mem if m in usable), key=lambda m: -speech_by_member.get(m, 0.0))
     samples_added = 0
     samples_from_clusters = 0
+    samples_rejected = 0
+    worst_mismatch: float | None = None
     tried = 0           # members with an audio file (and utterances) we attempted
     audio_read = 0      # ... of which the file could be read (the engine saw a clip)
+    faint_only: set[tuple[int, int]] = set()     # members whose sentences all lie below the loudness gate
+    enroll_kwargs: dict[str, Any] = {"force": True} if force else {}
+    enroll_kwargs["min_speech_s"] = min_label_sample_s(cfg)      # short far-field snippets make unreliable samples
+    enroll_kwargs["origin"] = "voice"
+    loud, loud_params = _loud_clause(min_speech_dbfs(cfg))       # faint sentences never become samples
     for seg, cl in ranked:
         if tried >= int(max_samples):
             break
         row = seg_rows.get(seg)
         if row is None or not Path(row["path"]).exists():
             continue
-        utts = db.query("SELECT start_s, end_s FROM utterances WHERE segment_id=? AND cluster_label=? ORDER BY start_s, id", (seg, cl))
+        utts = db.query(f"SELECT u.start_s, u.end_s FROM utterances u WHERE u.segment_id=? AND u.cluster_label=?{loud}"
+                        " ORDER BY u.start_s, u.id", (seg, cl, *loud_params))
         if not utts:
+            if loud and db.one("SELECT 1 FROM utterances WHERE segment_id=? AND cluster_label=? LIMIT 1", (seg, cl)):
+                faint_only.add((seg, cl))
+                log.info("name_voice: member %s/%s has only faint sentences; not used as a sample", seg, cl)
             continue
         tried += 1
         try:
@@ -314,25 +374,42 @@ def name_voice(db: DB, cfg: Config, engine: Any, members: list[Any], name: str, 
             # the clip is a concatenation of non-contiguous ranges: the sample row must point at the
             # speech-only copy (playable, survives audio expiry), not at a "#a-b" slice of the segment
             source = f"{row['path']}#{float(utts[0]['start_s']):.1f}-{float(utts[-1]['end_s']):.1f}"
-            engine.enroll_from_audio(db, name, clip, source=source, copy_as_source=True)
+            engine.enroll_from_audio(db, name, clip, source=source, copy_as_source=True, **enroll_kwargs)
             samples_added += 1
+        except SampleMismatch as e:          # the group's voice does not resemble this person's samples
+            samples_rejected += 1
+            worst_mismatch = e.score if worst_mismatch is None else max(worst_mismatch, e.score)
+            log.info("name_voice: member %s/%s rejected: %s", seg, cl, e)
         except ValueError as e:              # too little speech in this member
             log.info("name_voice: member %s/%s skipped: %s", seg, cl, e)
         except Exception as e:  # noqa: BLE001 - unreadable file etc.
             log.warning("name_voice: member %s/%s failed: %s", seg, cl, e)
     if samples_added == 0 and audio_read == 0:
         # the group's recordings are gone (expired / unreadable): enrol the stored cluster embeddings
+        # (a faint-only member's embedding is a far-away voice: never a sample)
         for seg, cl in ranked[: max(0, int(max_samples))]:
             got = member_rows.get((seg, cl))
-            if got is None or got[0].size == 0:
+            if got is None or got[0].size == 0 or (seg, cl) in faint_only:
                 continue
-            db.add_speaker_embedding(sid, got[0], None, got[1])
+            score, ok = check_sample(db, sid, got[0], min_cos)
+            if not ok and not force:
+                samples_rejected += 1
+                worst_mismatch = score if worst_mismatch is None else max(worst_mismatch, float(score))
+                log.info("name_voice: stored embedding of member %s/%s rejected (cosine %.2f < %.2f)", seg, cl, score, min_cos)
+                continue
+            db.add_speaker_embedding(sid, got[0], None, got[1], origin="cluster")
             samples_from_clusters += 1
         samples_added += samples_from_clusters
         if samples_from_clusters:
             log.info("name_voice: %s: no readable recording, enrolled %d stored cluster embedding(s)", name, samples_from_clusters)
+    if samples_added == 0 and samples_rejected and not force:
+        # every usable sample of the group sounds unlike this person: nothing was added and nothing is
+        # assigned; the caller may retry with force=True ("仍然加入")
+        raise SampleMismatch(name, float(worst_mismatch or 0.0), min_cos)
     if samples_added == 0 and not existed:
         db.delete_speaker(sid, unknown)      # nothing assigned yet: just drops the empty row (+ relation cache)
+        if faint_only and audio_read == 0:
+            raise ValueError("这组声音都太轻（远处 / 不清晰），没有可用的声纹样本，无法登记")
         if audio_read == 0:
             raise ValueError("这组声音的录音已过期，也没有可用的声纹，无法登记")
         raise ValueError("这组声音里的语音太短，无法提取声纹")
@@ -371,9 +448,11 @@ def name_voice(db: DB, cfg: Config, engine: Any, members: list[Any], name: str, 
             write_day_markdown(db, cfg, day)
         except Exception as e:  # noqa: BLE001 - the DB is the source of truth
             log.warning("cannot write markdown for %s: %s", day, e)
-    log.info("name_voice: %s <- %d member(s), %d sample(s) (%d from stored clusters), %d utterance(s), %d hand-labelled kept",
-             name, len(mem), samples_added, samples_from_clusters, assigned, skipped_user)
+    log.info("name_voice: %s <- %d member(s), %d sample(s) (%d from stored clusters, %d rejected, %d members inconsistent),"
+             " %d utterance(s), %d hand-labelled kept",
+             name, len(mem), samples_added, samples_from_clusters, samples_rejected, members_inconsistent, assigned, skipped_user)
     return {"id": int(sid), "name": name, "samples_added": samples_added, "samples_from_clusters": samples_from_clusters,
+            "samples_rejected": samples_rejected, "members_inconsistent": members_inconsistent,
             "utterances_assigned": assigned, "skipped_user_labels": skipped_user,
             "segments": sorted(segments), "days": sorted(days)}
 

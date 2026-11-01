@@ -715,3 +715,13 @@ def test_voices_job_reports_missing_models_in_chinese(rt: Runtime, monkeypatch: 
     assert rt.wait_jobs(5) and st.error == rt_mod.VOICE_MODELS_MISSING_MSG and st.runs == 0
     rt._engine = object()                                      # an engine already loaded means the files were there
     assert rt.speaker_models_missing() == []
+
+
+def test_loudness_job_exists_and_runs_on_an_empty_db(rt: Runtime):
+    from audio_note.runtime import JOB_LABELS
+
+    assert "loudness" in JOBS and JOB_LABELS["loudness"] == "统计音量分布" and "loudness" in rt.jobs
+    assert rt.run_job("loudness") == {"computed": 0, "below": 0, "threshold": -40.0, "total": 0, "missing": 0, "speakers": []}
+    st = rt.submit("loudness")
+    assert rt.wait_jobs(5) and st.error is None and st.result["computed"] == 0 and st.runs == 1
+    assert rt.status()["jobs"]["loudness"]["label"] == "统计音量分布"

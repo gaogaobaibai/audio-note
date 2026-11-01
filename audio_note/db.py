@@ -168,7 +168,13 @@ MIGRATION_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("speakers", "relation_note", "TEXT"),                           # inference reason / user remark
     ("speakers", "relation_updated_at", "TEXT"),
     ("utterances", "speaker_source", "TEXT"),                        # NULL = automatic; 'user' = hand-labelled (relabel keeps it)
+    ("speaker_embeddings", "origin", "TEXT"),                        # 'mic' | 'file' | 'label' | 'voice' | 'cluster' | NULL (old rows)
+    ("segments", "faint_s", "REAL"),                                 # seconds of turns dropped as too quiet (audio.min_speech_dbfs)
+    ("utterances", "loudness_db", "REAL"),                           # speech level of the utterance's audio in dBFS (NULL = not computed)
 )
+
+#: speaker_embeddings.origin values whose voice cannot contain anybody else (the user recorded / uploaded it)
+TRUSTED_SAMPLE_ORIGINS = frozenset({"mic", "file"})
 
 
 #: kv key prefix holding the utterance count at the last relation inference of a speaker (analysis.relations)
@@ -241,6 +247,14 @@ class DB:
                     raise
                 continue
             added.append(f"{table}.{col}")
+        if "speaker_embeddings.origin" in added:
+            # one-time guess for rows written before the column existed: a "<file>#a-b" source is a transcript
+            # label, an "enroll_*" copy came from the page's microphone / file upload (trusted anchor);
+            # everything else (CLI record, voice-group copies) stays NULL
+            c.execute("UPDATE speaker_embeddings SET origin = CASE"
+                      " WHEN source_path LIKE '%#%' THEN 'label'"
+                      " WHEN source_path LIKE '%enroll\\_%' ESCAPE '\\' THEN 'file' END"
+                      " WHERE origin IS NULL AND source_path IS NOT NULL")
         if added:
             import logging
 
@@ -362,11 +376,15 @@ class DB:
             return int(row["id"])
         return int(self.execute("INSERT INTO speakers(name, notes) VALUES (?,?)", (name, notes)).lastrowid)
 
-    def add_speaker_embedding(self, speaker_id: int, emb: np.ndarray, source_path: str | None, duration_s: float | None) -> int:
+    def add_speaker_embedding(self, speaker_id: int, emb: np.ndarray, source_path: str | None, duration_s: float | None,
+                              origin: str | None = None) -> int:
+        """Store one enrolment embedding. `origin` says where the sample came from ('mic' = speakers record,
+        'file' = enroll upload / file, 'label' = transcript label, 'voice' = naming a voice group, 'cluster' =
+        stored cluster embedding of an expired recording); the consistency check anchors on 'mic' / 'file'."""
         emb = np.asarray(emb, dtype=np.float32)
         return int(self.execute(
-            "INSERT INTO speaker_embeddings(speaker_id, embedding, dim, source_path, duration_s) VALUES (?,?,?,?,?)",
-            (speaker_id, emb.tobytes(), int(emb.shape[0]), source_path, duration_s),
+            "INSERT INTO speaker_embeddings(speaker_id, embedding, dim, source_path, duration_s, origin) VALUES (?,?,?,?,?,?)",
+            (speaker_id, emb.tobytes(), int(emb.shape[0]), source_path, duration_s, origin),
         ).lastrowid)
 
     def speaker_embeddings(self) -> list[tuple[int, str, np.ndarray]]:
@@ -473,17 +491,17 @@ class DB:
 
     # --- utterances --------------------------------------------------------
     def add_utterances(self, rows: list[dict[str, Any]]) -> list[int]:
-        """rows: dicts with keys matching the utterances columns plus optional 'text_seg' / 'speaker_source'."""
+        """rows: dicts with keys matching the utterances columns plus optional 'text_seg' / 'speaker_source' / 'loudness_db'."""
         ids: list[int] = []
         c = self.conn()
         with _Tx(c):
             for r in rows:
                 cur = c.execute(
                     "INSERT INTO utterances(segment_id,start_s,end_s,abs_start,day,cluster_label,speaker_id,speaker_name,speaker_score,"
-                    "text_raw,text,speaker_source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "text_raw,text,speaker_source,loudness_db) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (r["segment_id"], r["start_s"], r["end_s"], r["abs_start"], r["day"], r.get("cluster_label"),
                      r.get("speaker_id"), r.get("speaker_name"), r.get("speaker_score"), r["text_raw"], r["text"],
-                     r.get("speaker_source")),
+                     r.get("speaker_source"), r.get("loudness_db")),
                 )
                 uid = int(cur.lastrowid)
                 ids.append(uid)

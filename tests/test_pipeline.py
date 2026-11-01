@@ -502,3 +502,64 @@ def test_transcribe_file_no_db_writes(cfg, db, tmp_path):
     assert out[0]["start_s"] == 0.0 and out[1]["end_s"] == 3.0
     assert db.query("SELECT id FROM utterances") == [] and db.query("SELECT id FROM transcripts") == []
     assert db.query("SELECT id FROM segments") == []
+
+
+# --------------------------------------------------------------------------- v3: split_utterance (more in tests/test_mixed_speakers.py)
+def test_split_utterance_replaces_the_row_with_retranscribed_pieces(cfg, db):
+    seg_id = make_segment(cfg, db, datetime(2026, 10, 31, 8, 19, 10), 6.0)
+    turns = [Turn(0.0, 6.0, 0)]
+    p = Processor(cfg, db, client=object(), engine=FakeEngine(turns), asr=FakeASR("混在一起"), corrector=EchoCorrector())
+    assert p.process_segment(seg_id) == 1
+    mixed = db.utterances_for_day("2026-10-31")[0]["id"]
+
+    class SplitEngine(FakeEngine):
+        def diarize(self, audio):
+            return [Turn(0.0, 2.5, 0), Turn(2.5, 6.0, 1)]
+
+        def identify_turns(self, audio, turns, db_, segment_id=None):
+            for t in turns:
+                t.speaker_id, t.speaker_name, t.score = (1, "张三", 0.9) if t.cluster == 0 else (None, None, 0.2)
+            return turns
+
+    db.upsert_speaker("张三")
+    asr = FakeASR("拆开")
+    corr = EchoCorrector()
+    p2 = Processor(cfg, db, client=object(), engine=SplitEngine(turns), asr=asr, corrector=corr)
+    res = p2.split_utterance(mixed, auto=True)
+    assert res["removed"] == mixed and res["billed_s"] == 6.0 and len(asr.calls) == 2
+    assert [(x["start_s"], x["end_s"], x["speaker"], x["speaker_id"], x["score"], x["text"]) for x in res["pieces"]] == \
+        [(0.0, 2.5, "张三", 1, 0.9, "拆开"), (2.5, 6.0, "未知", None, 0.2, "拆开")]
+    assert len(corr.calls) == 1 and [it["speaker"] for it in corr.calls[0][0]] == ["张三", "未知"]
+    utts = db.utterances_for_day("2026-10-31")
+    assert [(u["id"], u["cluster_label"], u["speaker_source"]) for u in utts] == [(res["pieces"][0]["id"], 0, None), (res["pieces"][1]["id"], 1, None)]
+    assert utts[1]["abs_start"] == "2026-10-31T08:19:12.500"
+    assert db.one("SELECT COUNT(*) AS n FROM utterances WHERE text='混在一起'")["n"] == 0
+    assert db.one("SELECT COUNT(*) AS n FROM utterance_tokens")["n"] == 2
+    md = (cfg.transcripts_dir / "2026-10-31.md").read_text(encoding="utf-8")
+    assert "08:19:12 未知**：拆开" in md and "混在一起" not in md
+
+
+# --------------------------------------------------------------------------- v3b: faint (far-away) turns (more in tests/test_loudness.py)
+def test_process_segment_drops_faint_turn_and_stores_loudness(cfg, db):
+    """The scripted engine hands back two turns; the second lies on 100x quieter audio and is dropped before
+    identification (audio.min_speech_dbfs -40): its seconds land in segments.faint_s, the kept utterance stores its level."""
+    from tests.conftest import sine
+
+    started = datetime(2026, 10, 31, 9, 0, 0)
+    d = cfg.audio_dir / "2026-10-31"
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / "090000_000.wav"
+    sf.write(path, np.concatenate([sine(3.0, amp=0.3), sine(3.0, amp=0.003)]), SR, format="WAV", subtype="PCM_16")
+    seg_id = db.add_segment(path, started, 6.0, SR, speech_s=6.0)
+    engine = FakeEngine([Turn(0.1, 2.9, 0), Turn(3.1, 5.9, 1)])
+    asr = FakeASR("你好世界")
+    p = Processor(cfg, db, client=object(), engine=engine, asr=asr, corrector=EchoCorrector())
+    assert p.process_segment(seg_id) == 1 and len(asr.calls) == 1
+    seg = db.get_segment(seg_id)
+    assert seg["status"] == "done" and seg["faint_s"] == pytest.approx(2.8, abs=1e-6)
+    utts = db.utterances_for_day("2026-10-31")
+    assert len(utts) == 1 and utts[0]["cluster_label"] == 0 and -14.5 < utts[0]["loudness_db"] < -12.5
+    # gate off: both turns survive, nothing is counted as faint
+    cfg["audio"]["min_speech_dbfs"] = None
+    assert p.process_segment(seg_id) == 2 and db.get_segment(seg_id)["faint_s"] == 0.0
+    assert [round(u["loudness_db"]) for u in db.utterances_for_day("2026-10-31")] == [-13, -53]

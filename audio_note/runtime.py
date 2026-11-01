@@ -10,7 +10,7 @@ recorder thread optional and switchable at run time. Only one process may run th
 a data directory (service.lock); a second `audio-note ui` still works for browsing and memory chat
 but cannot record or run jobs ("read-only mode").
 
-Jobs (process / daily / cleanup / reindex / relabel / push / voices / relations) run one at a time on a worker thread
+Jobs (process / daily / cleanup / reindex / relabel / push / voices / relations / loudness) run one at a time on a worker thread
 and under Scheduler.lock, so a job started from the UI never overlaps a scheduler tick. Their state
 (running / last result / last error) is kept per job name for the UI to poll.
 """
@@ -36,9 +36,10 @@ from .service import AlreadyRunning, _recorder_loop, acquire_lock, release_lock,
 
 log = logging.getLogger(__name__)
 
-JOBS = ("process", "daily", "cleanup", "reindex", "relabel", "push", "voices", "relations")
+JOBS = ("process", "daily", "cleanup", "reindex", "relabel", "push", "voices", "relations", "loudness")
 JOB_LABELS = {"process": "转写处理", "daily": "生成日报", "cleanup": "清理音频", "reindex": "重建索引",
-              "relabel": "重新识别说话人", "push": "推送日报", "voices": "扫描未识别的声音", "relations": "推断关系"}
+              "relabel": "重新识别说话人", "push": "推送日报", "voices": "扫描未识别的声音", "relations": "推断关系",
+              "loudness": "统计音量分布"}
 JOIN_TIMEOUT_S = 15.0
 #: message for a speaker-embedding request / job when the CAM++ model file is absent
 VOICE_MODELS_MISSING_MSG = "模型文件缺失，无法提取声纹（运行 scripts/download_models.ps1）"
@@ -477,6 +478,19 @@ class Runtime:
             out["vectors_added"] = mem_vectors.index_missing(self.db, emb)
             out["vectors"] = self.db.vector_count(emb.name)
         return out
+
+    def _job_loudness(self) -> dict[str, Any]:
+        """Fill in the missing utterances.loudness_db (reading the audio of 'done' segments that still have a
+        file) and count the sentences below audio.min_speech_dbfs. Statistics only: nothing is deleted
+        (`audio-note loudness --apply` does that on the command line)."""
+        from .audio.loudness import backfill_loudness, loudness_stats, min_speech_dbfs
+
+        stop = self._svc_stop if self.scheduler_running() else None
+        computed = backfill_loudness(self.db, stop_event=stop)
+        thr = min_speech_dbfs(self.cfg)
+        st = loudness_stats(self.db, thr, unknown_label=str(self.cfg.speakers.unknown_label or "未知"))
+        return {"computed": int(computed), "below": int(st["below"]), "threshold": thr, "total": int(st["total"]),
+                "missing": int(st["missing"]), "speakers": st["speakers"]}
 
     def _job_relabel(self, day: str | None = None, segment_id: int | None = None) -> dict[str, Any]:
         from .speech.pipeline import Processor

@@ -9,6 +9,13 @@ them in speaker_embeddings; a 16 kHz copy of the speech-only part of every accep
 under data/speakers/<name>/ so voices can be re-embedded later. Identification: cosine similarity
 between a cluster's mean embedding and each enrolled speaker's embeddings (max over samples);
 accepted if >= identify_threshold.
+
+v3 (mixed sentences): a cluster decision is re-checked turn by turn (`identify_turns`, speakers.turn_check_min_s),
+a new enrollment sample must resemble the person's existing samples (`check_sample` / `SampleMismatch`,
+speakers.sample_consistency_min, `force=True` overrides) and `audit_samples` flags the outliers already stored.
+v3b: the reference voice is anchored on samples the user recorded / uploaded themselves (speaker_embeddings.origin
+'mic' / 'file'); without such an anchor two rival factions of samples are reported as `ambiguous` instead of one
+being deleted (see _analyse_samples).
 """
 from __future__ import annotations
 
@@ -29,6 +36,181 @@ log = logging.getLogger(__name__)
 
 MIN_ENROLL_SPEECH_S = 1.0   # samples with less speech than this are rejected (enroll and label alike)
 MIN_CLUSTER_SPEECH_S = 0.5  # a diarization cluster shorter than this is neither identified nor stored
+DEFAULT_SAMPLE_CONSISTENCY_MIN = 0.5
+DEFAULT_TURN_CHECK_MIN_S = 1.0
+DEFAULT_TURN_REJECT_MARGIN = 0.15
+DEFAULT_MIN_LABEL_SAMPLE_S = 2.5   # samples cut out of recordings (label / name a voice) need this much speech
+
+
+class SampleMismatch(ValueError):
+    """A new sample does not resemble the person's existing samples (best cosine `score` < `threshold`).
+    Raised by the enroll functions unless `force=True`; the API answers 400 with "mismatch": true."""
+
+    def __init__(self, name: str, score: float, threshold: float):
+        self.name = str(name)
+        self.score = float(score)
+        self.threshold = float(threshold)
+        super().__init__(f"这段声音和 {self.name} 已有的样本不像（相似度 {self.score:.2f} < {self.threshold:.2f}），没有加入；"
+                         "确定是同一个人可以用“仍然加入”")
+
+
+class TooShortSample(ValueError):
+    """The clip holds less speech than a voice sample needs (`speech_s` < `min_s`). The label flows catch it
+    and still assign the utterance to the person, just without adding a sample."""
+
+    def __init__(self, speech_s: float, min_s: float):
+        self.speech_s = float(speech_s)
+        self.min_s = float(min_s)
+        super().__init__(f"选中的范围只有 {self.speech_s:.1f}s 语音（至少需要 {self.min_s:g}s），没有加入声纹样本")
+
+
+def _unit(v: np.ndarray) -> np.ndarray:
+    v = np.asarray(v, dtype=np.float32).ravel()
+    n = float(np.linalg.norm(v))
+    return v / n if n > 0 else v
+
+
+def sample_consistency_min(cfg: Config) -> float:
+    try:
+        return float(cfg.speakers.get("sample_consistency_min", DEFAULT_SAMPLE_CONSISTENCY_MIN))
+    except (TypeError, ValueError, AttributeError):
+        return DEFAULT_SAMPLE_CONSISTENCY_MIN
+
+
+def min_label_sample_s(cfg: Config) -> float:
+    """Minimum speech (s) for a sample taken out of a recording (transcript label / naming a voice group).
+    Short far-field snippets make unreliable embeddings that later attract the wrong voice."""
+    try:
+        return float(cfg.speakers.get("min_label_sample_s", DEFAULT_MIN_LABEL_SAMPLE_S))
+    except (TypeError, ValueError, AttributeError):
+        return DEFAULT_MIN_LABEL_SAMPLE_S
+
+
+ANCHOR_DURATION_CAP_S = 10.0   # duration weight cap when no trusted (mic / file) sample can anchor the core
+
+
+@dataclass
+class SampleAnalysis:
+    """Result of _analyse_samples: the reference voice, which samples form the core and which are ambiguous."""
+    ref: np.ndarray | None
+    core: frozenset[int] = frozenset()        # indices of the core faction (medoid + its neighbours)
+    ambiguous: frozenset[int] = frozenset()   # indices of samples in a two-faction stand-off (core + the rival faction)
+
+
+def _analyse_samples(embs: list[np.ndarray], durs: list[float], min_consistency: float,
+                     origins: list[str | None] | None = None) -> SampleAnalysis:
+    """Reference voice of a speaker from their stored samples (v3b anchor rules):
+
+    * The medoid (the sample most similar to all the others, duration-weighted, ties to the longer one) is chosen
+      among the samples whose origin is 'mic' or 'file' (the user recorded / uploaded them: they cannot contain
+      somebody else). Only when there is none is it chosen among all samples, with the duration weight capped at
+      ANCHOR_DURATION_CAP_S so a long mixed clip cannot buy its way in.
+    * Core = medoid + every sample at least `min_consistency` similar to it; the reference is their duration-
+      weighted mean, normalised. Consistency is always measured against the core, so two stray samples that
+      merely resemble each other cannot vouch for one another.
+    * Without a trusted anchor, non-core samples that form a faction of their own (>= 2 samples resembling each
+      other) make the speaker *ambiguous*: nobody can tell which faction is the real voice, so both factions are
+      flagged `ambiguous` and neither is an outlier (the user decides by ear). A lone stranger stays an outlier.
+    """
+    if not embs:
+        return SampleAnalysis(None)
+    if len(embs) == 1:
+        return SampleAnalysis(embs[0], frozenset({0}))
+    n = len(embs)
+    origins = list(origins) if origins is not None else [None] * n
+    from ..db import TRUSTED_SAMPLE_ORIGINS
+
+    trusted = [i for i in range(n) if origins[i] in TRUSTED_SAMPLE_ORIGINS]
+    E = np.stack(embs)
+    w = np.asarray([max(float(d or 0.0), 0.1) for d in durs], dtype=np.float64)
+    if not trusted:
+        w = np.minimum(w, ANCHOR_DURATION_CAP_S)
+    S = E @ E.T
+    score = np.zeros(n)
+    for i in range(n):
+        others = [j for j in range(n) if j != i]
+        score[i] = float(np.dot(S[i, others], w[others]) / w[others].sum())
+    candidates = trusted or list(range(n))
+    # tie-break on duration so a long clean recording beats a short snippet
+    medoid = int(max(candidates, key=lambda i: (round(score[i], 6), w[i])))
+    thr = float(min_consistency)
+    core = [j for j in range(n) if j == medoid or S[medoid, j] >= thr]
+    ref = _unit((E[core] * w[core][:, None]).sum(axis=0))
+    ambiguous: set[int] = set()
+    if not trusted:
+        rest = [j for j in range(n) if j not in core]
+        faction = {i for i in rest if any(j != i and S[i, j] >= thr for j in rest)}
+        if len(faction) >= 2:
+            ambiguous = faction | set(core)
+    return SampleAnalysis(ref, frozenset(core), frozenset(ambiguous))
+
+
+def _core_reference(embs: list[np.ndarray], durs: list[float], min_consistency: float,
+                    origins: list[str | None] | None = None) -> np.ndarray | None:
+    """The reference voice alone (see _analyse_samples)."""
+    return _analyse_samples(embs, durs, min_consistency, origins).ref
+
+
+def _speaker_sample_rows(db: DB, speaker_id: int) -> list:
+    return db.query("SELECT id, embedding, dim, source_path, duration_s, origin FROM speaker_embeddings WHERE speaker_id=? ORDER BY id",
+                    (int(speaker_id),))
+
+
+def check_sample(db: DB, speaker_id: int, emb: np.ndarray, min_consistency: float) -> tuple[float | None, bool]:
+    """(cosine between `emb` and the speaker's reference voice or None when there is no sample, ok).
+    Samples of another embedding dimension (older model) are not comparable and ignored. When the stored
+    samples are ambiguous (two factions, no trusted anchor) the best cosine to any sample is returned and the
+    sample is never refused. Pure numpy."""
+    e = _unit(emb)
+    embs, durs, origins = [], [], []
+    for r in _speaker_sample_rows(db, speaker_id):
+        if int(r["dim"]) != e.shape[0]:
+            continue
+        embs.append(_unit(np.frombuffer(r["embedding"], dtype=np.float32)))
+        durs.append(r["duration_s"])
+        origins.append(r["origin"])
+    a = _analyse_samples(embs, durs, min_consistency, origins)
+    if a.ref is None:
+        return None, True
+    if a.ambiguous:
+        return max(float(np.dot(e, x)) for x in embs), True
+    s = float(np.dot(e, a.ref))
+    return s, s >= float(min_consistency)
+
+
+def audit_samples(db: DB, speaker_id: int, min_consistency: float) -> list[dict]:
+    """Every stored sample of a speaker with its `origin`, its `consistency` (cosine to the core reference; None
+    when it is the only comparable one), `ambiguous` (part of a two-faction stand-off, see _analyse_samples) and
+    `outlier` (consistency < min_consistency and not ambiguous). Pure numpy, no model."""
+    rows = _speaker_sample_rows(db, speaker_id)
+    embs = [(_unit(np.frombuffer(r["embedding"], dtype=np.float32)) if r["dim"] else None) for r in rows]
+    # the reference is built per embedding dimension (samples of an older model are compared among themselves)
+    analyses: dict[int, tuple[SampleAnalysis, list[int]]] = {}
+    for dim in {e.shape[0] for e in embs if e is not None and e.size}:
+        idx = [i for i, e in enumerate(embs) if e is not None and e.shape[0] == dim]
+        if len(idx) < 2:
+            continue
+        a = _analyse_samples([embs[i] for i in idx], [rows[i]["duration_s"] for i in idx], min_consistency,
+                             [rows[i]["origin"] for i in idx])
+        analyses[dim] = (a, idx)
+    out: list[dict] = []
+    for i, (r, ei) in enumerate(zip(rows, embs)):
+        best: float | None = None
+        amb = False
+        if ei is not None and ei.size and ei.shape[0] in analyses:
+            a, idx = analyses[ei.shape[0]]
+            if a.ref is not None:
+                best = float(np.dot(ei, a.ref))
+                amb = idx.index(i) in a.ambiguous
+        out.append({"id": int(r["id"]), "source_path": r["source_path"], "duration_s": r["duration_s"], "origin": r["origin"],
+                    "consistency": round(best, 3) if best is not None else None, "ambiguous": amb,
+                    "outlier": best is not None and best < float(min_consistency) and not amb})
+    return out
+
+
+def speaker_is_ambiguous(db: DB, speaker_id: int, min_consistency: float) -> bool:
+    """True when the speaker's samples split into two factions nobody can arbitrate (see _analyse_samples)."""
+    return any(a["ambiguous"] for a in audit_samples(db, speaker_id, min_consistency))
 
 
 @dataclass
@@ -134,28 +316,143 @@ class SpeakerEngine:
             return None
         return self.embed(speech[: 60 * SAMPLE_RATE])
 
+    def _turn_check_params(self) -> tuple[float, float]:
+        sp = self.cfg.speakers
+        try:
+            min_s = float(sp.get("turn_check_min_s", DEFAULT_TURN_CHECK_MIN_S))
+        except (TypeError, ValueError):
+            min_s = DEFAULT_TURN_CHECK_MIN_S
+        try:
+            margin = float(sp.get("turn_reject_margin", DEFAULT_TURN_REJECT_MARGIN))
+        except (TypeError, ValueError):
+            margin = DEFAULT_TURN_REJECT_MARGIN
+        return min_s, margin
+
+    def _cluster_decisions(self, audio: np.ndarray, clusters: dict[int, list[Turn]], enrolled: list[tuple[int, str, np.ndarray]],
+                           thr: float) -> dict[int, tuple[int | None, str | None, float | None, np.ndarray | None]]:
+        """Per cluster: (speaker_id, speaker_name, score, embedding) - the decision as before v3."""
+        out: dict[int, tuple[int | None, str | None, float | None, np.ndarray | None]] = {}
+        for cid, ts in clusters.items():
+            emb = self.cluster_embedding(audio, ts)
+            if emb is None:
+                out[cid] = (None, None, None, None)
+                continue
+            sid, name, score = self.match(emb, enrolled, thr)
+            out[cid] = (sid, name, score, emb)
+        return out
+
+    @staticmethod
+    def _sim_to_speaker(emb: np.ndarray, enrolled: list[tuple[int, str, np.ndarray]], sid: int) -> float:
+        best = -1.0
+        for s, _n, e in enrolled:
+            if s == sid:
+                best = max(best, float(np.dot(emb, _unit(e))))
+        return best
+
+    def _turn_audio(self, audio: np.ndarray, t: Turn) -> np.ndarray | None:
+        seg = audio[int(t.start * SAMPLE_RATE): int(t.end * SAMPLE_RATE)]
+        return seg if len(seg) >= int(MIN_CLUSTER_SPEECH_S * SAMPLE_RATE) else None
+
     def identify_turns(self, audio: np.ndarray, turns: list[Turn], db: DB, segment_id: int | None = None) -> list[Turn]:
         """Embed each cluster (all its turns concatenated, speech up to 60 s) and match against enrolled speakers.
         With `segment_id` every cluster embedding is also stored in cluster_embeddings (speech_s = sum of its
-        turn durations) so the unknown voices can later be grouped and named without re-reading the audio."""
+        turn durations) so the unknown voices can later be grouped and named without re-reading the audio.
+
+        Turn-level correction (only with enrolled speakers and speakers.turn_check_min_s > 0): every turn at
+        least that long is embedded on its own; a turn that clearly belongs to another enrolled speaker, or
+        does not resemble the cluster's speaker at all, is moved to a new cluster id (one per (original
+        cluster, speaker) so build_chunks still merges neighbours). Shorter turns keep the cluster decision.
+        The list is returned in its original order; cluster ids of moved turns change in place."""
         enrolled = db.speaker_embeddings()
         thr = float(self.cfg.speakers.identify_threshold)
         unknown = self.cfg.speakers.unknown_label
         clusters: dict[int, list[Turn]] = {}
         for t in turns:
             clusters.setdefault(t.cluster, []).append(t)
+        decisions = self._cluster_decisions(audio, clusters, enrolled, thr)
         for cid, ts in clusters.items():
-            emb = self.cluster_embedding(audio, ts)
-            if emb is None:
-                name, sid, score = unknown, None, None
-            else:
-                sid, name, score = self.match(emb, enrolled, thr)
-                if sid is None:
-                    name = unknown
-                if segment_id is not None:
-                    db.upsert_cluster_embedding(int(segment_id), int(cid), emb, sum(t.duration for t in ts))
+            sid, name, score, _emb = decisions[cid]
             for t in ts:
-                t.speaker_id, t.speaker_name, t.score = sid, name, score
+                t.speaker_id, t.speaker_name, t.score = sid, (name if sid is not None else unknown), score
+
+        moved = 0
+        moved_s = 0.0
+        min_s, margin = self._turn_check_params()
+        if enrolled and min_s > 0 and turns:
+            next_id = max(clusters) + 1
+            new_ids: dict[tuple[int, int | None], int] = {}
+            for cid, ts in list(clusters.items()):
+                s_c = decisions[cid][0]
+                for t in ts:
+                    if t.duration < min_s:
+                        continue
+                    seg = self._turn_audio(audio, t)
+                    if seg is None:
+                        continue
+                    e_t = self.embed(seg)
+                    s_t, name_t, score_t = self.match(e_t, enrolled, thr)
+                    target: tuple[int | None, str | None, float | None] | None = None
+                    if s_c is not None:
+                        sim_c = self._sim_to_speaker(e_t, enrolled, s_c)
+                        if s_t is not None and s_t != s_c and sim_c < thr:
+                            target = (s_t, name_t, score_t)
+                        elif s_t is None and sim_c < thr - margin:
+                            target = (None, None, score_t)
+                    elif s_t is not None:
+                        target = (s_t, name_t, score_t)
+                    if target is None:
+                        continue
+                    key = (cid, target[0])
+                    if key not in new_ids:
+                        new_ids[key] = next_id
+                        next_id += 1
+                    t.cluster = new_ids[key]
+                    t.speaker_id, t.speaker_name, t.score = target[0], (target[1] if target[0] is not None else unknown), target[2]
+                    moved += 1
+                    moved_s += t.duration
+            if moved:
+                log.info("segment #%s: turn-level check moved %d turns (%.1f s)",
+                         segment_id if segment_id is not None else "?", moved, moved_s)
+
+        if segment_id is not None:
+            final: dict[int, list[Turn]] = {}
+            for t in turns:
+                final.setdefault(t.cluster, []).append(t)
+            for cid, ts in final.items():
+                emb = self.cluster_embedding(audio, ts) if (moved or cid not in decisions) else decisions[cid][3]
+                if emb is None:
+                    continue
+                db.upsert_cluster_embedding(int(segment_id), int(cid), emb, sum(t.duration for t in ts))
+        return turns
+
+    def identify_utterances(self, audio: np.ndarray, turns: list[Turn], db: DB, segment_id: int | None = None) -> list[Turn]:
+        """Per-utterance identification for relabel: cluster decision as a baseline (cluster embeddings stored
+        with `segment_id`), then every turn at least speakers.turn_check_min_s long is matched on its own audio
+        and carries its own score; shorter turns keep the cluster result. Cluster ids never change."""
+        enrolled = db.speaker_embeddings()
+        thr = float(self.cfg.speakers.identify_threshold)
+        unknown = self.cfg.speakers.unknown_label
+        clusters: dict[int, list[Turn]] = {}
+        for t in turns:
+            clusters.setdefault(t.cluster, []).append(t)
+        decisions = self._cluster_decisions(audio, clusters, enrolled, thr)
+        min_s, _margin = self._turn_check_params()
+        own = 0
+        for cid, ts in clusters.items():
+            sid, name, score, emb = decisions[cid]
+            if emb is not None and segment_id is not None:
+                db.upsert_cluster_embedding(int(segment_id), int(cid), emb, sum(t.duration for t in ts))
+            for t in ts:
+                t.speaker_id, t.speaker_name, t.score = sid, (name if sid is not None else unknown), score
+                if not enrolled or min_s <= 0 or t.duration < min_s:
+                    continue
+                seg = self._turn_audio(audio, t)
+                if seg is None:
+                    continue
+                s_t, name_t, score_t = self.match(self.embed(seg), enrolled, thr)
+                t.speaker_id, t.speaker_name, t.score = s_t, (name_t if s_t is not None else unknown), score_t
+                own += 1
+        log.debug("segment #%s: %d/%d utterances identified on their own audio", segment_id, own, len(turns))
         return turns
 
     @staticmethod
@@ -173,12 +470,34 @@ class SpeakerEngine:
             return sid, name, score
         return None, None, score
 
+    # --- sample consistency ----------------------------------------------------
+    def check_sample(self, db: DB, speaker_id: int, emb: np.ndarray) -> tuple[float | None, bool]:
+        """(best cosine to the speaker's existing samples or None when there is none, ok = not below
+        speakers.sample_consistency_min)."""
+        return check_sample(db, speaker_id, emb, sample_consistency_min(self.cfg))
+
+    def audit_samples(self, db: DB, speaker_id: int) -> list[dict]:
+        """Stored samples with `consistency` / `outlier` (see module-level audit_samples); no model involved."""
+        return audit_samples(db, speaker_id, sample_consistency_min(self.cfg))
+
+    def _guard_sample(self, db: DB, name: str, emb: np.ndarray, force: bool) -> float | None:
+        """Raise SampleMismatch when `emb` does not resemble `name`'s existing samples (unless force).
+        Returns the best score (None without samples / without the speaker)."""
+        row = db.one("SELECT id FROM speakers WHERE name=?", (name,))
+        if row is None:
+            return None
+        score, ok = self.check_sample(db, int(row["id"]), emb)
+        if not ok and not force:
+            raise SampleMismatch(name, float(score), sample_consistency_min(self.cfg))
+        return score
+
     # --- enrollment ----------------------------------------------------------
-    def enroll(self, db: DB, name: str, sources: list[Path | str], notes: str | None = None) -> int:
-        """Register `name` with one embedding per source file. Files are decoded with libsndfile/ffmpeg."""
+    def enroll(self, db: DB, name: str, sources: list[Path | str], notes: str | None = None, force: bool = False) -> int:
+        """Register `name` with one embedding per source file. Files are decoded with libsndfile/ffmpeg.
+        A file whose voice does not resemble the person's existing samples is skipped (logged) unless `force`."""
         from ..audio.importer import decode_any
 
-        sid = db.upsert_speaker(name, notes)
+        sid = db.upsert_speaker(name)
         n = 0
         for src in sources:
             src = Path(src)
@@ -188,34 +507,50 @@ class SpeakerEngine:
             if speech_s < MIN_ENROLL_SPEECH_S:
                 log.warning("skip %s: only %.1fs speech", src, speech_s)
                 continue
+            emb = self.embed(speech)
+            score, ok = self.check_sample(db, sid, emb)
+            if not ok and not force:
+                log.warning("skip %s: does not resemble %s's existing samples (cosine %.2f < %.2f); use force to add it anyway",
+                            src, name, score, sample_consistency_min(self.cfg))
+                continue
             saved = self._save_sample(name, speech, src.stem)
-            db.add_speaker_embedding(sid, self.embed(speech), str(saved or src), speech_s)
+            db.add_speaker_embedding(sid, emb, str(saved or src), speech_s, origin="file")
             n += 1
+        if n and notes is not None:
+            db.upsert_speaker(name, notes)      # notes only once at least one sample made it in
         log.info("enrolled %s with %d samples", name, n)
         return sid
 
     def enroll_from_audio(self, db: DB, name: str, audio: np.ndarray, source: str | None = None,
-                          copy_as_source: bool = False) -> int:
+                          copy_as_source: bool = False, force: bool = False, min_speech_s: float | None = None,
+                          origin: str | None = "label") -> int:
         """Add one embedding for `name` from an in-memory clip. Raises ValueError when the clip holds
-        less than MIN_ENROLL_SPEECH_S of speech (a noise embedding would later attract false matches).
+        less than MIN_ENROLL_SPEECH_S of speech (a noise embedding would later attract false matches) and
+        SampleMismatch when the voice does not resemble the person's existing samples (unless `force`).
         `source` ("<file>#a-b") is stored as the sample's source_path and names the saved copy; with
         `copy_as_source` the saved speech-only copy is stored instead (for clips stitched from several
-        ranges, where a "#a-b" slice of the original would not play back the right audio)."""
+        ranges, where a "#a-b" slice of the original would not play back the right audio). `origin` is the
+        sample's provenance stored next to it ('label' by default, 'voice' when naming a voice group)."""
         speech = self.speech_only(audio)
         speech_s = len(speech) / SAMPLE_RATE
-        if speech_s < MIN_ENROLL_SPEECH_S:
-            raise ValueError(f"选中的范围只有 {speech_s:.1f}s 语音（至少需要 {MIN_ENROLL_SPEECH_S:.0f}s），未注册")
+        need = MIN_ENROLL_SPEECH_S if min_speech_s is None else max(float(min_speech_s), MIN_ENROLL_SPEECH_S)
+        if speech_s < need:
+            raise TooShortSample(speech_s, need)
+        emb = self.embed(speech)
+        self._guard_sample(db, name, emb, force)
         sid = db.upsert_speaker(name)
         saved = self._save_sample(name, speech, Path(str(source).split("#")[0]).stem if source else "label")
         stored = str(saved) if saved and (copy_as_source or source is None) else source
-        db.add_speaker_embedding(sid, self.embed(speech), stored, speech_s)
+        db.add_speaker_embedding(sid, emb, stored, speech_s, origin=origin)
         return sid
 
-    def enroll_from_segment_turns(self, db: DB, name: str, seg_path: Path | str, turns: list[tuple[float, float]]) -> int:
+    def enroll_from_segment_turns(self, db: DB, name: str, seg_path: Path | str, turns: list[tuple[float, float]],
+                                  force: bool = False, min_speech_s: float | None = None) -> int:
         """Label an existing recording's time ranges as `name` (used by `audio-note speakers label`)."""
         audio = read_segment(seg_path)
         parts = [audio[int(a * SAMPLE_RATE): int(b * SAMPLE_RATE)] for a, b in turns]
-        return self.enroll_from_audio(db, name, np.concatenate(parts), f"{seg_path}#{turns[0][0]:.1f}-{turns[-1][1]:.1f}")
+        return self.enroll_from_audio(db, name, np.concatenate(parts), f"{seg_path}#{turns[0][0]:.1f}-{turns[-1][1]:.1f}",
+                                      force=force, min_speech_s=min_speech_s, origin="label")
 
 
 def _safe_name(s: str) -> str:

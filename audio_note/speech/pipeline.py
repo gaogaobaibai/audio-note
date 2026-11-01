@@ -7,7 +7,7 @@ Public pieces
 -------------
 Chunk                 one speaker-homogeneous stretch of audio sent to ASR as a unit
 build_chunks(...)     pure function: diarization turns -> ASR chunks (merge / split / pad / drop)
-Processor             process_pending() / process_segment(seg_id)
+Processor             process_pending() / process_segment(seg_id) / relabel_segment(seg_id) / split_utterance(utt_id)
 write_day_markdown()  regenerate transcripts/YYYY-MM-DD.md from the DB
 transcribe_file()     one-off diarize + identify + ASR of any audio file (no DB writes)
 """
@@ -25,6 +25,7 @@ from typing import Any, Sequence
 
 import numpy as np
 
+from ..audio.loudness import is_faint, min_speech_dbfs, speech_dbfs
 from ..audio.storage import read_segment
 from ..audio.vad import SAMPLE_RATE
 from ..config import Config
@@ -35,6 +36,10 @@ from .speakers import Turn
 log = logging.getLogger(__name__)
 
 STALE_PROCESSING_S = 600   # a 'processing' row untouched for this long belongs to a dead run
+SPLIT_MIN_PIECE_S = 0.6    # a split piece shorter than this is merged into the previous one
+SPLIT_EDGE_S = 0.3         # a manual split point must lie inside (SPLIT_EDGE_S, duration - SPLIT_EDGE_S)
+SPLIT_MIN_TURN_S = 1.0     # auto split: diarization turns shorter than this are ignored
+SPLIT_PAD_S = 0.15         # ASR padding around a piece (same as build_chunks)
 
 
 # --------------------------------------------------------------------------- chunks
@@ -62,6 +67,29 @@ class Chunk:
         a = max(0, int(round(self.audio_start_s * SAMPLE_RATE)))
         b = min(len(audio), int(round(self.audio_end_s * SAMPLE_RATE)))
         return audio[a:b]
+
+
+def _clip(audio: np.ndarray, start_s: float, end_s: float) -> np.ndarray:
+    a = max(0, int(float(start_s) * SAMPLE_RATE))
+    b = min(len(audio), int(float(end_s) * SAMPLE_RATE))
+    return audio[a:b] if b > a else audio[:0]
+
+
+def drop_faint_turns(audio: np.ndarray, turns: Sequence[Turn], threshold: float | None) -> tuple[list[Turn], int, float]:
+    """Remove the diarization turns whose speech level (audio.loudness.speech_dbfs) is below `threshold` dBFS:
+    far-away / unclear voices are neither transcribed nor used for speaker identification. Returns
+    (kept turns in order, dropped count, dropped seconds); threshold None keeps everything."""
+    if threshold is None:
+        return list(turns), 0, 0.0
+    kept: list[Turn] = []
+    dropped, faint_s = 0, 0.0
+    for t in turns:
+        if speech_dbfs(_clip(audio, t.start, t.end)) < float(threshold):
+            dropped += 1
+            faint_s += max(0.0, t.duration)
+        else:
+            kept.append(t)
+    return kept, dropped, faint_s
 
 
 def build_chunks(turns: Sequence[Turn], audio_len_s: float, max_chunk_s: float, gap_s: float = 1.0,
@@ -370,8 +398,13 @@ class Processor:
         self.db.execute("DELETE FROM transcripts WHERE segment_id=?", (seg_id,))
         self.db.delete_cluster_embeddings(seg_id)
 
-        # 2. diarize + identify
+        # 2. diarize, drop the faint (far-away) turns, identify the rest
         turns: list[Turn] = list(self.engine.diarize(audio))
+        min_db = min_speech_dbfs(self.cfg)
+        turns, n_faint, faint_s = drop_faint_turns(audio, turns, min_db)
+        if n_faint:
+            log.info("segment #%d: dropped %d faint turns (%.1f s, < %g dBFS)", seg_id, n_faint, faint_s, min_db)
+        self.db.execute("UPDATE segments SET faint_s=? WHERE id=?", (float(faint_s), seg_id))
         if turns:
             turns = self._identify(audio, turns, seg_id)
         chunks = build_chunks(turns, audio_len_s, float(self.cfg.mimo.asr_max_chunk_s)) if turns else []
@@ -415,6 +448,7 @@ class Processor:
                 "cluster_label": c.cluster, "speaker_id": c.speaker_id,
                 "speaker_name": c.speaker_name or unknown, "speaker_score": c.score,
                 "text_raw": raw, "text": text, "text_seg": tokenize(text),
+                "loudness_db": speech_dbfs(_clip(audio, c.start_s, c.end_s)),
             })
         self.db.execute(
             "INSERT INTO transcripts(segment_id, asr_model, raw_json, text_raw, text_corrected, correction_json, language)"
@@ -434,12 +468,17 @@ class Processor:
                 log.warning("cannot write markdown for %s: %s", day, e)
         return len(rows)
 
-    def _identify(self, audio: np.ndarray, turns: list[Turn], seg_id: int) -> list[Turn]:
+    def _identify(self, audio: np.ndarray, turns: list[Turn], seg_id: int | None, per_utterance: bool = False) -> list[Turn]:
         """engine.identify_turns with the segment id (so cluster embeddings get stored); engines that do
-        not take `segment_id` (fakes in tests, older implementations) are called the old way."""
-        if _accepts_segment_id(self.engine.identify_turns):
-            return list(self.engine.identify_turns(audio, turns, self.db, segment_id=seg_id))
-        return list(self.engine.identify_turns(audio, turns, self.db))
+        not take `segment_id` (fakes in tests, older implementations) are called the old way.
+        `per_utterance` (relabel) prefers engine.identify_utterances: every utterance long enough is matched on
+        its own audio and keeps its own score, the short ones follow their cluster."""
+        fn = getattr(self.engine, "identify_utterances", None) if per_utterance else None
+        if not callable(fn):
+            fn = self.engine.identify_turns
+        if seg_id is not None and _accepts_segment_id(fn):
+            return list(fn(audio, turns, self.db, segment_id=seg_id))
+        return list(fn(audio, turns, self.db))
 
     # --- re-identification without ASR ------------------------------------
     def relabel_segment(self, seg_id: int) -> int:
@@ -463,14 +502,31 @@ class Processor:
         if not utts:
             return 0
         audio = read_segment(path)
-        turns = [Turn(float(u["start_s"]), float(u["end_s"]), int(u["cluster_label"] if u["cluster_label"] is not None else i))
-                 for i, u in enumerate(utts)]
-        turns = self._identify(audio, turns, seg_id)
+        # loudness: fill in what older rows lack, and keep the faint (far-away) utterances out of identification
+        min_db = min_speech_dbfs(self.cfg)
+        levels: list[float] = []
+        for u in utts:
+            lv = u["loudness_db"]
+            if lv is None:
+                lv = speech_dbfs(_clip(audio, u["start_s"], u["end_s"]))
+                self.db.execute("UPDATE utterances SET loudness_db=? WHERE id=? AND loudness_db IS NULL", (lv, u["id"]))
+            levels.append(float(lv))
+        loud = [i for i, lv in enumerate(levels) if not is_faint(lv, min_db)]
+        turns = [Turn(float(utts[i]["start_s"]), float(utts[i]["end_s"]),
+                      int(utts[i]["cluster_label"] if utts[i]["cluster_label"] is not None else i)) for i in loud]
+        if turns:
+            turns = self._identify(audio, turns, seg_id, per_utterance=True)
+        by_row = dict(zip(loud, turns))
         unknown = self.cfg.speakers.unknown_label
         changed = 0
         days: set[str] = set()
-        for u, t in zip(utts, turns):
+        for i, u in enumerate(utts):
             if u["speaker_source"] == "user" and u["speaker_id"] is not None:
+                continue
+            t = by_row.get(i)
+            if t is None:
+                # too quiet to identify: left as it is, just without a score
+                self.db.execute("UPDATE utterances SET speaker_score=NULL WHERE id=?", (u["id"],))
                 continue
             name = t.speaker_name or unknown
             cur = self.db.execute(
@@ -490,6 +546,206 @@ class Processor:
                     log.warning("cannot write markdown for %s: %s", day, e)
         log.info("relabel segment #%d: %d/%d utterances changed", seg_id, changed, len(utts))
         return changed
+
+    # --- splitting a mixed utterance -------------------------------------
+    def _utterance_for_split(self, utt_id: int) -> tuple[Any, Any, np.ndarray]:
+        """(utterance row, segment row, segment audio) or ValueError / FileNotFoundError."""
+        u = self.db.one("SELECT * FROM utterances WHERE id=?", (int(utt_id),))
+        if u is None:
+            raise ValueError("没有这条记录")
+        seg = self.db.get_segment(int(u["segment_id"]))
+        if seg is None:
+            raise ValueError(f"语句所属的录音段 #{u['segment_id']} 已不存在")
+        path = Path(seg["path"])
+        if not path.exists():
+            raise FileNotFoundError("这段音频已不存在（超过保留期），无法拆分")
+        return u, seg, read_segment(path)
+
+    def _match_clip(self, clip: np.ndarray, enrolled: list[tuple[int, str, np.ndarray]], thr: float
+                    ) -> tuple[int | None, str | None, float | None]:
+        """Identify one piece on its own audio (at least SPLIT_MIN_TURN_S of it); unknown otherwise."""
+        if not enrolled or len(clip) < int(SPLIT_MIN_TURN_S * SAMPLE_RATE):
+            return None, None, None
+        embed = getattr(self.engine, "embed", None)
+        match = getattr(self.engine, "match", None)
+        if not callable(embed) or not callable(match):
+            return None, None, None
+        return match(embed(clip), enrolled, thr)
+
+    def _pieces_manual(self, clip: np.ndarray, at: list[float]) -> list[dict[str, Any]]:
+        dur = len(clip) / SAMPLE_RATE
+        pts: list[float] = []
+        for x in at:
+            try:
+                v = float(x)
+            except (TypeError, ValueError):
+                raise ValueError(f"拆分点应为秒数: {x!r}")
+            if not (SPLIT_EDGE_S < v < dur - SPLIT_EDGE_S):
+                raise ValueError(f"拆分点 {v:.1f}s 必须在 {SPLIT_EDGE_S:.1f}s 和 {dur - SPLIT_EDGE_S:.1f}s 之间")
+            if pts and v < pts[-1]:
+                raise ValueError("拆分点必须按时间升序")
+            if not pts or v - pts[-1] > 1e-6:
+                pts.append(v)
+        if not pts:
+            raise ValueError("需要至少一个拆分点")
+        enrolled = self.db.speaker_embeddings()
+        thr = float(self.cfg.speakers.identify_threshold)
+        bounds = [0.0, *pts, dur]
+        pieces: list[dict[str, Any]] = []
+        for a, b in zip(bounds, bounds[1:]):
+            sid, name, score = self._match_clip(clip[int(a * SAMPLE_RATE): int(b * SAMPLE_RATE)], enrolled, thr)
+            pieces.append({"rel_start": a, "rel_end": b, "speaker_id": sid, "speaker_name": name, "score": score})
+        return pieces
+
+    def _pieces_auto(self, clip: np.ndarray) -> list[dict[str, Any]]:
+        """Diarize the utterance's audio, identify (cluster + turn level), merge neighbouring turns of the
+        same speaker / cluster into pieces."""
+        turns = [t for t in self.engine.diarize(clip) if t.duration >= SPLIT_MIN_TURN_S]
+        if not turns:
+            raise ValueError("没有分出第二个声音，请手动指定拆分点")
+        turns = sorted(self.engine.identify_turns(clip, turns, self.db), key=lambda t: (t.start, t.end))
+        pieces: list[dict[str, Any]] = []
+        for t in turns:
+            key = ("s", t.speaker_id) if t.speaker_id is not None else ("c", t.cluster)
+            if pieces and pieces[-1]["_key"] == key:
+                pieces[-1]["rel_end"] = max(pieces[-1]["rel_end"], float(t.end))
+                continue
+            pieces.append({"_key": key, "rel_start": float(t.start), "rel_end": float(t.end), "speaker_id": t.speaker_id,
+                           "speaker_name": t.speaker_name if t.speaker_id is not None else None, "score": t.score})
+        for pc in pieces:
+            pc.pop("_key", None)
+        if len(pieces) < 2:
+            raise ValueError("没有分出第二个声音，请手动指定拆分点")
+        return pieces
+
+    @staticmethod
+    def _merge_short_pieces(pieces: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for pc in pieces:
+            if out and pc["rel_end"] - pc["rel_start"] < SPLIT_MIN_PIECE_S:
+                out[-1]["rel_end"] = pc["rel_end"]
+                continue
+            out.append(dict(pc))
+        if len(out) > 1 and out[0]["rel_end"] - out[0]["rel_start"] < SPLIT_MIN_PIECE_S:
+            nxt = out[1]
+            nxt["rel_start"] = out[0]["rel_start"]
+            out = out[1:]
+        return out
+
+    def _plan_split(self, utt_id: int, at: list[float] | None, auto: bool) -> tuple[Any, Any, np.ndarray, list[dict[str, Any]]]:
+        u, seg, audio = self._utterance_for_split(utt_id)
+        a, b = float(u["start_s"]), float(u["end_s"])
+        clip = audio[int(a * SAMPLE_RATE): int(b * SAMPLE_RATE)]
+        if len(clip) < int(2 * SPLIT_MIN_PIECE_S * SAMPLE_RATE):
+            raise ValueError("这句太短，无法拆分")
+        if auto:
+            pieces = self._pieces_auto(clip)
+        elif at:
+            pieces = self._pieces_manual(clip, list(at))
+        else:
+            raise ValueError("需要给出拆分点（at）或选择自动拆分（auto）")
+        pieces = self._merge_short_pieces(pieces)
+        if len(pieces) < 2:
+            raise ValueError("拆分点太靠近两端，只剩一段，没有拆分")
+        unknown = self.cfg.speakers.unknown_label
+        for pc in pieces:
+            pc["start_s"] = round(a + float(pc["rel_start"]), 3)
+            pc["end_s"] = round(a + float(pc["rel_end"]), 3)
+            pc["rel_start"] = round(float(pc["rel_start"]), 3)
+            pc["rel_end"] = round(float(pc["rel_end"]), 3)
+            pc["speaker"] = pc["speaker_name"] or unknown
+            pc["score"] = round(float(pc["score"]), 3) if pc.get("score") is not None else None
+        return u, seg, audio, pieces
+
+    def preview_split(self, utt_id: int, at: list[float] | None = None, auto: bool = True) -> dict[str, Any]:
+        """The pieces split_utterance would produce (bounds + identification), without ASR or DB writes."""
+        u, _seg, _audio, pieces = self._plan_split(utt_id, at, auto)
+        return {"utterance_id": int(u["id"]), "segment_id": int(u["segment_id"]), "start_s": float(u["start_s"]),
+                "end_s": float(u["end_s"]), "pieces": [{k: pc[k] for k in ("start_s", "end_s", "rel_start", "rel_end",
+                                                                             "speaker", "speaker_id", "score")} for pc in pieces]}
+
+    def split_utterance(self, utt_id: int, at: list[float] | None = None, auto: bool = False) -> dict[str, Any]:
+        """Split one (mixed) utterance into several: `auto` diarizes + identifies its audio, `at` cuts at the
+        given seconds (relative to the utterance start). Every piece is transcribed again (ASR + correction) and
+        replaces the original row inside one transaction (tokens / vectors cascade); piece 0 keeps the cluster
+        label, the others get fresh labels; cluster_embeddings and the day Markdown are refreshed.
+        Returns {"removed", "pieces": [{id, start_s, end_s, speaker, speaker_id, score, text}], "billed_s"}.
+        An ASR failure (LLMError) leaves the database untouched."""
+        u, seg, audio, pieces = self._plan_split(utt_id, at, auto)
+        seg_id = int(u["segment_id"])
+        audio_len_s = len(audio) / SAMPLE_RATE
+        started_at = _parse_iso(seg["started_at"])
+        base_cluster = int(u["cluster_label"]) if u["cluster_label"] is not None else 0
+        top = self.db.one("SELECT MAX(cluster_label) AS m FROM utterances WHERE segment_id=?", (seg_id,))
+        next_cluster = int(top["m"]) + 1 if top and top["m"] is not None else base_cluster + 1
+        chunks: list[Chunk] = []
+        for k, pc in enumerate(pieces):
+            cl = base_cluster if k == 0 else next_cluster + k - 1
+            c = Chunk(float(pc["start_s"]), float(pc["end_s"]), cl, pc["speaker_id"], pc["speaker_name"], pc["score"])
+            c.audio_start_s = max(0.0, c.start_s - SPLIT_PAD_S)
+            c.audio_end_s = min(audio_len_s, c.end_s + SPLIT_PAD_S)
+            chunks.append(c)
+        self._register_terms()
+        spoken, billed, filtered = transcribe_chunks(self.asr, audio, chunks, _asr_concurrency(self.cfg), stop_event=self.stop_event)
+        self.skipped_chunks += filtered
+        if len(spoken) != len(chunks):
+            # every piece must come back with text, or the sentence would lose part of what was said
+            raise ValueError("有一段没有转写出文字（或被内容过滤），没有修改这句")
+        corrected, _edits = self._correct(spoken)
+        unknown = self.cfg.speakers.unknown_label
+        rows: list[dict[str, Any]] = []
+        days: set[str] = {str(u["day"])}
+        for i, (c, raw) in enumerate(spoken):
+            text = corrected[i]
+            abs_start = started_at + timedelta(seconds=c.start_s)
+            day = abs_start.strftime("%Y-%m-%d")
+            days.add(day)
+            rows.append({"segment_id": seg_id, "start_s": c.start_s, "end_s": c.end_s,
+                         "abs_start": abs_start.isoformat(timespec="milliseconds"), "day": day,
+                         "cluster_label": c.cluster, "speaker_id": c.speaker_id, "speaker_name": c.speaker_name or unknown,
+                         "speaker_score": c.score, "text_raw": raw, "text": text, "text_seg": tokenize(text), "speaker_source": None,
+                         "loudness_db": speech_dbfs(_clip(audio, c.start_s, c.end_s))})
+        ids: list[int] = []
+        with self.db.transaction() as con:
+            # the row must still be the one we planned on (ASR took seconds: another split / relabel may have replaced it)
+            cur = con.execute("DELETE FROM utterances WHERE id=? AND start_s=? AND end_s=?",
+                              (int(utt_id), float(u["start_s"]), float(u["end_s"])))
+            if int(cur.rowcount or 0) != 1:
+                raise ValueError("这句已经被修改或拆分过了，请刷新")
+            for r in rows:
+                # new ids above every id ever used, so the page never confuses a piece with the row it replaced
+                cur = con.execute(
+                    "INSERT INTO utterances(id,segment_id,start_s,end_s,abs_start,day,cluster_label,speaker_id,speaker_name,speaker_score,"
+                    "text_raw,text,speaker_source,loudness_db)"
+                    " VALUES ((SELECT COALESCE(MAX(id),0)+1 FROM utterances),?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (r["segment_id"], r["start_s"], r["end_s"], r["abs_start"], r["day"], r["cluster_label"], r["speaker_id"],
+                     r["speaker_name"], r["speaker_score"], r["text_raw"], r["text"], r["speaker_source"], r["loudness_db"]))
+                uid = int(cur.lastrowid)
+                ids.append(uid)
+                if r["text_seg"]:
+                    con.execute("INSERT INTO utterance_tokens(utterance_id, text_seg) VALUES (?,?)", (uid, r["text_seg"]))
+        self._embed_new(ids)
+        cluster_embedding = getattr(self.engine, "cluster_embedding", None)
+        if callable(cluster_embedding):
+            for cl in sorted({c.cluster for c, _ in spoken}):
+                ts = [Turn(float(r["start_s"]), float(r["end_s"]), cl) for r in self.db.query(
+                    "SELECT start_s, end_s FROM utterances WHERE segment_id=? AND cluster_label=? ORDER BY start_s, id", (seg_id, cl))]
+                try:
+                    emb = cluster_embedding(audio, ts)
+                    if emb is not None:
+                        self.db.upsert_cluster_embedding(seg_id, cl, emb, sum(t.duration for t in ts))
+                except Exception as e:  # noqa: BLE001 - the rows are in; the voice grouping just lacks this cluster
+                    log.warning("split: cluster embedding for #%d/%d failed: %s", seg_id, cl, e)
+        for day in sorted(days):
+            try:
+                write_day_markdown(self.db, self.cfg, day)
+            except Exception as e:  # noqa: BLE001 - the DB is the source of truth
+                log.warning("cannot write markdown for %s: %s", day, e)
+        out_pieces = [{"id": uid, "start_s": round(c.start_s, 3), "end_s": round(c.end_s, 3), "speaker": c.speaker_name or unknown,
+                       "speaker_id": c.speaker_id, "score": round(float(c.score), 3) if c.score is not None else None, "text": corrected[i]}
+                      for i, (uid, (c, _raw)) in enumerate(zip(ids, spoken))]
+        log.info("split utterance #%d (segment #%d) into %d pieces (%.1fs billed)", int(utt_id), seg_id, len(ids), billed)
+        return {"removed": int(utt_id), "pieces": out_pieces, "billed_s": round(float(billed), 1)}
 
     def relabel(self, day: str | None = None, segment_id: int | None = None) -> dict[str, int]:
         """relabel_segment over every 'done' segment whose audio still exists (optionally one day / one id)."""
@@ -692,5 +948,5 @@ def transcribe_file(cfg: Config, client: Any, path: Path | str, db: DB | None = 
     } for i, (c, raw) in enumerate(spoken)]
 
 
-__all__ = ["Chunk", "Processor", "build_chunks", "write_day_markdown", "segment_heading", "transcribe_file",
-           "tokenize", "load_glossary"]
+__all__ = ["Chunk", "Processor", "build_chunks", "drop_faint_turns", "write_day_markdown", "segment_heading", "transcribe_file",
+           "tokenize", "load_glossary", "SPLIT_MIN_PIECE_S", "SPLIT_EDGE_S", "SPLIT_MIN_TURN_S"]

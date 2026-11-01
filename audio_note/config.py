@@ -53,6 +53,7 @@ DEFAULTS: dict[str, Any] = {
         "system_audio": False,         # also capture what the speakers / headphones play (meetings, calls): WASAPI loopback
         "system_device": None,         # None = default output device; or an output device index / name substring
         "system_gain": 1.0,            # level of the system audio in the mix
+        "min_speech_dbfs": -40.0,      # speech turns quieter than this (dBFS) are far / unclear: not transcribed, not enrolled; null = off
     },
     "storage": {
         "cleanup_enabled": True,
@@ -76,6 +77,10 @@ DEFAULTS: dict[str, Any] = {
         "infer_relations": True,        # after the daily digest, ask the LLM how each speaker relates to the user
         "relation_min_utterances": 15,  # a speaker needs at least this many utterances before relation inference
         "relation_min_confidence": 0.6, # inferred relations below this confidence are not written
+        "min_label_sample_s": 2.5,      # a sample cut out of a recording (label / name a voice) needs this much speech
+        "sample_consistency_min": 0.5,  # a new sample whose best cosine to the person's existing samples is below this is refused
+        "turn_check_min_s": 1.0,        # turns at least this long are re-checked one by one after cluster identification (0 = off)
+        "turn_reject_margin": 0.15,     # a turn whose similarity to the cluster's speaker is below threshold - margin becomes unknown
     },
     "correction": {
         "enabled": True,
