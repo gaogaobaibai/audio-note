@@ -573,3 +573,14 @@ def test_unknown_utterance_count_and_grouping_skip_faint_sentences(cfg, db):
     assert [s["utterance_id"] for s in out["groups"][0]["samples"]] != [far]
     cfg["audio"]["min_speech_dbfs"] = None
     assert group_unknown_voices(db, cfg)["groups"][0]["utterances"] == 2
+
+
+
+def test_closest_hint_skips_vetoed_and_negative_dominated_speakers():
+    a, b = _voice(1), _voice(2)
+    enrolled = [(1, "甲", a), (2, "乙", b)]
+    c = voices._unit(a * 0.9 + b * 0.3)
+    assert voices._closest_enrolled(c, enrolled)["id"] == 1
+    assert voices._closest_enrolled(c, enrolled, exclude={1})["id"] == 2
+    assert voices._closest_enrolled(c, enrolled, [(1, c)])["id"] == 2          # c is a negative of 甲 itself
+    assert voices._closest_enrolled(c, enrolled, [(1, c)], exclude={2}) is None

@@ -649,3 +649,41 @@ def test_speakers_list_and_samples_expose_v3b_fields(client: TestClient, rt: Run
     assert sp["张三"]["outlier_samples"] == 0 and sp["张三"]["ambiguous_samples"] == 0
     rt.db.add_speaker_embedding(sid, _voice(5), "rec.wav", 2.0, origin="mic")
     assert client.get(f"/api/speakers/{sid}/samples").json()[-1]["origin"] == "mic"
+
+
+
+def test_speakers_list_has_v4_counts_and_settings_are_editable(client: TestClient, rt: Runtime):
+    sid = rt.db.upsert_speaker("甲")
+    rt.db.add_speaker_embedding(sid, _voice(1), None, 3.0)
+    sp = {s["id"]: s for s in client.get("/api/speakers").json()["speakers"]}[sid]
+    assert (sp["negatives"], sp["rejections"], sp["risky_samples"]) == (0, 0, 0)
+    rt.db.add_speaker_negative(sid, _voice(2), None, 1.0)
+    assert {s["id"]: s for s in client.get("/api/speakers").json()["speakers"]}[sid]["negatives"] == 1
+    cfg = client.get("/api/config").json()
+    assert "negative_margin" in cfg["defaults"]["speakers"] and "system_turn_share" in cfg["defaults"]["speakers"]
+    r = client.put("/api/config", json={"speakers": {"system_turn_share": 1.5}})
+    assert r.status_code == 400
+
+
+def test_label_whole_cluster_skips_vetoed_rows_and_an_explicit_pick_lifts_its_veto(client: TestClient, rt: Runtime,
+                                                                                   fake_engine: FakeEngine):
+    """v4 review fix: the cluster expansion of /api/speakers/label never reassigns a sentence the user vetoed for
+    that speaker (「不是 TA」, counted in skipped_user_labels); the sentence picked explicitly is assigned and its
+    veto for the speaker is lifted."""
+    seg, _ = _seg(rt.cfg, rt.db, datetime(2026, 10, 30, 9, 0), audio=_tone(10.0))
+    wang = rt.db.upsert_speaker("王敏")
+    u1 = _utt(rt.db, seg, DAY, "09:00", "第一句", None, None, 0.0, 2.0, cluster=0)
+    u2 = _utt(rt.db, seg, DAY, "09:00", "第二句", None, None, 2.0, 4.0, cluster=0)
+    u3 = _utt(rt.db, seg, DAY, "09:00", "不是王敏", None, None, 4.0, 5.0, cluster=0)
+    rt.db.reject_utterances(wang, [u1, u3], "未知")
+    r = client.post("/api/speakers/label", json={"name": "王敏", "utterance_id": u1})
+    assert r.status_code == 200, r.text
+    assert r.json()["id"] == wang and r.json()["assigned"] == 2 and r.json()["skipped_user_labels"] == 1
+    rows = {x["id"]: x for x in rt.db.query("SELECT id, speaker_id, speaker_source FROM utterances")}
+    assert rows[u1]["speaker_id"] == wang and rows[u2]["speaker_id"] == wang and rows[u3]["speaker_id"] is None
+    assert rt.db.rejected_speakers([u1, u2, u3]) == {u3: {wang}}
+    r = client.post("/api/speakers/label", json={"name": "王敏", "utterance_id": u3, "whole_cluster": False})
+    assert r.status_code == 200 and r.json()["assigned"] == 1
+    assert rt.db.one("SELECT speaker_id FROM utterances WHERE id=?", (u3,))["speaker_id"] == wang
+    assert rt.db.rejected_speakers([u3]) == {}
+    assert rt.wait_jobs(5)

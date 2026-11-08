@@ -462,3 +462,24 @@ def test_migration_backfills_sample_origin_from_source_path(tmp_path):
     db.execute("UPDATE speaker_embeddings SET origin='voice' WHERE id=3")
     DB(p)                                                   # a second open does not touch rows any more
     assert [r["origin"] for r in db.query("SELECT origin FROM speaker_embeddings ORDER BY id")] == ["file", "label", "voice", None]
+
+
+# --- speakers v4: negatives / vetoes / system share ------------------------------------------------------------
+
+def test_v4_tables_columns_and_system_share_roundtrip(db):
+    names = {r["name"] for r in db.query("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert {"speaker_negatives", "utterance_rejections"} <= names
+    assert {"channel_rms", "channel_block_s"} <= {r[1] for r in db.query("PRAGMA table_info(segments)")}
+    seg = db.add_segment("a.wav", datetime(2026, 11, 4, 9), 2.0)
+    u = db.add_utterances([{"segment_id": seg, "start_s": 0, "end_s": 1, "abs_start": "2026-11-04T09:00:00", "day": "2026-11-04",
+                            "text_raw": "x", "text": "x", "system_share": 0.75}])[0]
+    assert db.one("SELECT system_share FROM utterances WHERE id=?", (u,))["system_share"] == 0.75
+    sid = db.upsert_speaker("甲")
+    db.add_speaker_negative(sid, np.ones(4, dtype=np.float32), None, 1.0, utterance_id=u, segment_id=seg)
+    db.reject_utterances(sid, [u], "未知")
+    assert db.rejected_speakers([u]) == {u: {sid}} and len(db.speaker_negatives()) == 1
+    db.execute("DELETE FROM utterances WHERE id=?", (u,))                # a deleted sentence takes its vetoes along
+    assert db.rejected_speakers([u]) == {}
+    assert len(db.speaker_negatives()) == 1                              # ... but not the negative sample (no FK on purpose)
+    db.delete_speaker(sid, "未知")
+    assert db.speaker_negatives() == []

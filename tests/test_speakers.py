@@ -191,3 +191,16 @@ def test_identify_turns_turn_level_pass_splits_a_mixed_cluster(speaker_engine, d
                                         [Turn(0.0, 3.0, 0), Turn(3.0, 5.0, 0), Turn(5.0, 8.0, 0)], db)
     assert [t.speaker_id for t in out] == [None, a, None] and out[1].cluster != out[0].cluster
     assert out[0].cluster == out[2].cluster
+
+
+
+def test_match_v4_keywords_are_optional_and_exclude_works():
+    a, b = np.eye(4, dtype=np.float32)[0], np.eye(4, dtype=np.float32)[1]
+    enrolled = [(1, "甲", a), (2, "乙", b)]
+    probe = (a * 0.8 + b * 0.6).astype(np.float32)
+    assert SpeakerEngine.match(probe, enrolled, 0.5) == (1, "甲", pytest.approx(0.8))
+    assert SpeakerEngine.match(probe, enrolled, 0.5, None, margin=0.3, exclude=None)[:2] == (1, "甲")
+    assert SpeakerEngine.match(probe, enrolled, 0.5, exclude={1}) == (2, "乙", pytest.approx(0.6))
+    # a negative of 甲 equal to the probe: p - n = 0.8 - 1.0 < 0 -> 乙
+    assert SpeakerEngine.match(probe, enrolled, 0.5, [(1, probe / np.linalg.norm(probe))])[:2] == (2, "乙")
+    assert Turn(0.0, 1.0, 0).exclude == frozenset()

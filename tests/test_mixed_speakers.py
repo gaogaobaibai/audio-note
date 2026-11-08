@@ -1014,3 +1014,18 @@ def test_api_split_runs_under_the_scheduler_lock_preview_does_not(client: TestCl
     r = client.get(f"/api/audio/utterance/{r.json()['pieces'][0]['id']}")
     assert r.status_code == 200 and r.headers["cache-control"] == "no-store"
     assert rt.wait_jobs(5)
+
+
+
+def test_audit_samples_rows_carry_influence(db):
+    sid = db.upsert_speaker("甲")
+    base = _voice(1)
+    db.add_speaker_embedding(sid, base, "a.wav", 3.0)
+    db.add_speaker_embedding(sid, _near(base, 2), "b.wav", 3.0)
+    rows = audit_samples(db, sid, 0.5)
+    assert [r["influence"] for r in rows] == [0, 0]                    # no automatic sentences yet
+    seg = db.add_segment("s.wav", datetime(2026, 10, 30, 9), 10.0)
+    for k in range(3):
+        _utt(db, seg, DAY, "09:00", "句", "甲", sid, k, k + 1, 0.6, cluster=0)
+    db.upsert_cluster_embedding(seg, 0, _near(base, 3), 3.0)
+    assert [r["influence"] for r in audit_samples(db, sid, 0.5)] == [0, 0]   # both samples match: neither alone

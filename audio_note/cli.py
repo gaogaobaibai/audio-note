@@ -11,6 +11,7 @@ Commands
   speakers enroll|record|list|label|relabel|calibrate|audit   (enroll/label/voices --assign take --force to add a sample that sounds unlike the person)
   speakers voices|scan            unidentified voices in the recordings: list / name a group (no enrollment recording needed)
   speakers set-self|relation|relations   who the user is, relations to the user (by hand / inferred by the LLM)
+  speakers reject|negatives       "not this person" for a sentence (veto + negative sample); list / delete negative samples
   daily [--day] [--push] [--force]
   push-test <text>
   chat [question...]              one question, or an interactive REPL without arguments
@@ -743,13 +744,17 @@ def cmd_speakers_audit(cfg: Config, args: argparse.Namespace) -> int:
     min_cos = sample_consistency_min(cfg)
     speakers = db.query("SELECT id, name FROM speakers ORDER BY is_self DESC, name")
     t = Table(title=f"声纹样本一致性（阈值 {min_cos:.2f}）")
-    for col in ("人", "样本", "来源", "时长", "一致性", "离群"):
+    for col in ("人", "样本", "来源", "时长", "一致性", "单独认出", "离群"):
         t.add_column(col)
+    try:
+        id_thr: float | None = float(cfg.speakers.identify_threshold)
+    except (TypeError, ValueError, AttributeError):
+        id_thr = None
     outliers: list[tuple[int, str, int]] = []
     ambiguous: list[str] = []
     total = 0
     for sp in speakers:
-        rows = audit_samples(db, int(sp["id"]), min_cos)
+        rows = audit_samples(db, int(sp["id"]), min_cos, id_thr)
         if any(a["ambiguous"] for a in rows):
             ambiguous.append(sp["name"])
         for a in rows:
@@ -760,7 +765,9 @@ def cmd_speakers_audit(cfg: Config, args: argparse.Namespace) -> int:
                 outliers.append((int(sp["id"]), sp["name"], int(a["id"])))
             src = Path(str(a["source_path"]).split("#")[0]).name if a["source_path"] else "（扫描时保存的声纹）"
             dur = f"{float(a['duration_s']):.1f}s" if a["duration_s"] is not None else "-"
-            t.add_row(sp["name"], f"#{a['id']} {src}", SAMPLE_ORIGIN_LABELS.get(a.get("origin") or "", "-"), dur, cons, flag)
+            infl = int(a.get("influence") or 0)
+            t.add_row(sp["name"], f"#{a['id']} {src}", SAMPLE_ORIGIN_LABELS.get(a.get("origin") or "", "-"), dur, cons,
+                      f"{infl} 句" if infl else "-", flag)
     console.print(t)
     if not total:
         console.print("（没有样本）")
@@ -1013,6 +1020,17 @@ def resolve_label_target(db: DB, at: datetime, dur: float | None = None, toleran
     """Find the utterance spoken at wall-clock time `at` (the timestamp shown in the transcript) and
     return (segment row, from_s, to_s) inside that segment's file. The utterance that contains `at`
     wins; otherwise the nearest one within tolerance_s. `dur` overrides the range length."""
+    best = utterance_at(db, at, tolerance_s)
+    seg = db.get_segment(int(best["segment_id"]))
+    if seg is None:
+        raise CLIError(f"语句所属的录音段 #{best['segment_id']} 已不存在")
+    a = float(best["start_s"])
+    b = a + float(dur) if dur else float(best["end_s"])
+    return seg, a, b
+
+
+def utterance_at(db: DB, at: datetime, tolerance_s: float = 60.0) -> Any:
+    """The utterance row spoken at wall-clock time `at`: the one containing it, else the nearest within tolerance_s."""
     iso = at.isoformat(timespec="milliseconds")
     rows = db.query(
         "SELECT u.*, s.started_at AS seg_started_at FROM utterances u JOIN segments s ON s.id=u.segment_id"
@@ -1032,12 +1050,82 @@ def resolve_label_target(db: DB, at: datetime, dur: float | None = None, toleran
             best, best_key = r, key
     if best is None:
         raise CLIError(f"{iso} 附近 {tolerance_s:.0f}s 内没有已转写的语句（看 transcripts/ 里的时间）")
-    seg = db.get_segment(int(best["segment_id"]))
-    if seg is None:
-        raise CLIError(f"语句所属的录音段 #{best['segment_id']} 已不存在")
-    a = float(best["start_s"])
-    b = a + float(dur) if dur else float(best["end_s"])
-    return seg, a, b
+    return best
+
+
+def _optional_engine(cfg: Config) -> Any:
+    """SpeakerEngine, or None when the voice model is missing / fails to load (a veto still works without it)."""
+    try:
+        if not cfg.model_path("embedding_model").exists():
+            return None
+    except Exception:  # noqa: BLE001 - odd config: let the engine decide
+        pass
+    try:
+        from .speech.speakers import SpeakerEngine
+
+        return SpeakerEngine(cfg)
+    except Exception as e:  # noqa: BLE001
+        log.warning("speaker engine unavailable (%s): veto only, no negative sample", e)
+        return None
+
+
+def cmd_speakers_reject(cfg: Config, args: argparse.Namespace) -> int:
+    """「不是 TA」: the sentence at --at is not NAME (default: its current speaker). Vetoes the speaker for it (and with
+    --cluster for the same voice in that recording), stores a negative sample, re-identifies the segment."""
+    from .speech import voices
+
+    db = _db(cfg)
+    u = utterance_at(db, _parse_datetime(args.at))
+    if args.name:
+        sp = _speaker_by_name(db, args.name)
+    elif u["speaker_id"] is not None:
+        sp = db.one("SELECT * FROM speakers WHERE id=?", (int(u["speaker_id"]),))
+        if sp is None:
+            raise CLIError("这句的说话人已不存在：用 --name 指定")
+    else:
+        raise CLIError("这句还没有说话人：用 --name 指定要否决的人")
+    engine = _optional_engine(cfg)
+    try:
+        res = voices.reject_voice(db, cfg, engine, int(sp["id"]), [int(u["id"])], whole_cluster=bool(getattr(args, "cluster", False)))
+    except (LookupError, ValueError) as e:
+        raise CLIError(str(e)) from e
+    console.print(f"{str(u['abs_start'])[:19].replace('T', ' ')} 「{(u['text'] or '').strip()[:40]}」：已标为不是 {sp['name']}"
+                  f"（{res['rejected']} 句，{res['negatives_added']} 个负样本，重新识别后 {res['relabeled_changed']} 句有变化）。")
+    if res.get("warning"):
+        console.print(f"[yellow]{res['warning']}（只记下了否决，没有存成负样本）[/yellow]")
+    elif engine is None:
+        console.print("[yellow]声纹模型不可用：只记下了否决，没有存负样本。[/yellow]")
+    return 0
+
+
+def cmd_speakers_negatives(cfg: Config, args: argparse.Namespace) -> int:
+    """List the negative samples (all, or one person's); --delete ID removes one."""
+    db = _db(cfg)
+    if getattr(args, "delete", None) is not None:
+        n = db.delete_speaker_negative(int(args.delete))
+        if not n:
+            raise CLIError(f"没有 id={args.delete} 的负样本")
+        console.print(f"已删除负样本 #{args.delete}。")
+        return 0
+    where, params = "", []
+    if args.name:
+        sp = _speaker_by_name(db, args.name)
+        where, params = " WHERE n.speaker_id=?", [int(sp["id"])]
+    rows = db.query("SELECT n.id, s.name, n.duration_s, n.source_path, n.created_at, u.abs_start, u.text FROM speaker_negatives n"
+                    " JOIN speakers s ON s.id=n.speaker_id LEFT JOIN utterances u ON u.id=n.utterance_id"
+                    f"{where} ORDER BY s.name, n.id", params)
+    t = Table(title="负样本（不是 TA 的声音）")
+    for col in ("id", "不是", "时长", "来源", "那句话", "加入时间"):
+        t.add_column(col)
+    for r in rows:
+        src = Path(str(r["source_path"]).split("#")[0]).name if r["source_path"] else "-"
+        dur = f"{float(r['duration_s']):.1f}s" if r["duration_s"] is not None else "-"
+        said = f"{str(r['abs_start'])[:19].replace('T', ' ')} {(r['text'] or '').strip()[:30]}" if r["abs_start"] else "-"
+        t.add_row(str(r["id"]), r["name"], dur, src, said, r["created_at"] or "")
+    console.print(t)
+    if not rows:
+        console.print("（没有负样本：在记录里对认错的句子用 audio-note speakers reject --at \"时间\"）")
+    return 0
 
 
 def _relabel_segment_quietly(cfg: Config, db: DB, engine: Any, seg_id: int) -> None:
@@ -1452,6 +1540,15 @@ def build_parser() -> argparse.ArgumentParser:
     s = ssub.add_parser("audit", help="检查每个声纹样本和同一人其他样本是否一致（--fix 删除离群样本）")
     s.add_argument("--fix", action="store_true", help="删除离群样本")
     s.set_defaults(func=cmd_speakers_audit)
+    s = ssub.add_parser("reject", help="某句话认错了人：标为「不是 TA」（存负样本，以后不再认成 TA）")
+    s.add_argument("--at", required=True, metavar="TIME", help='记录里那句话的时间，如 "2026-11-04 13:17:05"')
+    s.add_argument("--name", default=None, help="不是谁（默认这句当前的说话人）")
+    s.add_argument("--cluster", action="store_true", help="这段录音里同一个声音的其他句子也一起")
+    s.set_defaults(func=cmd_speakers_reject)
+    s = ssub.add_parser("negatives", help="列出负样本（不是 TA 的声音）；--delete ID 删除一个")
+    s.add_argument("name", nargs="?", default=None, help="只看某人的")
+    s.add_argument("--delete", type=int, default=None, metavar="ID", help="删除这个负样本")
+    s.set_defaults(func=cmd_speakers_negatives)
 
     s = sub.add_parser("daily", help="生成（并推送）某天的日报")
     s.add_argument("--day", default=None, help="YYYY-MM-DD，默认今天")

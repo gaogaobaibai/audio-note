@@ -248,9 +248,39 @@ class Notifier: def __init__(cfg); def send(msg) -> dict[str, str|None]   # chan
   `voices.group_unknown_voices` / `name_voice` / `unknown_utterances` 都不算低于门槛的句子。已有记录：`audio-note loudness` 补算 + 分布，`--apply --yes` 删除；
   UI 任务 `loudness` 只补算 + 统计（`{computed, below, threshold}`），记录页每句带 `loudness_db`。
 
+### 10.5 负样本、否决、核对、样本影响力、系统声音分声道（spec 见 docs/SPEC_speakers_v4_negatives.md）
+
+用户真实数据（2026-11-08）："有时把别人的声音认成自己"。档案里只登记了本人：3 条麦克风样本（彼此 0.95）+ 1 条从记录里强行加入的样本（和麦克风样本只有 0.35–0.39）。
+旧规则是"像任一样本 ≥ 0.45 就算这个人"，这条样本成了侧门：自动认成本人的 961 句里 413 句**只靠它**过线（音量中位 −32 dB，多为 1–2 s 短句；靠麦克风样本过线的 540 句中位 −24 dB）。
+没有人工标注就测不出"难的冒认"有多少，所以重点是让用户低成本地给出标注（否决 / 负样本 / 核对），并让识别立刻用上。开会时系统声音和麦克风混成单声道，对方的声音原本没有任何信号区分于本人。
+
+- **判定规则**（`SpeakerEngine.match(emb, enrolled, threshold, negatives=None, margin=0.0, exclude=None)`，identify_turns / identify_utterances / relabel / 拆分 / 声音组「可能是 X」提示共用）：
+  候选人 S 的正分 p = 对 S 正样本的最大 cosine；负分 n = 对 S 负样本的最大 cosine（没有负样本 = −1）。候选按 p 降序，第一个满足 **p ≥ 阈值 且 p − n ≥ `speakers.negative_margin`**（默认 0.0）
+  且不在 exclude 里的人就是结果；都不满足 = 未知。返回的分数仍是 p（未知时为剩余候选里最高的 p）。negatives=None 与旧行为完全一致；维度不同的样本跳过。
+  `speakers.load_negatives()` 每次识别读一次 `db.speaker_negatives()`。
+- **否决优先**：`utterance_rejections(utterance_id, speaker_id)` 里的组合永远不会被写回——`Turn.exclude` 把否决的人从候选里去掉；整簇都排除某人时簇级候选也去掉 TA，
+  被挡下的短轮次在簇 embedding 上去掉 TA 重新匹配（换新簇号，`build_chunks` 不会再合回去）。引擎即使不理 exclude，pipeline 写回时再查一遍（否决 / 本人在系统声音上 → 未知），
+  relabel 的条件 UPDATE 另加 `NOT EXISTS utterance_rejections` 保护。已知限制：`process_segment` 重处理（`--retry-failed`）会删旧句子，否决随 FK 级联消失；负样本保留。
+- **取负样本**（`voices.reject_voice` / `reject_voice_group`）：whole_cluster 时加入同片段同 cluster_label、当前也是 TA、且不是手标给 TA 的句子；全部写否决并清空归属（`db.reject_utterances`）、
+  重写受影响日期的 markdown。按 (segment, cluster_label) 拼音频（≥ 1.0 s 语音才取；最多 3 段、每段 ≤ 30 s；音频没了只否决）→ embed → `add_speaker_negative`。
+  负样本不做一致性检查，但和 TA 的核心参考（`_core_reference`）≥ 0.75 时判为可能点错：只否决、不入负样本，结果带 `warning`。最后对受影响片段 relabel。
+  删除说话人时负样本和否决随 FK 级联删除。
+- **核对队列**（`speech/review.py`）：`review_queue()` = TA 的自动认定句（`speaker_source IS NULL`）、≥ 0.8 s、音频在、没被否决，按 `speaker_score` 升序（NULL 最前）、再按时长升序；
+  `confirm_utterance()` 设 `speaker_source='user'`（原本就是 TA 时保留分数），够 `min_label_sample_s` 且 `check_sample` 通过时追加 origin 'label' 正样本，否则 `sample_added: false`，并解除对 TA 的否决。
+- **样本影响力**（`audit_samples` 的 `influence`）：TA 的自动认定句按 (segment_id, cluster_label) 分组，用 `cluster_embeddings` 对 TA 的所有正样本算分；只有这一条样本 ≥ 阈值的簇，其句数记到这条样本上
+  （没有样本过线、或没有簇 embedding 的句子不计）。纯 numpy。`GET /api/speakers` 的 `risky_samples` = outlier 且 influence ≥ 20（`app.RISKY_INFLUENCE`）的样本数，界面醒目提示。
+- **系统声音分声道**：`MixedCapture.read()` 在混音前记下这一块的 `last_channels = (mic_rms, system_rms)`（system_rms 在 system_gain 之后、按整块平均，缺的 loopback 样本算 0；
+  没有播放 = 0.0；loopback 没打开 = None）。Recorder 按片段收集，emit 时存进
+  `segments.channel_rms`：**float16 交替排列 `mic, sys, mic, sys, …`，每个采集块一对，第 0 对覆盖片段第一个样本（含 pre-roll）**；`segments.channel_block_s` = 每对代表的秒数
+  （覆盖块样本数的中位数 / 16000，标准 32 ms 块 = 0.032）。片段范围没被连续的块完整覆盖、导入文件、纯麦克风录音 → 两列 NULL。
+  `pipeline.channel_pairs()` 解码，`system_share(pairs, block_s, start, end)` = 区间覆盖块（按重叠加权）的 Σsys² / (Σsys² + Σmic²)，静音或没数据 → None。
+  `process_segment` 对每个 turn 算 share，≥ `speakers.system_turn_share`（默认 0.6）的 turn 把本人（is_self）放进 `Turn.exclude`，仍可认成其他人；每条 utterance 存 ASR 块范围的 `system_share`（拆分的 piece 也算），
+  relabel / identify_utterances 有 channel_rms 时同样遵守。记录页 share ≥ 0.6 的句子在名字旁显示 🔊。
+- 界面：说话人页「已登记的人」在最上面、「未识别的声音」其次、提示卡片最后；卡片上「核对」弹窗、负样本分组（试听 / 删除）、「单独认出 N 句」列；记录页 ✗「不是 TA」；声音组「不是 X」。
+
 ## 11. 默认参数
 
-16 kHz / 512 样本块 / VAD 阈值 0.5（迟滞 0.15）/ 起始 0.3s / 静音结束 2.0s / 前后 0.5s / 最长 300s / Opus 24 kbps / ASR 单段 ≤60s / 说话人阈值 0.45 / 聚类阈值 0.5 / 处理间隔 10 min / 清理 30 min / 日报 22:30 / 音频保留 30 天 / 磁盘上限 20 GB。
+16 kHz / 512 样本块 / VAD 阈值 0.5（迟滞 0.15）/ 起始 0.3s / 静音结束 2.0s / 前后 0.5s / 最长 300s / Opus 24 kbps / ASR 单段 ≤60s / 说话人阈值 0.45 / 负样本余量 0 / 系统声音占比 0.6 不认本人 / 聚类阈值 0.5 / 处理间隔 10 min / 清理 30 min / 日报 22:30 / 音频保留 30 天 / 磁盘上限 20 GB。
 
 ## 12. 风险与未验证
 

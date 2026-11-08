@@ -68,6 +68,8 @@ speakers:
   sample_consistency_min: 0.5    # 新样本和此人已有样本（以时长加权的中位样本为基准）的相似度低于它就拒绝加入（防止混了别人的声音；可用「仍然加入」强制）
   turn_check_min_s: 1.0          # 簇级识别后，≥ 此秒数的说话轮次再逐个核对声纹（两人被并成一簇时能分开）；0 = 关闭
   turn_reject_margin: 0.15       # 轮次与簇内说话人的相似度低于 identify_threshold - 此值且不像任何人时，标为未知
+  negative_margin: 0.0           # 负样本（「不是 TA」标出的声音）：只有和 TA 正样本的相似度比和负样本的高出至少这么多才认成 TA（0 = 只要更像正样本）
+  system_turn_share: 0.6         # 一段话里来自系统声音（会议 / 通话的对方）的能量占比 ≥ 此值时，不会被认成本人（只对同时录系统声音的录音生效）
 
 correction:
   enabled: true                  # 是否用 LLM 对 ASR 结果做纠错

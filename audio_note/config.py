@@ -81,6 +81,8 @@ DEFAULTS: dict[str, Any] = {
         "sample_consistency_min": 0.5,  # a new sample whose best cosine to the person's existing samples is below this is refused
         "turn_check_min_s": 1.0,        # turns at least this long are re-checked one by one after cluster identification (0 = off)
         "turn_reject_margin": 0.15,     # a turn whose similarity to the cluster's speaker is below threshold - margin becomes unknown
+        "negative_margin": 0.0,         # a voice is X only when (best positive sample) - (best negative sample of X) >= this
+        "system_turn_share": 0.6,       # a turn with at least this share of system-audio energy is never the user themselves
     },
     "correction": {
         "enabled": True,

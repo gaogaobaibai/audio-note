@@ -240,3 +240,31 @@ def test_api_system_devices_and_config_toggle(cfg_factory, monkeypatch: pytest.M
             assert c.put("/api/config", json={"audio": {"system_device": [1]}}).status_code == 400
     finally:
         rt.shutdown()
+
+
+# --- per-block channel levels (speakers v4 D.1) ----------------------------------------------------
+
+def test_mixed_capture_reports_per_block_channel_levels():
+    mic = FakeMic([blk(0.1), blk(0.1), blk(0.1)])
+    loop = FakeLoop([blk(0.2, 300), np.zeros(0, dtype=np.float32), blk(0.6, 1000)])
+    with MixedCapture(mic, loop, system_gain=2.0) as m:
+        assert m.last_channels is None
+        m.read()
+        mic_rms, sys_rms = m.last_channels
+        assert mic_rms == pytest.approx(0.1, abs=1e-6)
+        # 300 loopback samples of 0.2 * gain 2, averaged over the whole 512-sample block (rest counts as 0)
+        assert sys_rms == pytest.approx(float(np.sqrt(0.4 ** 2 * 300 / 512)), rel=1e-5)
+        m.read()
+        assert m.last_channels == (pytest.approx(0.1, abs=1e-6), 0.0)      # nothing playing -> system 0
+        m.read()
+        # measured before mixing / clipping: the mixed block is clipped to 1.0, the levels are not
+        assert m.last_channels[0] == pytest.approx(0.1, abs=1e-6) and m.last_channels[1] == pytest.approx(1.2, rel=1e-5)
+        assert m.read() is None and m.last_channels is None
+
+
+def test_mixed_capture_without_loopback_has_no_channel_levels():
+    mic = FakeMic([blk(0.2)])
+    with MixedCapture(mic, FakeLoop([], fail=True)) as m:
+        m.read()
+        assert m.last_channels is None            # effectively microphone only -> nothing to split
+    assert not hasattr(capture.MicCapture(None), "last_channels")   # plain microphone capture: no channel split

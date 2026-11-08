@@ -337,3 +337,45 @@ def test_cleanup_removes_empty_day_dirs(cfg_factory, db):
     cleanup(cfg, db)
     assert not empty.exists() and full.exists()
     assert dir_size_bytes(cfg.audio_dir) == 1
+
+
+# --- channel levels (speakers v4 D.2) ----------------------------------------------------------------
+
+def test_finalize_segment_stores_channel_levels(cfg, db):
+    t = datetime(2026, 11, 8, 10, 0, 0)
+    pairs = np.array([[0.05, 0.0], [0.04, 0.3], [0.06, 0.25]], dtype=np.float32)
+    sid = finalize_segment(cfg, db, noise(2.0, amp=0.05), t, speech_s=1.5, channel_rms=pairs, channel_block_s=0.032)
+    row = db.get_segment(sid)
+    assert row["channel_block_s"] == pytest.approx(0.032)
+    blob = row["channel_rms"]
+    assert len(blob) == 3 * 2 * 2                                    # float16, interleaved (mic, sys)
+    flat = np.frombuffer(blob, dtype=np.float16)
+    assert np.allclose(flat, pairs.reshape(-1), atol=1e-3)
+    back = storage.decode_channel_rms(blob)
+    assert back.shape == (3, 2) and np.allclose(back, pairs, atol=1e-3)
+
+
+def test_finalize_segment_without_channel_levels_leaves_null(cfg, db):
+    t = datetime(2026, 11, 8, 10, 1, 0)
+    sid = finalize_segment(cfg, db, noise(2.0, amp=0.05), t, 1.5, "import", "x.wav", None)   # old positional signature
+    row = db.get_segment(sid)
+    assert row["channel_rms"] is None and row["channel_block_s"] is None
+    assert storage.decode_channel_rms(None) is None and storage.decode_channel_rms(b"\x00\x01\x02") is None
+
+
+def test_finalize_segment_bad_channel_levels_still_saves_audio(cfg, db):
+    t = datetime(2026, 11, 8, 10, 2, 0)
+    sid = finalize_segment(cfg, db, noise(2.0, amp=0.05), t, speech_s=1.5,
+                           channel_rms=np.array([0.1, 0.2, 0.3], dtype=np.float32), channel_block_s=0.032)
+    row = db.get_segment(sid)
+    assert row is not None and Path(row["path"]).exists()
+    assert row["channel_rms"] is None
+
+
+def test_encode_channel_rms_accepts_flat_arrays_and_blobs():
+    flat = storage.encode_channel_rms([0.1, 0.2, 0.3, 0.4])
+    assert storage.encode_channel_rms(flat) == flat
+    assert storage.encode_channel_rms(None) is None
+    assert np.allclose(storage.decode_channel_rms(flat), [[0.1, 0.2], [0.3, 0.4]], atol=1e-3)
+    with pytest.raises(ValueError):
+        storage.encode_channel_rms(np.zeros(0))

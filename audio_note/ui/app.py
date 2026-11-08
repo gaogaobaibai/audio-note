@@ -14,7 +14,9 @@ Endpoints (see the handlers for parameters)
   speakers                GET /api/speakers  POST /api/speakers/{name}/samples?force=  POST /api/speakers/label
                           PATCH,DELETE /api/speakers/{id}  GET /api/speakers/{id}/samples  DELETE /api/speakers/samples/{id}
                           DELETE /api/speakers/{id}/samples/outliers  POST /api/speakers/calibrate
-  unknown voices          GET /api/voices   POST /api/voices/name   (name a group of not-yet-identified voices)
+                          GET /api/speakers/{id}/negatives  GET,DELETE /api/speakers/negatives/{id}[/audio]
+                          GET /api/speakers/{id}/review   POST /api/utterances/{id}/reject  POST /api/utterances/{id}/confirm
+  unknown voices          GET /api/voices   POST /api/voices/name   POST /api/voices/reject   (name / reject a voice group)
   mixed utterances        POST /api/utterances/{id}/split {auto | at: [s, ...]}   GET /api/utterances/{id}/preview-split?auto=1
   memory chat             POST /api/chat   (NDJSON stream: tool / answer / error / ping events)
   settings                GET,PUT /api/config   GET,PUT /api/glossary   GET /api/devices   POST /api/config/test-api
@@ -58,7 +60,8 @@ EDITABLE: dict[str, set[str]] = {
     "storage": {"cleanup_enabled", "keep_audio_days", "max_disk_gb"},
     "speakers": {"identify_threshold", "cluster_threshold", "unknown_label", "num_threads",
                  "voice_group_threshold", "infer_relations", "relation_min_utterances", "relation_min_confidence",
-                 "sample_consistency_min", "turn_check_min_s", "turn_reject_margin", "min_label_sample_s"},
+                 "sample_consistency_min", "turn_check_min_s", "turn_reject_margin", "min_label_sample_s",
+                 "negative_margin", "system_turn_share"},
     "correction": {"enabled"},
     "pipeline": {"process_interval_min", "min_segment_age_s"},
     "memory": {"strategy", "retrieval", "query_expansion", "prefetch_k", "chat_model", "max_tool_rounds", "embedding_model"},
@@ -88,12 +91,15 @@ _RANGES: dict[tuple[str, ...], tuple[float, float]] = {
     ("speakers", "voice_group_threshold"): (0.0, 1.0), ("speakers", "relation_min_utterances"): (1, 1000),
     ("speakers", "relation_min_confidence"): (0.0, 1.0), ("speakers", "sample_consistency_min"): (0.0, 1.0),
     ("speakers", "turn_check_min_s"): (0.0, 60.0), ("speakers", "turn_reject_margin"): (0.0, 1.0),
-    ("speakers", "min_label_sample_s"): (1.0, 60.0),
+    ("speakers", "min_label_sample_s"): (1.0, 60.0), ("speakers", "negative_margin"): (-1.0, 1.0),
+    ("speakers", "system_turn_share"): (0.0, 1.0),
     ("pipeline", "process_interval_min"): (1, 1440), ("pipeline", "min_segment_age_s"): (0, 3600),
     ("mimo", "asr_concurrency"): (1, 32), ("memory", "prefetch_k"): (1, 100), ("memory", "max_tool_rounds"): (0, 50),
     ("analysis", "session_gap_min"): (1, 1440), ("analysis", "catchup_days"): (1, 365), ("ui", "port"): (1024, 65535),
 }
 _PUSH_CHANNELS = ("toast", "feishu", "wecom", "serverchan", "pushplus", "wxpusher", "ntfy")
+#: an outlier sample that alone lets through at least this many automatic sentences is "risky" (GET /api/speakers)
+RISKY_INFLUENCE = 20
 #: numeric settings that may also be null (= feature off); an empty form field means null
 _NULLABLE = {("audio", "min_speech_dbfs")}
 
@@ -242,6 +248,28 @@ def _loudness_of(r: Any) -> float | None:
     return round(float(v), 1) if v is not None else None
 
 
+def _system_share_of(r: Any) -> float | None:
+    """utterances.system_share of a row (share of system-audio energy, 0..1; None when unknown / column absent)."""
+    try:
+        v = r["system_share"]
+    except (IndexError, KeyError):
+        return None
+    return round(float(v), 3) if v is not None else None
+
+
+def _bool_arg(v: Any, name: str) -> bool:
+    """A boolean flag from a JSON body: true / false / 0 / 1 (or those as text); anything else is 400."""
+    if v is None:
+        return False
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, int) and v in (0, 1):
+        return bool(v)
+    if isinstance(v, str) and v.strip().lower() in ("true", "false", "0", "1"):
+        return v.strip().lower() in ("true", "1")
+    raise HTTPException(400, f"{name} 应为 true/false")
+
+
 def _hint(secret: str | None) -> str:
     s = str(secret or "")
     if not s:
@@ -258,6 +286,7 @@ def _utt_dict(r: Any, unknown: str, audio_ok: bool | None = None) -> dict[str, A
         "speaker": r["speaker_name"] or unknown, "speaker_id": r["speaker_id"],
         "score": round(float(r["speaker_score"]), 3) if r["speaker_score"] is not None else None,
         "text": text, "cluster": r["cluster_label"], "loudness_db": _loudness_of(r),
+        "system_share": _system_share_of(r),
     }
     if raw and raw != text:
         d["text_raw"] = raw
@@ -707,6 +736,10 @@ def create_app(rt_or_holder: Runtime | RuntimeHolder) -> FastAPI:
             " FROM speakers s LEFT JOIN speaker_embeddings e ON e.speaker_id=s.id GROUP BY s.id ORDER BY s.name")
         counts = {r["speaker_id"]: int(r["n"]) for r in rt.db.query(
             "SELECT speaker_id, COUNT(*) AS n FROM utterances WHERE speaker_id IS NOT NULL GROUP BY speaker_id")}
+        negs = {int(r["speaker_id"]): int(r["n"]) for r in rt.db.query(
+            "SELECT speaker_id, COUNT(*) AS n FROM speaker_negatives GROUP BY speaker_id")}
+        rejs = {int(r["speaker_id"]): int(r["n"]) for r in rt.db.query(
+            "SELECT speaker_id, COUNT(*) AS n FROM utterance_rejections GROUP BY speaker_id")}
         out = []
         for r in rows:
             audit = _audit(int(r["id"])) if int(r["samples"]) > 1 else []
@@ -715,22 +748,37 @@ def create_app(rt_or_holder: Runtime | RuntimeHolder) -> FastAPI:
                         "is_self": bool(r["is_self"]), "relation": r["relation"], "relation_source": r["relation_source"],
                         "relation_note": r["relation_note"],
                         "outlier_samples": sum(1 for a in audit if a["outlier"]),
-                        "ambiguous_samples": sum(1 for a in audit if a["ambiguous"])})
+                        "ambiguous_samples": sum(1 for a in audit if a["ambiguous"]),
+                        "negatives": negs.get(int(r["id"]), 0), "rejections": rejs.get(int(r["id"]), 0),
+                        "risky_samples": sum(1 for a in audit if a["outlier"] and int(a.get("influence") or 0) >= RISKY_INFLUENCE)})
         return out
 
     def _audit(sid: int) -> list[dict[str, Any]]:
         from ..speech.speakers import audit_samples, sample_consistency_min
 
-        return audit_samples(rt.db, int(sid), sample_consistency_min(rt.cfg))
+        return audit_samples(rt.db, int(sid), sample_consistency_min(rt.cfg), float(rt.cfg.speakers.identify_threshold))
+
+    def _engine_or_none() -> Any:
+        """The speaker engine, or None when its model files are missing (a veto still works without it)."""
+        if rt.speaker_models_missing():
+            return None
+        try:
+            return rt.engine()
+        except Exception as e:  # noqa: BLE001 - e.g. a corrupt model file: veto only, no negative / positive sample
+            log.warning("speaker engine unavailable (%s): veto only, no voice sample", e)
+            return None
 
     def _assign_utterances(sid: int, name: str, seg_id: int, ids: list[int], whole_cluster: bool) -> tuple[int, int]:
         """Hand-label utterances (speaker_source='user': relabel leaves them alone). With whole_cluster every
         utterance of the same segment that shares a cluster_label with one of `ids` is included - except the
-        ones the user already labelled by hand as somebody else, which are kept. Returns (assigned, skipped)."""
+        ones the user already labelled by hand as somebody else and the ones the user vetoed for this speaker
+        (utterance_rejections), which are kept. The sentences in `ids` were picked explicitly: they are assigned
+        and their veto for this speaker (if any) is lifted. Returns (assigned, skipped)."""
         db = rt.db
         if not ids:
             return 0, 0
         marks = ",".join("?" * len(ids))
+        db.execute(f"DELETE FROM utterance_rejections WHERE speaker_id=? AND utterance_id IN ({marks})", [int(sid), *ids])
         where, params = f"id IN ({marks})", [*ids]
         skipped = 0
         if whole_cluster:
@@ -738,12 +786,13 @@ def create_app(rt_or_holder: Runtime | RuntimeHolder) -> FastAPI:
                       if r["cluster_label"] is not None]
             if labels:
                 lmarks = ",".join("?" * len(labels))
-                guard = "(speaker_source IS NULL OR speaker_source<>'user' OR speaker_id IS NULL OR speaker_id=?)"
+                guard = ("(speaker_source IS NULL OR speaker_source<>'user' OR speaker_id IS NULL OR speaker_id=?)"
+                         " AND NOT EXISTS (SELECT 1 FROM utterance_rejections r WHERE r.utterance_id=utterances.id AND r.speaker_id=?)")
                 other = db.one(f"SELECT COUNT(*) AS n FROM utterances WHERE segment_id=? AND cluster_label IN ({lmarks})"
-                               f" AND id NOT IN ({marks}) AND NOT {guard}", [int(seg_id), *labels, *ids, int(sid)])
+                               f" AND id NOT IN ({marks}) AND NOT ({guard})", [int(seg_id), *labels, *ids, int(sid), int(sid)])
                 skipped = int(other["n"]) if other else 0
                 where += f" OR (segment_id=? AND cluster_label IN ({lmarks}) AND {guard})"
-                params += [int(seg_id), *labels, int(sid)]
+                params += [int(seg_id), *labels, int(sid), int(sid)]
         cur = db.execute(f"UPDATE utterances SET speaker_id=?, speaker_name=?, speaker_score=NULL, speaker_source='user'"
                          f" WHERE {where}", [int(sid), name, *params])
         return int(cur.rowcount or 0), skipped
@@ -849,6 +898,7 @@ def create_app(rt_or_holder: Runtime | RuntimeHolder) -> FastAPI:
             d["consistency"] = a.get("consistency")
             d["outlier"] = bool(a.get("outlier", False))
             d["ambiguous"] = bool(a.get("ambiguous", False))
+            d["influence"] = int(a.get("influence") or 0)
             out.append(d)
         return out
 
@@ -874,7 +924,12 @@ def create_app(rt_or_holder: Runtime | RuntimeHolder) -> FastAPI:
         r = rt.db.one("SELECT source_path FROM speaker_embeddings WHERE id=?", (int(emb_id),))
         if r is None or not r["source_path"]:
             raise HTTPException(404, "样本不存在")
-        src = str(r["source_path"])
+        return Response(_source_audio(str(r["source_path"])), media_type="audio/wav")
+
+    def _source_audio(src: str) -> bytes:
+        """WAV bytes of a sample's source_path: a file, or "<file>#a-b" (a slice of a recording)."""
+        from ..audio.importer import decode_any
+
         p = Path(src.split("#")[0])
         if not p.exists():
             raise HTTPException(404, "样本文件已不存在")
@@ -887,12 +942,136 @@ def create_app(rt_or_holder: Runtime | RuntimeHolder) -> FastAPI:
                 audio = audio[int(float(a) * SAMPLE_RATE):int(float(b) * SAMPLE_RATE)]
             except ValueError:
                 pass
-        return Response(_wav_bytes(audio), media_type="audio/wav")
+        return _wav_bytes(audio)
 
     @app.delete("/api/speakers/samples/{emb_id}")
     def speaker_sample_delete(emb_id: int) -> dict[str, Any]:
         cur = rt.db.execute("DELETE FROM speaker_embeddings WHERE id=?", (int(emb_id),))
         return {"ok": True, "deleted": int(cur.rowcount or 0)}
+
+    # ------------------------------------------------------------------ negatives / review (speakers v4)
+    @app.get("/api/speakers/{sid}/negatives")
+    def speaker_negatives(sid: int) -> list[dict[str, Any]]:
+        """Negative samples ("not this person") of a speaker, oldest first."""
+        db = rt.db
+        if db.one("SELECT id FROM speakers WHERE id=?", (int(sid),)) is None:
+            raise HTTPException(404, "没有这个说话人")
+        rows = db.query("SELECT n.id, n.duration_s, n.source_path, n.utterance_id, n.segment_id, n.created_at, u.text"
+                        " FROM speaker_negatives n LEFT JOIN utterances u ON u.id = n.utterance_id WHERE n.speaker_id=? ORDER BY n.id",
+                        (int(sid),))
+        out = []
+        for r in rows:
+            src = r["source_path"]
+            f = Path(str(src).split("#")[0]) if src else None
+            d: dict[str, Any] = {"id": int(r["id"]), "duration_s": r["duration_s"], "source_path": src,
+                                 "file": f.name if f else "", "audio": bool(f and f.exists()),
+                                 "utterance_id": r["utterance_id"], "segment_id": r["segment_id"], "created_at": r["created_at"]}
+            if r["text"]:
+                d["text"] = r["text"]
+            out.append(d)
+        return out
+
+    @app.delete("/api/speakers/negatives/{neg_id}")
+    def speaker_negative_delete(neg_id: int) -> dict[str, Any]:
+        return {"ok": True, "deleted": rt.db.delete_speaker_negative(int(neg_id))}
+
+    @app.get("/api/speakers/negatives/{neg_id}/audio")
+    def speaker_negative_audio(neg_id: int) -> Response:
+        r = rt.db.one("SELECT source_path FROM speaker_negatives WHERE id=?", (int(neg_id),))
+        if r is None or not r["source_path"]:
+            raise HTTPException(404, "负样本不存在")
+        return Response(_source_audio(str(r["source_path"])), media_type="audio/wav")
+
+    @app.get("/api/speakers/{sid}/review")
+    def speaker_review(sid: int, limit: int = 20, offset: int = 0) -> dict[str, Any]:
+        """Review queue: the speaker's automatically identified sentences, least certain first."""
+        from ..speech import review
+
+        if rt.db.one("SELECT id FROM speakers WHERE id=?", (int(sid),)) is None:
+            raise HTTPException(404, "没有这个说话人")
+        limit = max(1, min(int(limit), 200))
+        offset = max(0, int(offset))
+        return {"items": review.review_queue(rt.db, rt.cfg, int(sid), limit, offset),
+                "total": review.review_total(rt.db, rt.cfg, int(sid)), "limit": limit, "offset": offset}
+
+    @app.post("/api/utterances/{uid}/reject")
+    async def utterance_reject(uid: int, body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+        """「不是 TA」: {speaker_id?: the sentence's current speaker by default, whole_cluster?: false}. Vetoes the speaker
+        for the sentence(s), takes negative samples, re-identifies the segment."""
+        from ..speech import voices
+
+        db = rt.db
+        u = db.one("SELECT id, speaker_id FROM utterances WHERE id=?", (int(uid),))
+        if u is None:
+            raise HTTPException(404, "没有这条记录")
+        sid = _speaker_id_arg(body.get("speaker_id"))
+        if sid is None:
+            sid = int(u["speaker_id"]) if u["speaker_id"] is not None else None
+        if sid is None:
+            raise HTTPException(400, "这句还没有说话人：请指定 speaker_id")
+        if db.one("SELECT id FROM speakers WHERE id=?", (sid,)) is None:
+            raise HTTPException(404, "没有这个说话人")
+        whole = _bool_arg(body.get("whole_cluster"), "whole_cluster")
+        with rt.busy():
+            engine = await _to_thread(_engine_or_none)
+            try:
+                res = await _to_thread(lambda: voices.reject_voice(db, rt.cfg, engine, sid, [int(uid)], whole_cluster=whole))
+            except LookupError as e:
+                raise HTTPException(404, str(e))
+            except ValueError as e:
+                raise HTTPException(400, str(e))
+        return {"ok": True, **res}
+
+    @app.post("/api/utterances/{uid}/confirm")
+    async def utterance_confirm(uid: int, body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+        """「是 TA」: {speaker_id, whole_cluster?: false}. Marks the sentence(s) as the user's own label and adds a voice
+        sample when the sentence is long enough and resembles the person (sample_added: false otherwise)."""
+        from ..speech import review
+
+        db = rt.db
+        if db.one("SELECT id FROM utterances WHERE id=?", (int(uid),)) is None:
+            raise HTTPException(404, "没有这条记录")
+        sid = _speaker_id_arg(body.get("speaker_id"))
+        if sid is None:
+            raise HTTPException(400, "需要 speaker_id")
+        if db.one("SELECT id FROM speakers WHERE id=?", (sid,)) is None:
+            raise HTTPException(404, "没有这个说话人")
+        whole = _bool_arg(body.get("whole_cluster"), "whole_cluster")
+        with rt.busy():
+            engine = await _to_thread(_engine_or_none)
+            try:
+                res = await _to_thread(lambda: review.confirm_utterance(db, rt.cfg, engine, int(uid), sid, whole_cluster=whole))
+            except LookupError as e:
+                raise HTTPException(404, str(e))
+            except ValueError as e:
+                raise HTTPException(400, str(e))
+            if res.get("sample_added"):
+                res.update(await _to_thread(_after_enroll, int(res["segment_id"])))
+        return {"ok": True, **res}
+
+    @app.post("/api/voices/reject")
+    async def voices_reject(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        """「不是 X」 on a voice group: {members: [[segment_id, cluster_label], ...], speaker_id}."""
+        from ..speech import voices
+
+        members = body.get("members")
+        if not isinstance(members, list) or not members:
+            raise HTTPException(400, "members 不能为空")
+        sid = _speaker_id_arg(body.get("speaker_id"))
+        if sid is None:
+            raise HTTPException(400, "需要 speaker_id")
+        db = rt.db
+        if db.one("SELECT id FROM speakers WHERE id=?", (sid,)) is None:
+            raise HTTPException(404, "没有这个说话人")
+        with rt.busy():
+            engine = await _to_thread(_engine_or_none)
+            try:
+                res = await _to_thread(lambda: voices.reject_voice_group(db, rt.cfg, engine, members, sid))
+            except LookupError as e:
+                raise HTTPException(404, str(e))
+            except ValueError as e:
+                raise HTTPException(400, str(e))
+        return {"ok": True, **res}
 
     @app.post("/api/speakers/{name}/samples")
     async def speaker_add_sample(name: str, request: Request, filename: str = "sample.webm", notes: str | None = None,

@@ -127,9 +127,40 @@ class PartialWriter:
             pass
 
 
+def encode_channel_rms(pairs: np.ndarray | bytes | None) -> bytes | None:
+    """(mic_rms, system_rms) pairs -> the segments.channel_rms blob: float16, interleaved
+    [mic, sys, mic, sys, ...]. Accepts an (n, 2) array, a flat even-length array or a ready blob."""
+    if pairs is None:
+        return None
+    if isinstance(pairs, (bytes, bytearray, memoryview)):
+        b = bytes(pairs)
+        if len(b) == 0 or len(b) % 4:
+            raise ValueError("channel_rms blob must hold whole float16 pairs")
+        return b
+    a = np.asarray(pairs, dtype=np.float32).reshape(-1)
+    if a.size == 0 or a.size % 2:
+        raise ValueError("channel_rms needs (mic_rms, system_rms) pairs")
+    a = np.nan_to_num(np.clip(a, 0.0, 65000.0), nan=0.0)
+    return a.astype(np.float16).tobytes()
+
+
+def decode_channel_rms(blob: bytes | None) -> np.ndarray | None:
+    """segments.channel_rms blob -> float32 array of shape (n_blocks, 2): column 0 mic RMS, column 1
+    system-audio RMS. None for NULL / malformed blobs."""
+    if not blob or len(blob) % 4:
+        return None
+    return np.frombuffer(bytes(blob), dtype=np.float16).astype(np.float32).reshape(-1, 2)
+
+
 def finalize_segment(cfg: Config, db: DB, audio: np.ndarray, started_at: datetime, speech_s: float,
-                     source: str = "mic", origin: str | None = None, partial: Path | None = None) -> int | None:
+                     source: str = "mic", origin: str | None = None, partial: Path | None = None,
+                     channel_rms: np.ndarray | bytes | None = None, channel_block_s: float | None = None) -> int | None:
     """Encode + register one segment. Returns the segment id (or None if dropped as non-speech).
+
+    ``channel_rms`` / ``channel_block_s`` (live microphone + system-audio recordings only): one
+    (mic_rms, system_rms) pair per capture block, the first covering the segment's first sample,
+    and the seconds each pair spans; stored in segments.channel_rms (see encode_channel_rms) /
+    channel_block_s. Left NULL when not given (microphone-only capture, imports, recovered partials).
 
     Dropped when speech_s < storage.min_speech_total_s, or (for segments longer than
     RATIO_MIN_DURATION_S) when speech_s / duration < storage.min_speech_ratio: a gate kept open by
@@ -156,6 +187,12 @@ def finalize_segment(cfg: Config, db: DB, audio: np.ndarray, started_at: datetim
         # the partial, when there is one, stays on disk so recover_partials() can retry later
         _delete_file(str(path))
         raise
+    if channel_rms is not None and channel_block_s:
+        try:
+            blob = encode_channel_rms(channel_rms)
+            db.execute("UPDATE segments SET channel_rms=?, channel_block_s=? WHERE id=?", (blob, float(channel_block_s), seg_id))
+        except Exception as e:  # noqa: BLE001 - the channel split is optional; never lose the segment over it
+            log.warning("segment #%d: cannot store channel levels: %s", seg_id, e)
     if partial and partial.exists():
         partial.unlink()
     log.info("segment #%d %s %.1fs (speech %.1fs, %d KB)", seg_id, path.name, dur, speech_s, path.stat().st_size // 1024)

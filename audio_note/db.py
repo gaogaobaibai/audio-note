@@ -9,6 +9,7 @@ utterance_tokens   jieba-segmented text, mirrored into the FTS5 index utterances
 utterance_vectors  sentence embeddings (float32 blobs) for vector / hybrid retrieval
 speakers           enrolled people (+ is_self / relation columns added by _migrate)
 speaker_embeddings enrollment embeddings (float32 blobs)
+speaker_negatives  negative samples ("this voice is NOT that person") + utterance_rejections (per-sentence vetoes)
 cluster_embeddings one embedding per diarization cluster of a processed segment (for naming unknown voices)
 daily_summaries    per-day LLM digest
 memory_notes       long-lived notes (entities, topics, todos) maintained by the daily analysis
@@ -148,6 +149,28 @@ CREATE TABLE IF NOT EXISTS kv (
     value TEXT
 );
 
+-- "this is NOT that person": voices the user rejected for a speaker (negative samples)
+CREATE TABLE IF NOT EXISTS speaker_negatives (
+    id INTEGER PRIMARY KEY,
+    speaker_id INTEGER NOT NULL REFERENCES speakers(id) ON DELETE CASCADE,
+    embedding BLOB NOT NULL,             -- float32, L2-normalised
+    dim INTEGER NOT NULL,
+    duration_s REAL,
+    source_path TEXT,                    -- "<segment file>#a-b" or a speech-only copy
+    utterance_id INTEGER,                -- the sentence it came from (no FK: the sentence may be split / deleted later)
+    segment_id INTEGER,
+    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_spk_neg_speaker ON speaker_negatives(speaker_id);
+
+-- per-sentence veto: automatic identification never assigns this speaker to this sentence again
+CREATE TABLE IF NOT EXISTS utterance_rejections (
+    utterance_id INTEGER NOT NULL REFERENCES utterances(id) ON DELETE CASCADE,
+    speaker_id INTEGER NOT NULL REFERENCES speakers(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+    PRIMARY KEY (utterance_id, speaker_id)
+);
+
 CREATE TABLE IF NOT EXISTS cluster_embeddings (
     segment_id INTEGER NOT NULL REFERENCES segments(id) ON DELETE CASCADE,
     cluster_label INTEGER NOT NULL,
@@ -171,6 +194,9 @@ MIGRATION_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("speaker_embeddings", "origin", "TEXT"),                        # 'mic' | 'file' | 'label' | 'voice' | 'cluster' | NULL (old rows)
     ("segments", "faint_s", "REAL"),                                 # seconds of turns dropped as too quiet (audio.min_speech_dbfs)
     ("utterances", "loudness_db", "REAL"),                           # speech level of the utterance's audio in dBFS (NULL = not computed)
+    ("segments", "channel_rms", "BLOB"),                             # float16 pairs (mic_rms, system_rms) per capture block; NULL = mic only / unknown
+    ("segments", "channel_block_s", "REAL"),                         # seconds per channel_rms pair
+    ("utterances", "system_share", "REAL"),                          # share of the sentence's energy that came from system audio (0..1; NULL = unknown)
 )
 
 #: speaker_embeddings.origin values whose voice cannot contain anybody else (the user recorded / uploaded it)
@@ -393,6 +419,66 @@ class DB:
         )
         return [(int(r["speaker_id"]), r["name"], np.frombuffer(r["embedding"], dtype=np.float32)) for r in rows]
 
+    # --- negative samples / per-sentence vetoes (speakers v4) ----------------------
+    def add_speaker_negative(self, speaker_id: int, emb: np.ndarray, source_path: str | None, duration_s: float | None,
+                             utterance_id: int | None = None, segment_id: int | None = None) -> int:
+        """Store one negative sample ("this voice is NOT speaker_id"); the embedding is stored L2-normalised."""
+        emb = np.asarray(emb, dtype=np.float32).ravel()
+        n = float(np.linalg.norm(emb))
+        if n > 0:
+            emb = emb / n
+        return int(self.execute(
+            "INSERT INTO speaker_negatives(speaker_id, embedding, dim, duration_s, source_path, utterance_id, segment_id)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (int(speaker_id), emb.astype(np.float32).tobytes(), int(emb.shape[0]), duration_s, source_path,
+             int(utterance_id) if utterance_id is not None else None, int(segment_id) if segment_id is not None else None),
+        ).lastrowid)
+
+    def speaker_negatives(self) -> list[tuple[int, np.ndarray]]:
+        """[(speaker_id, L2-normalised embedding)] of every negative sample."""
+        out: list[tuple[int, np.ndarray]] = []
+        for r in self.query("SELECT speaker_id, embedding FROM speaker_negatives ORDER BY id"):
+            e = np.frombuffer(r["embedding"], dtype=np.float32)
+            n = float(np.linalg.norm(e))
+            out.append((int(r["speaker_id"]), e / n if n > 0 else e))
+        return out
+
+    def delete_speaker_negative(self, neg_id: int) -> int:
+        cur = self.execute("DELETE FROM speaker_negatives WHERE id=?", (int(neg_id),))
+        return int(cur.rowcount or 0)
+
+    def reject_utterances(self, speaker_id: int, utterance_ids: Iterable[int], unknown_name: str) -> int:
+        """Veto `speaker_id` for these sentences (utterance_rejections, INSERT OR IGNORE) and release the ones currently
+        attributed to that speaker (speaker_id NULL, name = unknown_name, no score, automatic again).
+        Returns the number of sentences released."""
+        sid = int(speaker_id)
+        ids = sorted({int(i) for i in utterance_ids})
+        if not ids:
+            return 0
+        released = 0
+        c = self.conn()
+        with _Tx(c):
+            for k in range(0, len(ids), 500):
+                chunk = ids[k:k + 500]
+                marks = ",".join("?" * len(chunk))
+                c.execute(f"INSERT OR IGNORE INTO utterance_rejections(utterance_id, speaker_id)"
+                          f" SELECT id, ? FROM utterances WHERE id IN ({marks})", [sid, *chunk])
+                cur = c.execute(f"UPDATE utterances SET speaker_id=NULL, speaker_name=?, speaker_score=NULL, speaker_source=NULL"
+                                f" WHERE speaker_id=? AND id IN ({marks})", [unknown_name, sid, *chunk])
+                released += int(cur.rowcount or 0)
+        return released
+
+    def rejected_speakers(self, utterance_ids: Iterable[int]) -> dict[int, set[int]]:
+        """{utterance_id: {vetoed speaker ids}} for the given sentences (only the ones with a veto appear)."""
+        ids = sorted({int(i) for i in utterance_ids})
+        out: dict[int, set[int]] = {}
+        for k in range(0, len(ids), 500):
+            chunk = ids[k:k + 500]
+            for r in self.query(f"SELECT utterance_id, speaker_id FROM utterance_rejections WHERE utterance_id IN ({','.join('?' * len(chunk))})",
+                                chunk):
+                out.setdefault(int(r["utterance_id"]), set()).add(int(r["speaker_id"]))
+        return out
+
     # --- self / relations ----------------------------------------------------
     def self_speaker(self) -> sqlite3.Row | None:
         """The speaker marked as the user themselves (at most one), or None."""
@@ -491,17 +577,18 @@ class DB:
 
     # --- utterances --------------------------------------------------------
     def add_utterances(self, rows: list[dict[str, Any]]) -> list[int]:
-        """rows: dicts with keys matching the utterances columns plus optional 'text_seg' / 'speaker_source' / 'loudness_db'."""
+        """rows: dicts with keys matching the utterances columns plus optional 'text_seg' / 'speaker_source' / 'loudness_db' /
+        'system_share'."""
         ids: list[int] = []
         c = self.conn()
         with _Tx(c):
             for r in rows:
                 cur = c.execute(
                     "INSERT INTO utterances(segment_id,start_s,end_s,abs_start,day,cluster_label,speaker_id,speaker_name,speaker_score,"
-                    "text_raw,text,speaker_source,loudness_db) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "text_raw,text,speaker_source,loudness_db,system_share) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (r["segment_id"], r["start_s"], r["end_s"], r["abs_start"], r["day"], r.get("cluster_label"),
                      r.get("speaker_id"), r.get("speaker_name"), r.get("speaker_score"), r["text_raw"], r["text"],
-                     r.get("speaker_source"), r.get("loudness_db")),
+                     r.get("speaker_source"), r.get("loudness_db"), r.get("system_share")),
                 )
                 uid = int(cur.lastrowid)
                 ids.append(uid)

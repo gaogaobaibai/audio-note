@@ -4,6 +4,8 @@ user can listen to one group and give it a name (no separate enrollment recordin
     group_unknown_voices(db, cfg)                  -> {"groups": [...], "missing_segments": m, ...}   (numpy only)
     backfill_cluster_embeddings(db, cfg, engine)   -> compute cluster_embeddings for 'done' segments that lack them
     name_voice(db, cfg, engine, members, name)     -> enroll samples from the group, assign its utterances, mark self / relation
+    reject_voice(db, cfg, engine, sid, utt_ids)    -> "not X": veto + negative samples from sentences, relabel (v4)
+    reject_voice_group(db, cfg, engine, members, sid) -> the same for a voice group's unidentified sentences
 
 A "member" is one (segment_id, cluster_label) pair of cluster_embeddings whose cluster still has at
 least one utterance with speaker_id IS NULL. Groups are built by greedy average-linkage clustering of
@@ -29,7 +31,8 @@ from ..audio.loudness import min_speech_dbfs
 from ..audio.storage import read_segment
 from ..config import Config
 from ..db import DB
-from .speakers import MIN_CLUSTER_SPEECH_S, SampleMismatch, Turn, check_sample, sample_consistency_min, min_label_sample_s
+from .speakers import (MIN_CLUSTER_SPEECH_S, SampleMismatch, Turn, check_sample, load_negatives, min_label_sample_s,
+                       negative_margin, negative_scores, sample_consistency_min)
 
 log = logging.getLogger(__name__)
 
@@ -124,12 +127,25 @@ def cluster_members(embs: np.ndarray, weights: np.ndarray, threshold: float) -> 
     return [g for g in groups if g]
 
 
-def _closest_enrolled(centroid: np.ndarray, enrolled: list[tuple[int, str, np.ndarray]]) -> dict[str, Any] | None:
-    best: dict[str, Any] | None = None
+def _closest_enrolled(centroid: np.ndarray, enrolled: list[tuple[int, str, np.ndarray]],
+                      negatives: list[tuple[int, np.ndarray]] | None = None, margin: float = 0.0,
+                      exclude: set[int] | frozenset[int] | None = None) -> dict[str, Any] | None:
+    """The most similar enrolled speaker (the "maybe X" hint). Speakers in `exclude` (vetoed for the group's
+    sentences) and speakers whose negative samples the centroid resembles at least as much (p - n < margin) are
+    never suggested."""
+    per: dict[int, tuple[str, float]] = {}
+    excl = set(exclude or ())
     for sid, name, e in enrolled:
-        if e.shape[0] != centroid.shape[0]:
+        if e.shape[0] != centroid.shape[0] or int(sid) in excl:
             continue
         s = float(np.dot(centroid, _unit(e)))
+        if int(sid) not in per or s > per[int(sid)][1]:
+            per[int(sid)] = (name, s)
+    neg = negative_scores(centroid, negatives)
+    best: dict[str, Any] | None = None
+    for sid, (name, s) in per.items():
+        if negatives and s - neg.get(sid, -1.0) < float(margin):
+            continue
         if best is None or s > best["score"]:
             best = {"id": int(sid), "name": name, "score": round(s, 3)}
     return best
@@ -180,6 +196,10 @@ def group_unknown_voices(db: DB, cfg: Config, threshold: float | None = None, ma
             utts.setdefault((int(u["segment_id"]), int(u["cluster_label"])), []).append(u)
 
     enrolled = db.speaker_embeddings()
+    negatives = load_negatives(db)
+    nmargin = negative_margin(cfg)
+    all_ids = [int(u["id"]) for us in utts.values() for u in us]
+    vetoed = db.rejected_speakers(all_ids) if hasattr(db, "rejected_speakers") else {}
     groups: list[dict[str, Any]] = []
     for idx in cluster_members(embs, weights, thr):
         mem = [(int(members[i]["segment_id"]), int(members[i]["cluster_label"])) for i in idx]
@@ -199,7 +219,8 @@ def group_unknown_voices(db: DB, cfg: Config, threshold: float | None = None, ma
             "key": _group_key(mem), "members": [[seg, cl] for seg, cl in sorted(mem)],
             "utterances": len(rows_u), "speech_s": round(speech_s, 1), "segments": len({seg for seg, _ in mem}),
             "days": days, "n_days": len(days), "samples": samples,
-            "closest": _closest_enrolled(centroid, enrolled),
+            "closest": _closest_enrolled(centroid, enrolled, negatives, nmargin,
+                                         {s for u in rows_u for s in vetoed.get(int(u["id"]), ())}),
         })
     groups.sort(key=lambda g: (-g["speech_s"], -g["utterances"], g["key"]))
     out["groups"] = groups
@@ -314,7 +335,8 @@ def name_voice(db: DB, cfg: Config, engine: Any, members: list[Any], name: str, 
     the top members are enrolled directly instead (they are the same L2-normalised CAM++ vectors an
     enrolment produces); 'samples_from_clusters' counts those (included in 'samples_added').
     Utterances the user already labelled by hand as somebody else are kept and counted in
-    'skipped_user_labels'. Raises ValueError for an empty name, malformed members, or when a brand-new
+    'skipped_user_labels'; the ones the user vetoed for this speaker (「不是 TA」, utterance_rejections) are kept
+    too and counted in 'skipped_vetoed'. Raises ValueError for an empty name, malformed members, or when a brand-new
     speaker got no usable sample (the speaker row is removed again in that case). FTS rebuild is the
     caller's job.
 
@@ -416,19 +438,26 @@ def name_voice(db: DB, cfg: Config, engine: Any, members: list[Any], name: str, 
 
     # 3. assign every utterance of every member (the user confirmed the group by ear) - except the ones
     #    they already labelled by hand as somebody else
+    #    and the ones they vetoed for this person (utterance_rejections: 「不是 TA」 wins over the group)
     assigned = 0
     skipped_user = 0
+    skipped_vetoed = 0
     days: set[str] = set()
     segments: set[int] = set()
+    veto = "EXISTS (SELECT 1 FROM utterance_rejections r WHERE r.utterance_id=utterances.id AND r.speaker_id=?)"
     for seg, cl in mem:
         other = db.one("SELECT COUNT(*) AS n FROM utterances WHERE segment_id=? AND cluster_label=?"
                        " AND speaker_source='user' AND speaker_id IS NOT NULL AND speaker_id<>?", (seg, cl, sid))
         skipped_user += int(other["n"]) if other else 0
+        vetoed = db.one(f"SELECT COUNT(*) AS n FROM utterances WHERE segment_id=? AND cluster_label=? AND {veto}"
+                        " AND NOT (speaker_source='user' AND speaker_id IS NOT NULL AND speaker_id<>?)", (seg, cl, sid, sid))
+        skipped_vetoed += int(vetoed["n"]) if vetoed else 0
         cur = db.execute(
             "UPDATE utterances SET speaker_id=?, speaker_name=?, speaker_score=NULL, speaker_source='user'"
             " WHERE segment_id=? AND cluster_label=?"
-            " AND (speaker_source IS NULL OR speaker_source<>'user' OR speaker_id IS NULL OR speaker_id=?)",
-            (sid, name, seg, cl, sid))
+            " AND (speaker_source IS NULL OR speaker_source<>'user' OR speaker_id IS NULL OR speaker_id=?)"
+            f" AND NOT {veto}",
+            (sid, name, seg, cl, sid, sid))
         n = int(cur.rowcount or 0)
         if n:
             assigned += n
@@ -449,13 +478,221 @@ def name_voice(db: DB, cfg: Config, engine: Any, members: list[Any], name: str, 
         except Exception as e:  # noqa: BLE001 - the DB is the source of truth
             log.warning("cannot write markdown for %s: %s", day, e)
     log.info("name_voice: %s <- %d member(s), %d sample(s) (%d from stored clusters, %d rejected, %d members inconsistent),"
-             " %d utterance(s), %d hand-labelled kept",
-             name, len(mem), samples_added, samples_from_clusters, samples_rejected, members_inconsistent, assigned, skipped_user)
+             " %d utterance(s), %d hand-labelled kept, %d vetoed kept",
+             name, len(mem), samples_added, samples_from_clusters, samples_rejected, members_inconsistent, assigned, skipped_user,
+             skipped_vetoed)
     return {"id": int(sid), "name": name, "samples_added": samples_added, "samples_from_clusters": samples_from_clusters,
             "samples_rejected": samples_rejected, "members_inconsistent": members_inconsistent,
-            "utterances_assigned": assigned, "skipped_user_labels": skipped_user,
+            "utterances_assigned": assigned, "skipped_user_labels": skipped_user, "skipped_vetoed": skipped_vetoed,
             "segments": sorted(segments), "days": sorted(days)}
 
 
+
+
+# --------------------------------------------------------------------------- public: "not X" (negative samples, v4)
+NEGATIVE_MIN_SPEECH_S = 1.0       # a rejected clip needs this much speech to become a negative sample
+NEGATIVE_MAX_CLIPS = 3            # at most this many negative samples per rejection
+NEGATIVE_MAX_S = 30.0             # each negative sample is cut to this many seconds of audio
+NEGATIVE_WARN_SIMILARITY = 0.75   # a "not X" voice this similar to X's reference voice is probably a mis-click
+
+
+def _speaker_row(db: DB, speaker_id: Any) -> Any:
+    try:
+        sid = int(speaker_id)
+    except (TypeError, ValueError):
+        raise ValueError("speaker_id 应为说话人 id")
+    row = db.one("SELECT id, name FROM speakers WHERE id=?", (sid,))
+    if row is None:
+        raise LookupError("没有这个说话人")
+    return row
+
+
+def _reference_similarity(db: DB, cfg: Config, speaker_id: int, emb: np.ndarray) -> float | None:
+    """Cosine between `emb` and the speaker's core reference voice (speakers._core_reference), None without samples."""
+    from .speakers import _core_reference
+
+    e = _unit(emb)
+    embs, durs, origins = [], [], []
+    for r in db.query("SELECT embedding, dim, duration_s, origin FROM speaker_embeddings WHERE speaker_id=? ORDER BY id", (int(speaker_id),)):
+        if int(r["dim"]) != e.shape[0]:
+            continue
+        embs.append(_unit(np.frombuffer(r["embedding"], dtype=np.float32)))
+        durs.append(r["duration_s"])
+        origins.append(r["origin"])
+    ref = _core_reference(embs, durs, sample_consistency_min(cfg), origins)
+    return float(np.dot(e, ref)) if ref is not None else None
+
+
+def _embed_negative(engine: Any, clip: np.ndarray) -> tuple[np.ndarray, float]:
+    """(embedding, speech seconds) of a rejected clip: speech only when the engine can gate it."""
+    from ..audio.vad import SAMPLE_RATE
+
+    fn = getattr(engine, "embed_speech_only", None)
+    if callable(fn):
+        emb, speech_s = fn(clip, max_s=NEGATIVE_MAX_S)
+        return np.asarray(emb, dtype=np.float32), float(speech_s)
+    return np.asarray(engine.embed(clip), dtype=np.float32), len(clip) / SAMPLE_RATE
+
+
+def _save_negative_clip(cfg: Config, name: str, clip: np.ndarray, stem: str) -> Path | None:
+    """Keep a 16 kHz copy of a negative clip stitched from several sentences (a "#a-b" slice would not play it)."""
+    import soundfile as sf
+
+    from ..audio.vad import SAMPLE_RATE
+    from .speakers import _safe_name
+
+    try:
+        d = cfg.speakers_dir / _safe_name(name) / "negatives"
+        d.mkdir(parents=True, exist_ok=True)
+        dest = d / f"{_safe_name(stem)}.wav"
+        k = 0
+        while dest.exists():
+            k += 1
+            dest = d / f"{_safe_name(stem)}_{k}.wav"
+        sf.write(str(dest), np.asarray(clip, dtype=np.float32), SAMPLE_RATE, format="WAV", subtype="PCM_16")
+        return dest
+    except Exception as e:  # noqa: BLE001 - the negative embedding still counts without a playable copy
+        log.warning("cannot save negative clip for %s: %s", name, e)
+        return None
+
+
+def _reject_rows(db: DB, cfg: Config, engine: Any, sp: Any, rows: list[Any], relabel: bool = True) -> dict[str, Any]:
+    """Shared part of reject_voice / reject_voice_group: negative samples from the rows grouped by (segment, cluster),
+    vetoes + released attribution, markdown, relabel of the affected segments."""
+    from ..audio.vad import SAMPLE_RATE
+    from .pipeline import Processor, write_day_markdown
+
+    sid, name = int(sp["id"]), str(sp["name"])
+    unknown = str(cfg.speakers.get("unknown_label") or "未知")
+    groups: dict[tuple[int, int | None], list[Any]] = {}
+    for r in rows:
+        groups.setdefault((int(r["segment_id"]), r["cluster_label"]), []).append(r)
+    ranked = sorted(groups.items(), key=lambda kv: -sum(max(0.0, float(u["end_s"]) - float(u["start_s"])) for u in kv[1]))
+    seg_rows = {seg: db.get_segment(seg) for seg in {k[0] for k in groups}}
+    negatives_added = 0
+    clips_tried = 0
+    warning: str | None = None
+    warn_score: float | None = None
+    for (seg, cl), us in ranked:
+        if clips_tried >= NEGATIVE_MAX_CLIPS:
+            break
+        row = seg_rows.get(seg)
+        if row is None or not Path(row["path"]).exists() or engine is None:
+            continue
+        us = sorted(us, key=lambda u: (float(u["start_s"]), int(u["id"])))
+        if sum(max(0.0, float(u["end_s"]) - float(u["start_s"])) for u in us) < NEGATIVE_MIN_SPEECH_S:
+            continue
+        try:
+            audio = read_segment(row["path"])
+            parts = [audio[int(float(u["start_s"]) * SAMPLE_RATE): int(float(u["end_s"]) * SAMPLE_RATE)] for u in us]
+            clip = np.concatenate(parts)[: int(NEGATIVE_MAX_S * SAMPLE_RATE)] if parts else np.zeros(0, dtype=np.float32)
+            if len(clip) < int(NEGATIVE_MIN_SPEECH_S * SAMPLE_RATE):
+                continue
+            clips_tried += 1
+            emb, speech_s = _embed_negative(engine, clip)
+        except Exception as e:  # noqa: BLE001 - unreadable file / engine failure: the veto still stands
+            log.warning("reject: no negative sample from segment #%s: %s", seg, e)
+            continue
+        if speech_s < NEGATIVE_MIN_SPEECH_S:
+            log.info("reject: segment #%s cluster %s has only %.1fs speech; veto without a negative sample", seg, cl, speech_s)
+            continue
+        sim = _reference_similarity(db, cfg, sid, emb)
+        if sim is not None and sim >= NEGATIVE_WARN_SIMILARITY:
+            # probably a mis-click: veto only, the voice does not become a negative sample
+            if warn_score is None or sim > warn_score:
+                warn_score = sim
+                warning = f"这段声音和 {name} 的样本非常像（{sim:.2f}），确定不是 TA 吗？"
+            log.info("reject: segment #%s voice resembles %s (%.2f); vetoed but not stored as a negative", seg, name, sim)
+            continue
+        if len(us) == 1:
+            source: str | None = f"{row['path']}#{float(us[0]['start_s']):.1f}-{float(us[0]['end_s']):.1f}"
+        else:
+            saved = _save_negative_clip(cfg, name, clip, f"neg_{seg}_{float(us[0]['start_s']):.0f}")
+            source = str(saved) if saved else None
+        db.add_speaker_negative(sid, emb, source, round(float(speech_s), 2), utterance_id=int(us[0]["id"]), segment_id=seg)
+        negatives_added += 1
+
+    ids = [int(r["id"]) for r in rows]
+    released = db.reject_utterances(sid, ids, unknown)
+    days = sorted({str(r["day"]) for r in rows})
+    for day in days:
+        try:
+            write_day_markdown(db, cfg, day)
+        except Exception as e:  # noqa: BLE001 - the DB is the source of truth
+            log.warning("cannot write markdown for %s: %s", day, e)
+    segments = sorted({k[0] for k in groups})
+    relabeled = 0
+    if relabel and engine is not None:
+        proc = Processor(cfg, db, engine=engine)
+        for seg in segments:
+            row = seg_rows.get(seg)
+            if row is None or row["status"] != "done" or not Path(row["path"]).exists():
+                continue
+            try:
+                relabeled += proc.relabel_segment(seg)
+            except Exception as e:  # noqa: BLE001 - the veto is in; re-identification is a bonus
+                log.warning("reject: relabel of segment #%s failed: %s", seg, e)
+    log.info("reject %s: %d sentence(s) vetoed (%d released), %d negative sample(s), %d relabeled",
+             name, len(ids), released, negatives_added, relabeled)
+    out: dict[str, Any] = {"speaker_id": sid, "name": name, "rejected": len(ids), "released": released,
+                           "utterance_ids": sorted(set(ids)),
+                           "negatives_added": negatives_added, "relabeled_changed": relabeled,
+                           "segments": segments, "days": days}
+    if warning:
+        out["warning"] = warning
+        out["warning_score"] = round(float(warn_score or 0.0), 3)
+    return out
+
+
+def reject_voice(db: DB, cfg: Config, engine: Any, speaker_id: int, utterance_ids: list[int],
+                 whole_cluster: bool = False) -> dict[str, Any]:
+    """"These sentences are NOT speaker_id": veto the speaker for them (utterance_rejections), release the ones
+    attributed to that speaker, take negative samples from their audio, then re-identify the affected segments.
+
+    With `whole_cluster` the sentences of the same segment and cluster that are also attributed to the speaker
+    automatically (not hand-labelled as that speaker) are included. Negative samples: the sentences grouped by
+    (segment, cluster) and stitched together, at most NEGATIVE_MAX_CLIPS clips of NEGATIVE_MAX_S each, only with
+    at least NEGATIVE_MIN_SPEECH_S of speech and a readable recording (otherwise veto only). A clip that
+    resembles the speaker's reference voice >= NEGATIVE_WARN_SIMILARITY is not stored (veto only) and the result
+    carries a `warning`. Raises LookupError (unknown speaker / sentences) and ValueError (bad input).
+
+    Returns {speaker_id, name, rejected, released, utterance_ids (every vetoed sentence, whole_cluster ones included),
+    negatives_added, relabeled_changed, segments, days, warning?}."""
+    sp = _speaker_row(db, speaker_id)
+    try:
+        ids = sorted({int(i) for i in (utterance_ids or [])})
+    except (TypeError, ValueError):
+        raise ValueError("utterance_ids 应为句子 id 列表")
+    if not ids:
+        raise ValueError("没有要否决的句子")
+    cols = "id, segment_id, cluster_label, start_s, end_s, day, speaker_id, speaker_source"
+    rows = list(db.query(f"SELECT {cols} FROM utterances WHERE id IN ({','.join('?' * len(ids))})", ids))
+    if not rows:
+        raise LookupError("没有这条记录")
+    if whole_cluster:
+        have = {int(r["id"]) for r in rows}
+        for seg, cl in sorted({(int(r["segment_id"]), int(r["cluster_label"])) for r in rows if r["cluster_label"] is not None}):
+            for r in db.query(f"SELECT {cols} FROM utterances WHERE segment_id=? AND cluster_label=? AND speaker_id=?"
+                              " AND (speaker_source IS NULL OR speaker_source<>'user')", (seg, cl, int(sp["id"]))):
+                if int(r["id"]) not in have:
+                    have.add(int(r["id"]))
+                    rows.append(r)
+    return _reject_rows(db, cfg, engine, sp, rows)
+
+
+def reject_voice_group(db: DB, cfg: Config, engine: Any, members: list[Any], speaker_id: int) -> dict[str, Any]:
+    """「不是 X」 on a voice group: veto speaker_id for every unidentified sentence of the members and take negative
+    samples per member (as reject_voice). Raises ValueError (bad members / no unidentified sentence) and LookupError."""
+    sp = _speaker_row(db, speaker_id)
+    mem = _parse_members(members)
+    rows: list[Any] = []
+    for seg, cl in mem:
+        rows.extend(db.query("SELECT id, segment_id, cluster_label, start_s, end_s, day, speaker_id, speaker_source FROM utterances"
+                             " WHERE segment_id=? AND cluster_label=? AND speaker_id IS NULL ORDER BY start_s, id", (seg, cl)))
+    if not rows:
+        raise ValueError("这组声音里没有未识别的句子")
+    return _reject_rows(db, cfg, engine, sp, rows)
+
+
 __all__ = ["RELATION_CHOICES", "group_unknown_voices", "backfill_cluster_embeddings", "name_voice", "cluster_members",
-           "missing_segments", "unknown_utterance_count"]
+           "missing_segments", "unknown_utterance_count", "reject_voice", "reject_voice_group"]

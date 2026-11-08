@@ -10,6 +10,11 @@ build_chunks(...)     pure function: diarization turns -> ASR chunks (merge / sp
 Processor             process_pending() / process_segment(seg_id) / relabel_segment(seg_id) / split_utterance(utt_id)
 write_day_markdown()  regenerate transcripts/YYYY-MM-DD.md from the DB
 transcribe_file()     one-off diarize + identify + ASR of any audio file (no DB writes)
+system_share()        share of a time range's energy that came from system audio (segments.channel_rms)
+
+Speakers v4: a turn whose system-audio share (segments.channel_rms, see system_share) reaches
+speakers.system_turn_share is never identified as the self speaker (the other side of a meeting / call), and a
+sentence is never re-identified as a speaker the user vetoed for it (utterance_rejections).
 """
 from __future__ import annotations
 
@@ -40,6 +45,73 @@ SPLIT_MIN_PIECE_S = 0.6    # a split piece shorter than this is merged into the 
 SPLIT_EDGE_S = 0.3         # a manual split point must lie inside (SPLIT_EDGE_S, duration - SPLIT_EDGE_S)
 SPLIT_MIN_TURN_S = 1.0     # auto split: diarization turns shorter than this are ignored
 SPLIT_PAD_S = 0.15         # ASR padding around a piece (same as build_chunks)
+DEFAULT_SYSTEM_TURN_SHARE = 0.6
+
+
+# --------------------------------------------------------------------------- system audio share
+def channel_pairs(blob: bytes | None) -> np.ndarray | None:
+    """segments.channel_rms (float16, interleaved mic, sys, mic, sys, ...) as an (n, 2) float64 array; None when
+    there is no usable data."""
+    if not blob:
+        return None
+    try:
+        a = np.frombuffer(bytes(blob), dtype=np.float16)
+    except (TypeError, ValueError):
+        return None
+    n = a.shape[0] // 2
+    if n == 0:
+        return None
+    a = np.nan_to_num(a[: 2 * n].astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0).reshape(n, 2)
+    return np.abs(a)
+
+
+def system_share(pairs: np.ndarray | None, block_s: float | None, start_s: float, end_s: float) -> float | None:
+    """Σsys² / (Σsys² + Σmic²) over the capture blocks the range [start_s, end_s) covers (weighted by overlap; one
+    (mic_rms, system_rms) pair per `block_s` seconds from the segment start). None when the segment has no
+    channel data, the range lies outside it, or the covered blocks are silent."""
+    if pairs is None or not block_s or float(block_s) <= 0:
+        return None
+    bs = float(block_s)
+    a, b = max(0.0, float(start_s)), float(end_s)
+    if b <= a:
+        return None
+    i0 = int(math.floor(a / bs))
+    i1 = min(int(math.ceil(b / bs)), pairs.shape[0])
+    if i0 >= i1:
+        return None
+    idx = np.arange(i0, i1)
+    w = np.minimum((idx + 1) * bs, b) - np.maximum(idx * bs, a)
+    w = np.clip(w, 0.0, None)
+    blk = pairs[i0:i1]
+    mic = float(np.sum(w * blk[:, 0] ** 2))
+    sys_ = float(np.sum(w * blk[:, 1] ** 2))
+    tot = mic + sys_
+    if not math.isfinite(tot) or tot <= 0:
+        return None
+    return round(sys_ / tot, 4)
+
+
+def system_turn_share(cfg: Config) -> float:
+    try:
+        return float(cfg.speakers.get("system_turn_share", DEFAULT_SYSTEM_TURN_SHARE))
+    except (TypeError, ValueError, AttributeError):
+        return DEFAULT_SYSTEM_TURN_SHARE
+
+
+def _segment_channels(seg: Any) -> tuple[np.ndarray | None, float | None]:
+    """(channel pairs, block seconds) of a segment row; (None, None) when it has none (mic only, imported, old row)."""
+    try:
+        blob, bs = seg["channel_rms"], seg["channel_block_s"]
+    except (IndexError, KeyError, TypeError):
+        return None, None
+    pairs = channel_pairs(blob)
+    try:
+        bs_f = float(bs) if bs is not None else None
+    except (TypeError, ValueError):
+        bs_f = None
+    if pairs is None or not bs_f or bs_f <= 0:
+        return None, None
+    return pairs, bs_f
 
 
 # --------------------------------------------------------------------------- chunks
@@ -405,8 +477,11 @@ class Processor:
         if n_faint:
             log.info("segment #%d: dropped %d faint turns (%.1f s, < %g dBFS)", seg_id, n_faint, faint_s, min_db)
         self.db.execute("UPDATE segments SET faint_s=? WHERE id=?", (float(faint_s), seg_id))
+        pairs, block_s = _segment_channels(seg)
         if turns:
+            self._mark_system_turns(turns, pairs, block_s)
             turns = self._identify(audio, turns, seg_id)
+            turns = self._enforce_system_turns(turns, pairs, block_s)
         chunks = build_chunks(turns, audio_len_s, float(self.cfg.mimo.asr_max_chunk_s)) if turns else []
         if not chunks:
             log.info("segment #%d: no speech turns -> no_speech, deleting %s", seg_id, path.name)
@@ -449,6 +524,7 @@ class Processor:
                 "speaker_name": c.speaker_name or unknown, "speaker_score": c.score,
                 "text_raw": raw, "text": text, "text_seg": tokenize(text),
                 "loudness_db": speech_dbfs(_clip(audio, c.start_s, c.end_s)),
+                "system_share": system_share(pairs, block_s, c.start_s, c.end_s),
             })
         self.db.execute(
             "INSERT INTO transcripts(segment_id, asr_model, raw_json, text_raw, text_corrected, correction_json, language)"
@@ -467,6 +543,59 @@ class Processor:
             except Exception as e:  # noqa: BLE001 - the DB is the source of truth
                 log.warning("cannot write markdown for %s: %s", day, e)
         return len(rows)
+
+    def _self_id(self) -> int | None:
+        try:
+            me = self.db.self_speaker()
+        except Exception:  # noqa: BLE001 - DB stand-ins without the method
+            return None
+        return int(me["id"]) if me is not None else None
+
+    def _mark_system_turns(self, turns: list[Turn], pairs: np.ndarray | None, block_s: float | None) -> int:
+        """Add the self speaker to Turn.exclude for every turn that is mostly system audio. Returns how many."""
+        if pairs is None:
+            return 0
+        me = self._self_id()
+        if me is None:
+            return 0
+        thr = system_turn_share(self.cfg)
+        n = 0
+        for t in turns:
+            sh = system_share(pairs, block_s, t.start, t.end)
+            if sh is not None and sh >= thr:
+                t.exclude = frozenset(getattr(t, "exclude", ()) or ()) | {me}
+                n += 1
+        return n
+
+    def _enforce_system_turns(self, turns: list[Turn], pairs: np.ndarray | None, block_s: float | None) -> list[Turn]:
+        """Safety net after identification (engines that ignore Turn.exclude): a system-audio turn identified as the
+        self speaker becomes unknown, on a fresh cluster id per original cluster so build_chunks does not merge it
+        back into the user's sentences."""
+        if pairs is None or not turns:
+            return turns
+        me = self._self_id()
+        if me is None:
+            return turns
+        thr = system_turn_share(self.cfg)
+        unknown = self.cfg.speakers.unknown_label
+        next_id = max(int(t.cluster) for t in turns) + 1
+        new_ids: dict[int, int] = {}
+        n = 0
+        for t in turns:
+            if t.speaker_id != me:
+                continue
+            sh = system_share(pairs, block_s, t.start, t.end)
+            if sh is None or sh < thr:
+                continue
+            if t.cluster not in new_ids:
+                new_ids[t.cluster] = next_id
+                next_id += 1
+            t.cluster = new_ids[t.cluster]
+            t.speaker_id, t.speaker_name = None, unknown
+            n += 1
+        if n:
+            log.info("%d system-audio turn(s) were not attributed to the self speaker", n)
+        return turns
 
     def _identify(self, audio: np.ndarray, turns: list[Turn], seg_id: int | None, per_utterance: bool = False) -> list[Turn]:
         """engine.identify_turns with the segment id (so cluster embeddings get stored); engines that do
@@ -488,6 +617,11 @@ class Processor:
         leaves speaker_id NULL and the row is automatic again) are left untouched. Returns the number of
         utterances whose speaker changed. Used after `speakers enroll/label` so history picks up a newly
         enrolled voice; the segment's cluster_embeddings are refreshed on the way.
+
+        A sentence is never identified as a speaker the user vetoed for it (utterance_rejections), and a mostly
+        system-audio sentence (segments.channel_rms, speakers.system_turn_share) never as the self speaker; the
+        engine tries the next candidate, and the write-back enforces it (unknown) whatever the engine did.
+        utterances.system_share is (re)computed when the segment has channel data.
 
         The write is conditional: between reading the rows and the UPDATE (the embedding takes seconds)
         a request thread may hand-label one of them (name_voice / label); such a row is skipped by the
@@ -512,8 +646,26 @@ class Processor:
                 self.db.execute("UPDATE utterances SET loudness_db=? WHERE id=? AND loudness_db IS NULL", (lv, u["id"]))
             levels.append(float(lv))
         loud = [i for i, lv in enumerate(levels) if not is_faint(lv, min_db)]
+        # vetoes (utterance_rejections) and system-audio sentences (never the self speaker)
+        pairs, block_s = _segment_channels(seg)
+        shares: list[float | None] = [None] * len(utts)
+        if pairs is not None:
+            for i, u in enumerate(utts):
+                sh = system_share(pairs, block_s, float(u["start_s"]), float(u["end_s"]))
+                shares[i] = sh
+                if sh is not None and _row_get(u, "system_share") != sh:
+                    self.db.execute("UPDATE utterances SET system_share=? WHERE id=?", (sh, u["id"]))
+        rejected = self.db.rejected_speakers([int(u["id"]) for u in utts]) if hasattr(self.db, "rejected_speakers") else {}
+        me = self._self_id() if pairs is not None else None
+        sys_thr = system_turn_share(self.cfg)
+        excludes: list[frozenset[int]] = []
+        for i, u in enumerate(utts):
+            ex = set(rejected.get(int(u["id"]), ()))
+            if me is not None and shares[i] is not None and shares[i] >= sys_thr:
+                ex.add(me)
+            excludes.append(frozenset(ex))
         turns = [Turn(float(utts[i]["start_s"]), float(utts[i]["end_s"]),
-                      int(utts[i]["cluster_label"] if utts[i]["cluster_label"] is not None else i)) for i in loud]
+                      int(utts[i]["cluster_label"] if utts[i]["cluster_label"] is not None else i), exclude=excludes[i]) for i in loud]
         if turns:
             turns = self._identify(audio, turns, seg_id, per_utterance=True)
         by_row = dict(zip(loud, turns))
@@ -525,17 +677,30 @@ class Processor:
                 continue
             t = by_row.get(i)
             if t is None:
-                # too quiet to identify: left as it is, just without a score
+                # too quiet to identify: left as it is, just without a score -- unless it is attributed to a speaker it
+                # may not be (a veto, or the self speaker on system audio): then it is released to unknown
+                if u["speaker_id"] is not None and int(u["speaker_id"]) in excludes[i]:
+                    cur = self.db.execute(
+                        "UPDATE utterances SET speaker_id=NULL, speaker_name=?, speaker_score=NULL, speaker_source=NULL"
+                        " WHERE id=? AND speaker_id=? AND (speaker_source IS NULL OR speaker_source<>'user')",
+                        (unknown, u["id"], int(u["speaker_id"])))
+                    if int(cur.rowcount or 0) == 1:
+                        changed += 1
+                        days.add(u["day"])
+                    continue
                 self.db.execute("UPDATE utterances SET speaker_score=NULL WHERE id=?", (u["id"],))
                 continue
-            name = t.speaker_name or unknown
+            sid_new, name, score_new = t.speaker_id, (t.speaker_name or unknown), t.score
+            if sid_new is not None and sid_new in excludes[i]:
+                sid_new, name = None, unknown        # the engine ignored the veto: enforce it
             cur = self.db.execute(
                 "UPDATE utterances SET speaker_id=?, speaker_name=?, speaker_score=?, speaker_source=NULL WHERE id=?"
-                " AND (speaker_source IS NULL OR speaker_source<>'user' OR speaker_id IS NULL)",
-                (t.speaker_id, name, t.score, u["id"]))
+                " AND (speaker_source IS NULL OR speaker_source<>'user' OR speaker_id IS NULL)"
+                " AND NOT EXISTS (SELECT 1 FROM utterance_rejections r WHERE r.utterance_id=utterances.id AND r.speaker_id=?)",
+                (sid_new, name, score_new, u["id"], sid_new))
             if int(cur.rowcount or 0) != 1:
                 continue                        # hand-labelled meanwhile: leave it alone
-            if u["speaker_id"] != t.speaker_id or (u["speaker_name"] or unknown) != name:
+            if u["speaker_id"] != sid_new or (u["speaker_name"] or unknown) != name:
                 changed += 1
                 days.add(u["day"])
         if changed:
@@ -561,18 +726,45 @@ class Processor:
             raise FileNotFoundError("这段音频已不存在（超过保留期），无法拆分")
         return u, seg, read_segment(path)
 
-    def _match_clip(self, clip: np.ndarray, enrolled: list[tuple[int, str, np.ndarray]], thr: float
-                    ) -> tuple[int | None, str | None, float | None]:
-        """Identify one piece on its own audio (at least SPLIT_MIN_TURN_S of it); unknown otherwise."""
+    def _match_clip(self, clip: np.ndarray, enrolled: list[tuple[int, str, np.ndarray]], thr: float,
+                    exclude: frozenset[int] = frozenset()) -> tuple[int | None, str | None, float | None]:
+        """Identify one piece on its own audio (at least SPLIT_MIN_TURN_S of it); unknown otherwise.
+        Negative samples and `exclude` are passed on only when there are any (engines / fakes without the
+        keywords keep working)."""
         if not enrolled or len(clip) < int(SPLIT_MIN_TURN_S * SAMPLE_RATE):
             return None, None, None
         embed = getattr(self.engine, "embed", None)
         match = getattr(self.engine, "match", None)
         if not callable(embed) or not callable(match):
             return None, None, None
-        return match(embed(clip), enrolled, thr)
+        from .speakers import load_negatives, negative_margin
 
-    def _pieces_manual(self, clip: np.ndarray, at: list[float]) -> list[dict[str, Any]]:
+        kw: dict[str, Any] = {}
+        negatives = load_negatives(self.db)
+        if negatives:
+            kw["negatives"], kw["margin"] = negatives, negative_margin(self.cfg)
+        if exclude:
+            kw["exclude"] = exclude
+        sid, name, score = match(embed(clip), enrolled, thr, **kw)
+        if sid is not None and sid in exclude:
+            return None, None, score
+        return sid, name, score
+
+    def _system_exclude(self, seg: Any, start_s: float, end_s: float) -> frozenset[int]:
+        """{self speaker id} when [start_s, end_s) of the segment is mostly system audio, else empty."""
+        pairs, block_s = _segment_channels(seg)
+        if pairs is None:
+            return frozenset()
+        me = self._self_id()
+        sh = system_share(pairs, block_s, start_s, end_s)
+        if me is None or sh is None or sh < system_turn_share(self.cfg):
+            return frozenset()
+        return frozenset({me})
+
+    def _pieces_manual(self, clip: np.ndarray, at: list[float], seg: Any = None, offset_s: float = 0.0,
+                       veto: frozenset[int] = frozenset()) -> list[dict[str, Any]]:
+        """Cut at `at` and identify every piece on its own audio; `veto` (the speakers the user rejected for the
+        sentence being split) is excluded for every piece."""
         dur = len(clip) / SAMPLE_RATE
         pts: list[float] = []
         for x in at:
@@ -593,17 +785,34 @@ class Processor:
         bounds = [0.0, *pts, dur]
         pieces: list[dict[str, Any]] = []
         for a, b in zip(bounds, bounds[1:]):
-            sid, name, score = self._match_clip(clip[int(a * SAMPLE_RATE): int(b * SAMPLE_RATE)], enrolled, thr)
+            excl = (self._system_exclude(seg, offset_s + a, offset_s + b) if seg is not None else frozenset()) | veto
+            sid, name, score = self._match_clip(clip[int(a * SAMPLE_RATE): int(b * SAMPLE_RATE)], enrolled, thr, excl)
             pieces.append({"rel_start": a, "rel_end": b, "speaker_id": sid, "speaker_name": name, "score": score})
         return pieces
 
-    def _pieces_auto(self, clip: np.ndarray) -> list[dict[str, Any]]:
+    def _pieces_auto(self, clip: np.ndarray, seg: Any = None, offset_s: float = 0.0,
+                     veto: frozenset[int] = frozenset()) -> list[dict[str, Any]]:
         """Diarize the utterance's audio, identify (cluster + turn level), merge neighbouring turns of the
-        same speaker / cluster into pieces."""
+        same speaker / cluster into pieces. Mostly system-audio turns are never the self speaker, and no turn is
+        ever a speaker in `veto` (rejected by the user for the sentence being split)."""
         turns = [t for t in self.engine.diarize(clip) if t.duration >= SPLIT_MIN_TURN_S]
         if not turns:
             raise ValueError("没有分出第二个声音，请手动指定拆分点")
+        if veto:
+            for t in turns:
+                t.exclude = frozenset(getattr(t, "exclude", ()) or ()) | veto
+        pairs, block_s = _segment_channels(seg) if seg is not None else (None, None)
+        if pairs is not None:
+            me = self._self_id()
+            for t in turns:
+                sh = system_share(pairs, block_s, offset_s + t.start, offset_s + t.end)
+                if me is not None and sh is not None and sh >= system_turn_share(self.cfg):
+                    t.exclude = frozenset(getattr(t, "exclude", ()) or ()) | {me}
         turns = sorted(self.engine.identify_turns(clip, turns, self.db), key=lambda t: (t.start, t.end))
+        unknown = self.cfg.speakers.unknown_label
+        for t in turns:
+            if t.speaker_id is not None and t.speaker_id in (getattr(t, "exclude", ()) or ()):
+                t.speaker_id, t.speaker_name = None, unknown
         pieces: list[dict[str, Any]] = []
         for t in turns:
             key = ("s", t.speaker_id) if t.speaker_id is not None else ("c", t.cluster)
@@ -638,10 +847,13 @@ class Processor:
         clip = audio[int(a * SAMPLE_RATE): int(b * SAMPLE_RATE)]
         if len(clip) < int(2 * SPLIT_MIN_PIECE_S * SAMPLE_RATE):
             raise ValueError("这句太短，无法拆分")
+        # the speakers the user vetoed for this sentence are never one of its pieces either
+        veto = (frozenset(self.db.rejected_speakers([int(u["id"])]).get(int(u["id"]), ()))
+                if hasattr(self.db, "rejected_speakers") else frozenset())
         if auto:
-            pieces = self._pieces_auto(clip)
+            pieces = self._pieces_auto(clip, seg, a, veto)
         elif at:
-            pieces = self._pieces_manual(clip, list(at))
+            pieces = self._pieces_manual(clip, list(at), seg, a, veto)
         else:
             raise ValueError("需要给出拆分点（at）或选择自动拆分（auto）")
         pieces = self._merge_short_pieces(pieces)
@@ -649,6 +861,8 @@ class Processor:
             raise ValueError("拆分点太靠近两端，只剩一段，没有拆分")
         unknown = self.cfg.speakers.unknown_label
         for pc in pieces:
+            if pc.get("speaker_id") is not None and int(pc["speaker_id"]) in veto:
+                pc["speaker_id"], pc["speaker_name"] = None, None     # a veto always wins
             pc["start_s"] = round(a + float(pc["rel_start"]), 3)
             pc["end_s"] = round(a + float(pc["rel_end"]), 3)
             pc["rel_start"] = round(float(pc["rel_start"]), 3)
@@ -693,6 +907,7 @@ class Processor:
             raise ValueError("有一段没有转写出文字（或被内容过滤），没有修改这句")
         corrected, _edits = self._correct(spoken)
         unknown = self.cfg.speakers.unknown_label
+        pairs, block_s = _segment_channels(seg)
         rows: list[dict[str, Any]] = []
         days: set[str] = {str(u["day"])}
         for i, (c, raw) in enumerate(spoken):
@@ -704,9 +919,15 @@ class Processor:
                          "abs_start": abs_start.isoformat(timespec="milliseconds"), "day": day,
                          "cluster_label": c.cluster, "speaker_id": c.speaker_id, "speaker_name": c.speaker_name or unknown,
                          "speaker_score": c.score, "text_raw": raw, "text": text, "text_seg": tokenize(text), "speaker_source": None,
-                         "loudness_db": speech_dbfs(_clip(audio, c.start_s, c.end_s))})
+                         "loudness_db": speech_dbfs(_clip(audio, c.start_s, c.end_s)),
+                         "system_share": system_share(pairs, block_s, c.start_s, c.end_s)})
         ids: list[int] = []
         with self.db.transaction() as con:
+            # the original sentence's vetoes go to every piece (read before the DELETE: they cascade with the row)
+            vetoed = [int(r[0]) for r in con.execute(
+                "SELECT speaker_id FROM utterance_rejections WHERE utterance_id=?", (int(utt_id),)).fetchall()]
+            # the highest id so far (the row being replaced may be it: its id must not come back for a piece)
+            top_id = int(con.execute("SELECT COALESCE(MAX(id),0) FROM utterances").fetchone()[0])
             # the row must still be the one we planned on (ASR took seconds: another split / relabel may have replaced it)
             cur = con.execute("DELETE FROM utterances WHERE id=? AND start_s=? AND end_s=?",
                               (int(utt_id), float(u["start_s"]), float(u["end_s"])))
@@ -716,12 +937,15 @@ class Processor:
                 # new ids above every id ever used, so the page never confuses a piece with the row it replaced
                 cur = con.execute(
                     "INSERT INTO utterances(id,segment_id,start_s,end_s,abs_start,day,cluster_label,speaker_id,speaker_name,speaker_score,"
-                    "text_raw,text,speaker_source,loudness_db)"
-                    " VALUES ((SELECT COALESCE(MAX(id),0)+1 FROM utterances),?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (r["segment_id"], r["start_s"], r["end_s"], r["abs_start"], r["day"], r["cluster_label"], r["speaker_id"],
-                     r["speaker_name"], r["speaker_score"], r["text_raw"], r["text"], r["speaker_source"], r["loudness_db"]))
+                    "text_raw,text,speaker_source,loudness_db,system_share)"
+                    " VALUES ((SELECT MAX(COALESCE(MAX(id),0), ?)+1 FROM utterances),?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (top_id, r["segment_id"], r["start_s"], r["end_s"], r["abs_start"], r["day"], r["cluster_label"], r["speaker_id"],
+                     r["speaker_name"], r["speaker_score"], r["text_raw"], r["text"], r["speaker_source"], r["loudness_db"],
+                     r["system_share"]))
                 uid = int(cur.lastrowid)
                 ids.append(uid)
+                for vs in vetoed:
+                    con.execute("INSERT OR IGNORE INTO utterance_rejections(utterance_id, speaker_id) VALUES (?,?)", (uid, vs))
                 if r["text_seg"]:
                     con.execute("INSERT INTO utterance_tokens(utterance_id, text_seg) VALUES (?,?)", (uid, r["text_seg"]))
         self._embed_new(ids)
@@ -810,6 +1034,13 @@ class Processor:
             log.warning("unusable correction result (%s), keeping raw text", e)
             return texts, None
         return out, (json.dumps(all_edits, ensure_ascii=False) if all_edits else None)
+
+
+def _row_get(r: Any, key: str) -> Any:
+    try:
+        return r[key]
+    except (IndexError, KeyError):
+        return None
 
 
 def _accepts_segment_id(fn: Any) -> bool:
@@ -949,4 +1180,5 @@ def transcribe_file(cfg: Config, client: Any, path: Path | str, db: DB | None = 
 
 
 __all__ = ["Chunk", "Processor", "build_chunks", "drop_faint_turns", "write_day_markdown", "segment_heading", "transcribe_file",
-           "tokenize", "load_glossary", "SPLIT_MIN_PIECE_S", "SPLIT_EDGE_S", "SPLIT_MIN_TURN_S"]
+           "tokenize", "load_glossary", "system_share", "channel_pairs", "system_turn_share",
+           "SPLIT_MIN_PIECE_S", "SPLIT_EDGE_S", "SPLIT_MIN_TURN_S"]

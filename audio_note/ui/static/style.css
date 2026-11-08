@@ -407,3 +407,62 @@ table.tbl { width: 100%; border-collapse: collapse; }
 .profile-row .pn { font-weight: 600; display: flex; align-items: center; gap: 8px; }
 .profile-row .ps { color: var(--muted); font-size: 12.5px; }
 .profile-row.cur { background: var(--accent-soft); border-radius: 8px; padding-left: 10px; padding-right: 10px; }
+
+/* speakers v4: negatives, review queue, sample influence, system-audio mark */
+.spk-section + .spk-section { margin-top: 22px; }
+#enroll-panel { margin-bottom: 14px; }
+.sys-mark { font-size: 11px; margin-left: 4px; vertical-align: 1px; cursor: help; }
+.utt .acts .icon-btn.reject:hover { background: var(--danger-soft); color: var(--danger); }
+.alert.risky-note { border-width: 1.5px; font-weight: 500; }
+.voice-hint { display: inline-flex; gap: 4px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+.chip.not { color: var(--muted); background: transparent; border-style: dashed; }
+.chip.not:hover { color: var(--danger); border-color: var(--danger); background: var(--danger-soft); }
+.chip.not:disabled { opacity: .55; cursor: default; }
+.tbl tr.outlier td { background: var(--warn-soft); }
+.tbl tr.risky td { background: var(--danger-soft); }
+.tbl td.influence { white-space: nowrap; }
+.tbl td.influence.bad { color: var(--danger); font-weight: 600; }
+.neg-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin: 14px 0 6px; padding-top: 10px; border-top: 1px dashed var(--border); }
+.neg-tbl .neg-src { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sample-player:empty { display: none; }
+.sample-player audio { height: 30px; width: 100%; margin-top: 6px; }
+.icon-btn.faint { cursor: default; opacity: .5; }
+.icon-btn.faint:hover { background: transparent; color: var(--muted); }
+
+/* 核对 dialog */
+.modal.wide { width: min(760px, 94vw); }
+.review-list { display: flex; flex-direction: column; gap: 2px; max-height: 58vh; overflow-y: auto; }
+.review-row { display: grid; grid-template-columns: 86px minmax(0, 1fr) auto auto; gap: 8px; align-items: center; padding: 5px 6px; border-radius: 6px; font-size: 13px; transition: opacity .35s; }
+.review-row:hover { background: var(--surface-2); }
+.review-row.playing { background: var(--accent-soft); }
+.review-row .time { color: var(--faint); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.review-row .text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.review-row .meta { display: inline-flex; gap: 6px; align-items: center; color: var(--faint); font-size: 11.5px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.review-row .meta .sc { color: var(--muted); font-weight: 600; }
+.review-row .btns { display: inline-flex; gap: 2px; align-items: center; justify-content: flex-end; min-width: 84px; }
+.review-row .icon-btn.ok:hover { background: var(--ok-soft); color: var(--ok); }
+.review-row .icon-btn.no:hover { background: var(--danger-soft); color: var(--danger); }
+.review-row.far .text { opacity: .6; font-style: italic; }
+.review-row .time, .review-row .text, .review-row .meta { transition: opacity .35s; }
+.review-row.done .time, .review-row.done .text, .review-row.done .meta { opacity: .4; }
+.review-row.done.no .text { text-decoration: line-through; text-decoration-color: var(--faint); }
+.review-row.done:hover { background: transparent; }
+.review-row .rv-res { white-space: nowrap; font-weight: 500; }
+.review-row .rv-res.ok { color: var(--ok); }
+.review-row .rv-res.no { color: var(--danger); }
+.review-row .rv-player { grid-column: 1 / -1; display: flex; }
+.review-row .rv-player:empty { display: none; }
+.review-row .rv-player audio { height: 30px; flex: 1; min-width: 0; }
+.review-row .rv-warn { grid-column: 1 / -1; margin: 2px 0 0; }
+@media (max-width: 640px) { .review-row { grid-template-columns: minmax(0, 1fr) auto; } .review-row .time, .review-row .meta { display: none; } }
+
+/* risky-sample note: text on its own line, buttons underneath (the card is only half the page wide) */
+.alert.risky-note { flex-direction: column; align-items: stretch; gap: 8px; }
+.alert.risky-note .right { margin-left: 0; flex-wrap: wrap; }
+/* sample / negative lists can be wider than a speaker card: scroll inside the card instead of spilling out */
+.spk-card .samples { overflow-x: auto; max-width: 100%; }
+.spk-card .samples table.tbl { min-width: 560px; }
+.spk-card .samples .tbl td { white-space: nowrap; }
+.spk-card .samples .tbl td:nth-child(2) { white-space: normal; word-break: break-all; min-width: 140px; }
+/* an open sample list gets the whole row so the 一致性 / 单独认出 columns are visible without scrolling */
+.grid > .spk-card:has(.samples:not(.hidden)) { grid-column: 1 / -1; }

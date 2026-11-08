@@ -13,12 +13,19 @@ Robustness: if no block arrives for STALL_TIMEOUT_S (device unplugged, Bluetooth
 WASAPI endpoint invalidated by sleep/resume) or the stream reports itself inactive, run() raises
 RuntimeError after flushing the open segment; service._recorder_loop then reopens the device.
 A failing partial-file write degrades to memory-only capture instead of killing the thread.
+
+Channel levels: when the capture mixes microphone + system audio (MixedCapture) every block comes
+with ``last_channels`` = (mic_rms, system_rms). The recorder keeps one entry per block, indexed by
+absolute sample position, for as long as the gate may still put that block into a segment (open
+segment or pre-roll ring), and stores the pairs of the blocks overlapping each emitted segment in
+segments.channel_rms / channel_block_s. Microphone-only capture leaves them NULL.
 """
 from __future__ import annotations
 
 import logging
 import threading
 import time
+from collections import deque
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -66,6 +73,8 @@ class Recorder:
         self._recover_vad: SileroVAD | None = None   # separate instance: recovery must not reset the live VAD state
         self.partials_recovered = 0
         self.capture: Any = None                  # the open MicCapture / MixedCapture while run() is inside it
+        # (start sample, n samples, mic_rms, system_rms) per delivered block, oldest first; only while mixing
+        self._channels: deque[tuple[int, int, float, float]] = deque()
 
     # wall-clock time of an absolute sample index
     def _time_of(self, sample: int) -> datetime:
@@ -87,6 +96,7 @@ class Recorder:
             self.stream_t0 = datetime.now()
             self._consumed = 0
             self._delivered = 0
+            self._channels.clear()
             first_block = True
             last_log = time.time()
             last_recover = time.time()
@@ -101,6 +111,7 @@ class Recorder:
                         self._check_stall(mic)
                         continue
                     self.last_block_at = time.time()
+                    self._note_channels(getattr(mic, "last_channels", None), len(block))
                     self._delivered += len(block)
                     self._reanchor(getattr(mic, "last_block_wall", 0.0) or self.last_block_at, force=first_block)
                     first_block = False
@@ -109,6 +120,7 @@ class Recorder:
                     for i in range(n):
                         self._feed_window(buf[i * WINDOW:(i + 1) * WINDOW])
                     carry = buf[n * WINDOW:]
+                    self._prune_channels()
                     if time.time() - last_log > 300:
                         last_log = time.time()
                         log.info("recorder alive: %d segments, %.0fs speech, overflows=%d dropped=%d reanchors=%d",
@@ -137,6 +149,50 @@ class Recorder:
         for seg in segs:
             self._emit(seg)
         self.is_speaking = self.gate.active
+
+    # --- channel levels (mic + system audio) -----------------------------------
+    def _note_channels(self, pair: Any, n: int) -> None:
+        """Remember the (mic_rms, system_rms) of the block about to be delivered (absolute samples
+        [self._delivered, self._delivered + n)). Blocks without a pair (microphone only) are not kept,
+        so a segment that is not fully covered gets no channel data."""
+        if pair is None or n <= 0:
+            return
+        try:
+            mic_rms, sys_rms = float(pair[0]), float(pair[1])
+        except (TypeError, ValueError, IndexError):
+            return
+        self._channels.append((self._delivered, n, mic_rms, sys_rms))
+
+    def _prune_channels(self) -> None:
+        """Drop pairs of blocks the gate can no longer put into a segment: everything before the open
+        segment's first sample, or before the pre-roll ring while idle."""
+        if not self._channels:
+            return
+        g = self.gate
+        held = g._buf_len if g.active else g._pre_len
+        keep_from = self._consumed - held
+        while self._channels and self._channels[0][0] + self._channels[0][1] <= keep_from:
+            self._channels.popleft()
+
+    def _segment_channels(self, seg) -> tuple[np.ndarray | None, float | None]:
+        """(n_blocks x 2 float32 array, seconds per block) for the blocks overlapping `seg`, or
+        (None, None) when the segment is not covered end to end by recorded pairs."""
+        if not self._channels or len(seg.audio) == 0:
+            return None, None
+        # gate positions and the recorder's consumed counter differ by a constant within one run
+        start = seg.start_sample + (self._consumed - self.gate._pos)
+        end = start + len(seg.audio)
+        sel = [c for c in self._channels if c[0] < end and c[0] + c[1] > start]
+        if not sel or sel[0][0] > start or sel[-1][0] + sel[-1][1] < end:
+            log.debug("segment [%d, %d) not fully covered by channel levels; storing none", start, end)
+            return None, None
+        for a, b in zip(sel, sel[1:]):
+            if b[0] != a[0] + a[1]:
+                log.debug("gap in channel levels inside segment [%d, %d); storing none", start, end)
+                return None, None
+        pairs = np.array([(c[2], c[3]) for c in sel], dtype=np.float32)
+        block_s = float(np.median([c[1] for c in sel])) / SAMPLE_RATE
+        return pairs, block_s
 
     # --- clock -----------------------------------------------------------------
     def _reanchor(self, block_wall: float, force: bool = False) -> None:
@@ -213,7 +269,13 @@ class Recorder:
         else:
             started = self._time_of(seg.start_sample)
         try:
-            seg_id = finalize_segment(self.cfg, self.db, seg.audio, started, seg.speech_s, partial=partial_path)
+            channels, block_s = self._segment_channels(seg)
+        except Exception as e:  # noqa: BLE001 - channel levels are optional; the audio must still be saved
+            log.warning("channel levels unavailable for this segment: %s", e)
+            channels, block_s = None, None
+        try:
+            seg_id = finalize_segment(self.cfg, self.db, seg.audio, started, seg.speech_s, partial=partial_path,
+                                      channel_rms=channels, channel_block_s=block_s)
         except Exception as e:  # noqa: BLE001
             log.exception("finalize failed: %s", e)
             return

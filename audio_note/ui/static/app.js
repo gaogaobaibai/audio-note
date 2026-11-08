@@ -28,6 +28,22 @@
   // loudness in dBFS, shown as "−32 dB" (real minus sign); null / NaN → ""
   const fmtDb = (v) => { if (v == null || !Number.isFinite(Number(v))) return ""; const n = Math.round(Number(v)); return `${n < 0 ? "−" : ""}${Math.abs(n)} dB`; };
   const ORIGIN_LABEL = { mic: "麦克风", file: "文件", label: "标记", voice: "声音组", cluster: "簇" };
+  // utterances.system_share: share of the turn's energy that came from the system-audio (loopback) channel; at or above
+  // this the line is most likely the far side of a meeting / call (speakers.system_turn_share defaults to the same 0.6)
+  const SYS_SHARE = 0.6;
+  const isSystemVoice = (v) => v != null && Number.isFinite(Number(v)) && Number(v) >= SYS_SHARE;
+  const sysBadge = (v) => (isSystemVoice(v) ? `<span class="sys-mark" title="来自系统声音（会议 / 通话的对方）${esc(` · 占 ${Math.round(Number(v) * 100)}%`)}">🔊</span>` : "");
+  // plain-text line (esc() it before putting it into html) for the answer of POST /api/utterances/{id}/reject and
+  // POST /api/voices/reject: {speaker_id, rejected, negatives_added, relabeled_changed, warning?}
+  function rejectSummary(r, name) {
+    const n = Number(r && r.rejected) || 0, k = Number(r && r.negatives_added) || 0, m = Number(r && r.relabeled_changed) || 0;
+    return `已标为不是 ${name || "TA"}：${n} 句${k ? `，加入 ${k} 个负样本` : "（没有取到负样本，只是这些句子不再认成 TA）"}${m ? `，这段录音里另有 ${m} 句重新识别` : ""}`;
+  }
+  function toastReject(r, name) {                // toast() sets textContent: plain text is right here
+    const text = rejectSummary(r, name);
+    if (r && r.warning) toast(`${text}。${r.warning}`, "warn", 10000);
+    else toast(text, "ok", 6000);
+  }
 
   async function api(path, opts = {}) {
     const init = { method: opts.method || "GET", headers: {} };
@@ -62,10 +78,15 @@
   }
   const toastErr = (e) => toast(e && e.message ? e.message : String(e), "err", 6000);
 
-  function modal(html, onMount) {
+  // onClose (optional) runs once after the dialog was closed in any way (button, Escape, click on the backdrop)
+  function modal(html, onMount, onClose) {
     const root = $("#modal-root");
     root.innerHTML = `<div class="modal">${html}</div>`;
-    const close = () => { root.innerHTML = ""; document.removeEventListener("keydown", onKey); };
+    let closed = false;
+    const close = () => {
+      root.innerHTML = ""; document.removeEventListener("keydown", onKey);
+      if (!closed) { closed = true; if (onClose) { try { onClose(); } catch (e) { /* ignore */ } } }
+    };
     const onKey = (e) => { if (e.key === "Escape") close(); };
     document.addEventListener("keydown", onKey);
     root.onclick = (e) => { if (e.target === root) close(); };
@@ -417,9 +438,9 @@
     const farBadge = far ? `<span class="badge far" title="${esc(dbTitle)}">远</span>` : "";
     return `<div class="utt ${isUnk ? "unknown" : ""} ${hl ? "hl" : ""} ${far ? "far" : ""}" data-id="${u.id}" id="u${u.id}" ${dbTitle ? `title="${esc(dbTitle)}"` : ""}>
       <span class="time">${esc(u.time.slice(0, 5))}${dbHtml}</span>
-      <span class="spk ${c}" title="${esc(u.speaker)}${u.score != null ? ` 相似度 ${u.score}` : ""}">${esc(u.speaker)}${meBadge}${u.score != null && !isUnk ? `<span class="sc">${u.score.toFixed(2)}</span>` : ""}${farBadge}</span>
+      <span class="spk ${c}" title="${esc(u.speaker)}${u.score != null ? ` 相似度 ${u.score}` : ""}">${esc(u.speaker)}${meBadge}${sysBadge(u.system_share)}${u.score != null && !isUnk ? `<span class="sc">${u.score.toFixed(2)}</span>` : ""}${farBadge}</span>
       <span class="text">${esc(u.text)}${u.text_raw ? `<div class="raw" title="纠错前的原始转写">原文：${esc(u.text_raw)}</div>` : ""}</span>
-      <span class="acts">${noActs ? "" : `${u.audio ? `<button class="icon-btn" data-u="play" title="播放这句">▶</button>` : ""}<button class="icon-btn" data-u="label" title="标记这句话是谁说的">👤</button>${u.audio ? `<button class="icon-btn" data-u="split" title="拆分这句（两个人的话混在一起时）">✂</button>` : ""}<button class="icon-btn" data-u="ctx" title="前后文">↕</button>`}</span>
+      <span class="acts">${noActs ? "" : `${u.audio ? `<button class="icon-btn" data-u="play" title="播放这句">▶</button>` : ""}<button class="icon-btn" data-u="label" title="标记这句话是谁说的">👤</button>${isUnk ? "" : `<button class="icon-btn reject" data-u="reject" title="不是 TA（标为负样本）">✗</button>`}${u.audio ? `<button class="icon-btn" data-u="split" title="拆分这句（两个人的话混在一起时）">✂</button>` : ""}<button class="icon-btn" data-u="ctx" title="前后文">↕</button>`}</span>
     </div>`;
   }
 
@@ -495,6 +516,7 @@
         const u = data.sessions.flatMap((s) => s.utterances).find((x) => x.id === id);
         if (ub.dataset.u === "play") playUtt(row, id);
         else if (ub.dataset.u === "label") labelUtt(u, () => loadDay());
+        else if (ub.dataset.u === "reject") rejectUtt(u, () => loadDay());
         else if (ub.dataset.u === "split") splitUtt(u, (ids) => { hlIds = new Set(ids || []); loadDay(); });
         else if (ub.dataset.u === "ctx") showContext(id);
         return;
@@ -550,9 +572,11 @@
       <label class="check small mt"><input type="checkbox" id="lb-whole" checked> 这段录音里同一个声音的其他句子也一起标</label>
       <div class="help mt">会用这句话的声音补充该说话人的声纹，并重新识别同一段录音里的其他语句（${(u.end_s - u.start_s).toFixed(1)} 秒，太短的话识别效果一般，建议选 3 秒以上的句子）。</div>
       ${u.audio ? `<div class="mt"><audio controls src="/api/audio/utterance/${u.id}?pad=0.3" style="width:100%"></audio></div>` : `<div class="alert warn mt">这段音频已被删除，无法提取声纹</div>`}
-      <div class="actions"><button class="btn" data-x="cancel">取消</button><button class="btn primary" data-x="ok" ${u.audio ? "" : "disabled"}>标记</button></div>`,
+      <div class="actions">${u.speaker_id ? `<button class="btn danger" data-x="reject" style="margin-right:auto"title="这句不是 ${esc(u.speaker)} 说的：标为未识别，并用它的声音给 ${esc(u.speaker)} 加一个负样本">不是 ${esc(u.speaker)}</button>` : ""}<button class="btn" data-x="cancel">取消</button><button class="btn primary" data-x="ok" ${u.audio ? "" : "disabled"}>标记</button></div>`,
       (el, close) => {
         const inp = el.querySelector("#lb-name"); inp.focus();
+        const rj = el.querySelector('[data-x="reject"]');
+        if (rj) rj.onclick = () => { close(); rejectUtt(u, after); };
         wireRelationSelects(el);
         const newBox = el.querySelector("#lb-new");
         const isNew = () => { const n = inp.value.trim(); return !!n && !names.includes(n); };
@@ -587,6 +611,34 @@
         };
         el.querySelector('[data-x="ok"]').onclick = () => ok(false);
         inp.onkeydown = (e) => { if (e.key === "Enter") ok(false); };
+      });
+  }
+
+  // ✗ 不是 TA: the utterance is not the speaker it was recognised as → POST /api/utterances/{id}/reject; the backend
+  // marks it unidentified, remembers the rejection (relabel never assigns it back) and, when the audio is still there,
+  // keeps its voice as a negative sample of that speaker. `after()` runs once it succeeded.
+  function rejectUtt(u, after) {
+    if (!u || !u.speaker_id) return;
+    const name = u.speaker;
+    modal(`<h2>这句不是 ${esc(name)}？</h2>
+      <div class="muted small mb">${esc(String(u.time || "").slice(0, 5))} ${esc(name)}${sysBadge(u.system_share)}：${esc(u.text)}</div>
+      ${u.audio ? `<div><audio controls src="/api/audio/utterance/${u.id}?pad=0.3" style="width:100%"></audio></div>` : `<div class="alert warn">这段音频已被删除：只会把这句标为不是 ${esc(name)}，取不到负样本。</div>`}
+      <label class="check small mt"><input type="checkbox" id="rj-whole"> 同一个声音的其他句子也一起（这段录音里）</label>
+      <div class="help mt">这句会变成「未识别」，以后重新识别也不会再认成 ${esc(name)}；它的声音会作为 ${esc(name)} 的负样本，像这样的声音以后不容易再被认成 ${esc(name)}。负样本可以在说话人页的样本列表里删掉。</div>
+      <div class="actions"><button class="btn" data-x="cancel">取消</button><button class="btn danger" data-x="ok">不是 ${esc(name)}</button></div>`,
+      (el, close) => {
+        const audio = el.querySelector("audio"); if (audio) audio.onerror = () => toast("音频无法播放（文件可能已删除）", "err");
+        el.querySelector('[data-x="cancel"]').onclick = close;
+        const b = el.querySelector('[data-x="ok"]');
+        b.onclick = async () => {
+          b.disabled = true; b.innerHTML = `<span class="spin"></span>处理中…`;
+          if (audio) audio.pause();
+          try {
+            const r = await api(`/api/utterances/${u.id}/reject`, { method: "POST", json: { speaker_id: u.speaker_id, whole_cluster: el.querySelector("#rj-whole").checked } });
+            toastReject(r, name);
+            close(); if (after) after();
+          } catch (e) { toastErr(e); b.disabled = false; b.textContent = `不是 ${name}`; }
+        };
       });
   }
 
@@ -900,6 +952,7 @@
   const currentProfile = () => (state.status && state.status.profile && state.status.profile.name) || "";
   const voiceDrafts = {};                  // what the user typed into a voice card, kept across a re-render (keyed by group key)
   const voiceMismatch = {};                // group key -> the 400 mismatch payload whose 「仍然加入」 note is showing on that card
+  const voiceNotHint = {};                 // "groupKey|speakerId" -> true: the user said 「不是 X」 on that card; hide the 「可能是 X」 hint
   const voiceLetter = (i) => (i < 26 ? String.fromCharCode(65 + i) : String(i + 1));
   function stashVoiceDrafts() {
     for (const c of $$(".voice-card")) {
@@ -924,20 +977,43 @@
       const auto = s.relation_source === "auto";
       return `<button class="relation-chip ${auto ? "auto" : ""}" data-act="relation" title="${esc(s.relation_note || (auto ? "模型从记录里推断的，点击修改" : "点击修改"))}">${esc(s.relation)}${auto ? `<small>自动</small>` : ""}</button>`;
     };
+    // v4 fields (negatives / rejections / risky_samples) are absent on an older server: treat them as 0
+    const cnt = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+    const statLine = (s) => {
+      const neg = cnt(s.negatives), rej = cnt(s.rejections);
+      const negTxt = neg ? ` · <span title="标为「不是 TA」的声音；像它们的声音不容易再被认成 ${esc(s.name)}${rej ? `（共 ${rej} 句标为不是 TA）` : ""}">${neg} 个负样本</span>`
+        : rej ? ` · <span title="这些句子不会再被认成 ${esc(s.name)}">${rej} 句标为不是 TA</span>` : "";
+      return `${s.samples} 个声纹样本${negTxt} · ${s.duration_s.toFixed(0)} 秒语音 · ${s.utterances} 条语句${s.notes ? ` · ${esc(s.notes)}` : ""}`;
+    };
+    // 负样本 group of the samples list: GET /api/speakers/{sid}/negatives → [{id, duration_s, source_path, file, audio, utterance_id, created_at, text?}]
+    const negativesHtml = (negs) => {
+      const list = Array.isArray(negs) ? negs : [];
+      const head = `<div class="neg-head"><h3>负样本</h3><span class="small muted">标为「不是 TA」的声音：和它们更像的声音不会被认成这个人</span></div>`;
+      if (!list.length) return `${head}<div class="small faint">还没有负样本：在「核对」或「记录」页把认错的句子标为「不是 TA」就会加入。</div>`;
+      return `${head}<table class="tbl small neg-tbl"><tr><th></th><th>来自</th><th class="num">时长</th><th>加入时间</th><th></th></tr>${list.map((n) => `<tr><td>#${Number(n.id)}</td><td class="neg-src">${n.text ? `<span title="${esc(n.text)}">${esc(n.text)}</span>` : esc(n.file || "")}</td><td class="num">${Number(n.duration_s || 0).toFixed(1)}s</td><td>${fmtDT(n.created_at)}</td><td class="nowrap">${n.audio ? `<button class="icon-btn" data-negplay="${Number(n.id)}" title="试听">▶</button>` : `<span class="icon-btn faint" title="音频已删除，无法试听">▶</span>`}<button class="icon-btn" data-delneg="${Number(n.id)}" title="删除负样本">✕</button></td></tr>`).join("")}</table>`;
+    };
+    const sampleAlerts = (s) => {
+      const risky = cnt(s.risky_samples), out = cnt(s.outlier_samples);
+      const removeBtn = `<button class="btn sm" data-act="outliers" title="删掉${out > risky ? ` ${out} 个` : "这些"}和其他样本不像的样本；在「样本列表」里可以先看每个样本的一致性和单独认出的句数">移除不像的样本</button>`;
+      if (risky) return `<div class="alert danger sm risky-note"><span>有 ${risky} 个样本和其他样本不像，却单独认出了很多句——可能混进了别人的声音</span><span class="right"><button class="btn sm primary" data-act="samples" data-open="1">打开样本列表</button>${out ? removeBtn : ""}</span></div>`;
+      if (out) return `<div class="alert warn sm"><span>有 ${out} 个样本和其他样本不像（可能混了别人）</span><span class="right">${removeBtn}</span></div>`;
+      return "";
+    };
     const cards = people.map((s) => `<div class="card spk-card ${s.is_self ? "me" : ""}" data-sid="${s.id}">
-        <div class="row"><span class="avatar bg-c${spkColor(s.name)}">${esc(s.name.slice(0, 1))}</span><div class="grow"><div class="name">${esc(s.name)}${s.is_self ? `<span class="badge me">我</span>` : ""}${relationChip(s)}</div><div class="small muted">${s.samples} 个声纹样本 · ${s.duration_s.toFixed(0)} 秒语音 · ${s.utterances} 条语句${s.notes ? ` · ${esc(s.notes)}` : ""}</div></div></div>
-        ${s.outlier_samples ? `<div class="alert warn sm"><span>有 ${s.outlier_samples} 个样本和其他样本不像（可能混了别人）</span><span class="right"><button class="btn sm" data-act="outliers" title="删掉这些样本；在「样本列表」里可以先看每个样本的一致性">移除不像的样本</button></span></div>` : ""}
-        ${s.ambiguous_samples ? `<div class="alert warn sm"><span>这个人的样本分成两组互不相像（${s.ambiguous_samples} 个有歧义），请打开样本列表自己判断（试听后删掉不是 TA 的）</span><span class="right"><button class="btn sm" data-act="samples">样本列表</button></span></div>` : ""}
-        <div class="row">${s.is_self ? `<button class="btn sm ghost" data-act="unself" title="不再把 TA 当作本人">取消本人</button>` : `<button class="btn sm" data-act="self" title="日报、推送和问答都站在本人的视角；记录里本人的话就是“我”说的">${me ? "改为本人" : "设为本人"}</button>`}<button class="btn sm" data-act="add" data-name="${esc(s.name)}">补充样本</button><button class="btn sm" data-act="samples">样本列表</button><button class="btn sm" data-act="rename">重命名</button><button class="btn sm ghost" data-act="notes">备注</button><button class="btn sm danger right" data-act="delete">删除</button></div>
+        <div class="row"><span class="avatar bg-c${spkColor(s.name)}">${esc(s.name.slice(0, 1))}</span><div class="grow"><div class="name">${esc(s.name)}${s.is_self ? `<span class="badge me">我</span>` : ""}${relationChip(s)}</div><div class="small muted">${statLine(s)}</div></div></div>
+        ${sampleAlerts(s)}
+        ${s.ambiguous_samples ? `<div class="alert warn sm"><span>这个人的样本分成两组互不相像（${s.ambiguous_samples} 个有歧义），请打开样本列表自己判断（试听后删掉不是 TA 的）</span><span class="right"><button class="btn sm" data-act="samples" data-open="1">样本列表</button></span></div>` : ""}
+        <div class="row">${s.is_self ? `<button class="btn sm ghost" data-act="unself" title="不再把 TA 当作本人">取消本人</button>` : `<button class="btn sm" data-act="self" title="日报、推送和问答都站在本人的视角；记录里本人的话就是“我”说的">${me ? "改为本人" : "设为本人"}</button>`}${s.utterances ? `<button class="btn sm" data-act="review" title="逐句确认自动认成 ${esc(s.name)} 的句子（最没把握的在前）：认错的点「不是 TA」会成为负样本，识别马上就用上">核对</button>` : ""}<button class="btn sm" data-act="add" data-name="${esc(s.name)}">补充样本</button><button class="btn sm" data-act="samples">样本列表</button><button class="btn sm" data-act="rename">重命名</button><button class="btn sm ghost" data-act="notes">备注</button><button class="btn sm danger right" data-act="delete">删除</button></div>
         <div class="samples hidden"></div></div>`).join("");
+    // order (spec v4 E.1): registered people first (right under the header buttons), then the unidentified voices, hints last
     main.innerHTML = `
-      <div class="page-head"><div><h1>说话人</h1><div class="sub">不用单独录样本：下面列出记录里还没认出来的声音，听一下是谁、填上名字就行；登记过的人会自动识别。</div></div>
+      <div class="page-head"><div><h1>说话人</h1><div class="sub">不用单独录样本：「未识别的声音」里列出记录里还没认出来的声音，听一下是谁、填上名字就行；登记过的人会自动识别，认错的可以「核对」或标为「不是 TA」。</div></div>
         <div class="row"><button class="btn" id="infer-rel" title="让模型从记录里的对话推断每个人和你的关系（手动标过的不会改）">自动推断关系</button><button class="btn" id="relabel-all" title="用当前声纹库重新识别所有已转写的记录（不重新转写）">重新识别全部记录</button><button class="btn" id="calib">校准阈值</button><button class="btn ghost" id="add-new">用麦克风 / 文件补充样本</button></div></div>
       <datalist id="spk-names">${names.map((n) => `<option value="${esc(n)}">`).join("")}</datalist>
       <div id="enroll-panel" class="card hidden"></div>
-      <div id="voices-box"><div class="card"><div class="thinking"><span class="spin"></span>正在整理未识别的声音…</div></div></div>
-      ${people.length ? `<div class="sec-head mt"><h2>已登记的人</h2><span class="small muted">${me ? `本人：${esc(me.name)}` : "还没有标出哪位是本人（卡片上点「设为本人」）"}</span></div><div class="grid grid-2">${cards}</div>` : ""}
-      <div class="card mt"><div class="card-head"><h2>提示</h2></div><ul class="muted small" style="margin:0;padding-left:18px"><li>给一组声音起名后，会从这些录音里自动提取声纹样本，之后这个人在新录音里会被自动识别；认错的句子在「记录」页悬停 → 👤 标记即可。</li><li>把自己标为「本人」后，日报和问答会站在你的视角；关系可以手动标，也可以点「自动推断关系」让模型从对话里推断。</li><li>当前识别阈值 ${data.identify_threshold}；样本多了之后「校准阈值」会给出建议值。</li></ul></div>`;
+      ${people.length ? `<section class="spk-section" id="people-box"><div class="sec-head"><h2>已登记的人</h2><span class="small muted">${me ? `本人：${esc(me.name)}` : "还没有标出哪位是本人（卡片上点「设为本人」）"}</span></div><div class="grid grid-2">${cards}</div></section>` : ""}
+      <section class="spk-section" id="voices-box"><div class="card"><div class="thinking"><span class="spin"></span>正在整理未识别的声音…</div></div></section>
+      <div class="card mt"><div class="card-head"><h2>提示</h2></div><ul class="muted small" style="margin:0;padding-left:18px"><li>给一组声音起名后，会从这些录音里自动提取声纹样本，之后这个人在新录音里会被自动识别；认错的句子在「记录」页悬停 → 👤 标记即可。</li><li>认错了人：在「记录」页点 ✗「不是 TA」，或在卡片上点「核对」逐句确认；标为不是 TA 的声音会成为负样本，以后像它的声音不容易再被认成这个人。</li><li>样本列表里「单独认出 N 句」是只靠这一个样本才认出的句数：一个和其他样本不像的样本却单独认出很多句，多半混进了别人的声音，试听后删掉。</li><li>开会 / 通话时系统声音里的对方（🔊）不会被认成本人。</li><li>把自己标为「本人」后，日报和问答会站在你的视角；关系可以手动标，也可以点「自动推断关系」让模型从对话里推断。</li><li>当前识别阈值 ${data.identify_threshold}；样本多了之后「校准阈值」会给出建议值。</li></ul></div>`;
 
     // ---- unidentified voices
     const voicesBox = $("#voices-box");
@@ -945,13 +1021,13 @@
     const voiceCard = (g, i) => {
       const days = g.days || [];
       const range = days.length > 1 ? `${days[0].slice(5)} ~ ${days[days.length - 1].slice(5)}` : (days[0] || "").slice(5);
-      const close = g.closest && g.closest.score >= 0.3 ? g.closest : null;
+      const close = g.closest && g.closest.score >= 0.3 && !voiceNotHint[`${g.key}|${g.closest.id}`] ? g.closest : null;
       const samples = (g.samples || []).map((s) => `<div class="voice-sample ${s.audio ? "" : "noaudio"}" data-uid="${s.utterance_id}">
           <span class="time">${esc(String(s.day || "").slice(5))} ${esc(s.time || "")}</span><span class="text" title="${esc(s.text)}">${esc(s.text) || "<i>（没有文字）</i>"}</span><span class="dur">${Number(s.seconds || 0).toFixed(1)}s</span>
           ${s.audio ? `<button class="icon-btn" data-vplay="${s.utterance_id}" title="播放这句">▶</button>` : `<span class="icon-btn faint" title="音频已删除，无法播放">▶</span>`}</div>`).join("");
       return `<div class="card voice-card" data-key="${esc(g.key)}">
         <div class="card-head"><div><h2>声音 ${voiceLetter(i)}</h2><div class="small muted">${g.utterances} 句 · ${Math.round(g.speech_s)} 秒 · ${g.n_days} 天${range ? `（${esc(range)}）` : ""}${g.segments > 1 ? ` · ${g.segments} 段录音` : ""}</div></div>
-          ${close ? `<button class="chip" data-vfill="${esc(close.name)}" title="与已登记声纹的相似度 ${Number(close.score).toFixed(2)}，点一下填入名字（不一定对，先听一听）">可能是 ${esc(close.name)}（${Number(close.score).toFixed(2)}）</button>` : ""}</div>
+          ${close ? `<span class="voice-hint"><button class="chip" data-vfill="${esc(close.name)}" title="与已登记声纹的相似度 ${Number(close.score).toFixed(2)}，点一下填入名字（不一定对，先听一听）">可能是 ${esc(close.name)}（${Number(close.score).toFixed(2)}）</button>${close.id != null ? `<button class="chip not" data-vnot="${esc(String(close.id))}" data-vnotname="${esc(close.name)}" title="听过了，不是 ${esc(close.name)}：这组句子以后不会被认成 TA，并用它们的声音给 ${esc(close.name)} 加负样本">不是 ${esc(close.name)}</button>` : ""}</span>` : ""}</div>
         <div class="voice-samples">${samples || `<div class="muted small">（没有示例句）</div>`}</div>
         <div class="voice-player"></div>
         <div class="row voice-form"><input class="input" data-vname list="spk-names" placeholder="这是谁？">${relationSelect(choices)}<label class="check small"><input type="checkbox" data-vself> ${me ? "这其实是我" : "这是我自己"}</label><button class="btn primary" data-vok>就是 TA</button></div></div>`;
@@ -1037,6 +1113,131 @@
       }
     };
 
+    // 「不是 X」 next to the 「可能是 X」 hint: POST /api/voices/reject {members, speaker_id} → rejections + negative samples
+    const rejectVoice = async (card, btn) => {
+      const g = voices && (voices.groups || []).find((x) => x.key === card.dataset.key); if (!g) return;
+      const sid = Number(btn.dataset.vnot); const name = btn.dataset.vnotname || "TA";
+      const letter = card.querySelector(".card-head h2") ? card.querySelector(".card-head h2").textContent : "这组声音";
+      if (!(await confirmModal(`${letter} 不是 ${name}`, `这组 ${g.utterances} 句以后不会被认成 ${name}，并用它们的声音给 ${name} 加负样本（之后像这样的声音不容易再被认成 ${name}）。负样本可以在 ${name} 的样本列表里删掉。`, `不是 ${name}`, true))) return;
+      btn.disabled = true;
+      try {
+        const r = await api("/api/voices/reject", { method: "POST", json: { members: g.members, speaker_id: sid } });
+        toastReject(r, name);
+        voiceNotHint[`${g.key}|${sid}`] = true;
+        stashVoiceDrafts();                                  // keep what was typed into the voice cards across the re-render
+        await pageSpeakers(arg, my);
+      } catch (err) { btn.disabled = false; toastErr(err); }
+    };
+
+    // 核对: the speaker's automatically recognised utterances, least certain first (GET /api/speakers/{sid}/review),
+    // each answered with ✓ 是 TA (POST /api/utterances/{id}/confirm) or ✗ 不是 TA (POST /api/utterances/{id}/reject).
+    // Answered rows fade out (a ✗ also marks every other row on the page that the veto took out of the queue);
+    // 「再来 20 句」 re-reads the queue from the top and skips what this dialog already showed, so sentences that left the
+    // queue meanwhile cannot shift the window; closing the dialog re-renders the page when anything changed.
+    const REVIEW_PAGE = 20, REVIEW_MAX = 200;              // the server caps limit at 200
+    const reviewModal = (spk) => {
+      let total = 0, items = [], answered = 0, changed = false, loading = false, hasMore = false;
+      const shown = new Set();                             // utterance ids already shown in this dialog session
+      const name = spk.name;
+      modal(`<h2>核对 ${esc(name)}</h2>
+        <div class="muted small mb">自动认成 ${esc(name)} 的句子，最没把握的在前。听一下：是 TA 就点 ✓（以后不会再被自动改掉，够长、够清楚的句子还会补充声纹样本），不是就点 ✗（会成为 ${esc(name)} 的负样本，识别马上用上）。不确定的可以跳过。</div>
+        <label class="check small mb"><input type="checkbox" id="rv-whole"> 点 ✗ 时，这段录音里同一个声音的其他句子也一起</label>
+        <div id="rv-list" class="review-list"><div class="thinking"><span class="spin"></span>加载中…</div></div>
+        <div class="actions"><span class="small muted" id="rv-count" style="margin-right:auto"></span><button class="btn" data-x="more" disabled>再来 ${REVIEW_PAGE} 句</button><button class="btn primary" data-x="close">完成</button></div>`,
+      (el, close) => {
+        el.classList.add("wide");
+        const list = el.querySelector("#rv-list"); const more = el.querySelector('[data-x="more"]'); const count = el.querySelector("#rv-count");
+        el.querySelector('[data-x="close"]').onclick = close;
+        const thr = () => (state.minDbfs != null && Number.isFinite(Number(state.minDbfs)) ? Number(state.minDbfs) : null);
+        const row = (it) => {
+          const db = it.loudness_db != null && Number.isFinite(Number(it.loudness_db)) ? Number(it.loudness_db) : null;
+          const far = db != null && thr() != null && db < thr();
+          const score = it.score != null && Number.isFinite(Number(it.score)) ? Number(it.score).toFixed(2) : "–";
+          return `<div class="review-row ${far ? "far" : ""}" data-rid="${Number(it.utterance_id)}">
+            <span class="time">${esc(String(it.day || "").slice(5))} ${esc(String(it.time || "").slice(0, 5))}</span>
+            <span class="text" title="${esc(it.text)}">${esc(it.text) || "<i>（没有文字）</i>"}</span>
+            <span class="meta"><span class="sc" title="和 ${esc(name)} 的样本的相似度">${score}</span>${db != null ? `<span class="db" title="音量">${fmtDb(db)}</span>` : ""}${sysBadge(it.system_share)}<span class="dur">${Number(it.seconds || 0).toFixed(1)}s</span></span>
+            <span class="btns">${it.audio ? `<button class="icon-btn" data-rplay title="试听">▶</button>` : `<span class="icon-btn faint" title="音频已删除，无法播放">▶</span>`}<button class="icon-btn ok" data-ryes title="是 TA">✓</button><button class="icon-btn no" data-rno title="不是 TA（标为负样本）">✗</button></span>
+            <div class="rv-player"></div></div>`;
+        };
+        const updateCount = () => {
+          const left = Math.max(0, total - answered);
+          count.textContent = total ? `还有约 ${left} 句待核对` : "";
+          more.disabled = loading || !hasMore;
+        };
+        const load = async () => {
+          loading = true; updateCount();
+          const before = shown.size;
+          list.innerHTML = `<div class="thinking"><span class="spin"></span>加载中…</div>`;
+          try {
+            // always from offset 0: ask for enough rows to get past the ones already shown, then drop those here
+            const limit = Math.min(REVIEW_MAX, REVIEW_PAGE + shown.size);
+            const r = await api(`/api/speakers/${spk.id}/review?limit=${limit}&offset=0`);
+            const got = Array.isArray(r && r.items) ? r.items : [];
+            const fresh = got.filter((it) => !shown.has(Number(it.utterance_id)));
+            items = fresh.slice(0, REVIEW_PAGE);
+            items.forEach((it) => shown.add(Number(it.utterance_id)));
+            total = Number(r && r.total) || 0; answered = 0;
+            // more unseen rows: some were left over in this answer, or the answer was full and the queue is longer
+            hasMore = fresh.length > items.length || (got.length >= limit && total > got.length);
+            list.innerHTML = items.length ? items.map(row).join("")
+              : `<div class="empty-state"><div class="big">没有需要核对的句子</div>${before ? "已经看完了" : `自动认成 ${esc(name)} 的句子都核对过了（或太短 / 音频已删除）`}</div>`;
+          } catch (e) { items = []; hasMore = false; list.innerHTML = `<div class="alert danger" style="margin:0">${esc(e.message || e)}</div>`; }
+          loading = false; updateCount();
+        };
+        const stopPlayers = () => { $$(".rv-player", list).forEach((p) => { p.innerHTML = ""; }); $$(".review-row.playing", list).forEach((x) => x.classList.remove("playing")); };
+        // n = how many sentences this answer took out of the queue (for the 「还有约 N 句」 count)
+        const finish = (rowEl, cls, html, n = 1) => {
+          if (rowEl.classList.contains("done")) return;    // already taken out by another ✗ (whole cluster)
+          rowEl.classList.add("done", cls);
+          const btns = rowEl.querySelector(".btns"); if (btns) btns.innerHTML = html;
+          const p = rowEl.querySelector(".rv-player"); if (p) p.innerHTML = "";
+          rowEl.classList.remove("playing");
+          answered += n; changed = true; updateCount();
+        };
+        list.onclick = async (ev) => {
+          const rowEl = ev.target.closest(".review-row"); if (!rowEl || rowEl.classList.contains("done")) return;
+          const uid = Number(rowEl.dataset.rid);
+          if (ev.target.closest("[data-rplay]")) {
+            const wasPlaying = rowEl.classList.contains("playing");
+            stopPlayers(); if (wasPlaying) return;
+            rowEl.classList.add("playing");
+            const p = rowEl.querySelector(".rv-player");
+            p.innerHTML = `<audio controls autoplay src="/api/audio/utterance/${uid}?pad=0.3"></audio>`;
+            p.querySelector("audio").onerror = () => toast("音频无法播放（文件可能已删除）", "err");
+            return;
+          }
+          const yes = ev.target.closest("[data-ryes]"), no = ev.target.closest("[data-rno]");
+          if (!yes && !no) return;
+          const btns = $$("button", rowEl); btns.forEach((b) => { b.disabled = true; });
+          changed = true;                                // even if the dialog is closed before the answer arrives: re-render then
+          try {
+            if (yes) {
+              const r = await api(`/api/utterances/${uid}/confirm`, { method: "POST", json: { speaker_id: spk.id } });
+              finish(rowEl, "yes", `<span class="small rv-res ok">✓ 是 ${esc(name)}${r && r.sample_added ? "，已加入声纹样本" : ""}</span>`);
+            } else {
+              const whole = el.querySelector("#rv-whole").checked;
+              const r = await api(`/api/utterances/${uid}/reject`, { method: "POST", json: { speaker_id: spk.id, whole_cluster: whole } });
+              const k = Number(r && r.negatives_added) || 0, n = Number(r && r.rejected) || 0;
+              // every sentence the veto vetoed or released (older servers do not send the list: just the clicked one)
+              const ids = new Set(Array.isArray(r && r.utterance_ids) ? r.utterance_ids.map(Number).filter(Number.isFinite) : []);
+              ids.add(uid);
+              finish(rowEl, "no", `<span class="small rv-res no">✗ 不是 ${esc(name)}${n > 1 ? `（连同 ${n - 1} 句）` : ""}${k ? `，${k} 个负样本` : ""}</span>`, ids.size);
+              $$(".review-row", list).forEach((x) => {
+                if (x !== rowEl && ids.has(Number(x.dataset.rid)))
+                  finish(x, "no", `<span class="small rv-res no">✗ 不是 ${esc(name)}（同一段里的这个声音一起标了）</span>`, 0);
+              });
+              if (r && r.warning) { rowEl.insertAdjacentHTML("beforeend", `<div class="alert warn sm rv-warn">${esc(r.warning)}</div>`); toast(r.warning, "warn", 9000); }
+              updateCount();
+            }
+          } catch (e) { btns.forEach((b) => { b.disabled = false; }); toastErr(e); }
+        };
+        more.onclick = () => { load(); };              // load() skips the ids already shown
+        load();
+      },
+      () => { if (changed && !stale(my)) { stashVoiceDrafts(); pageSpeakers(arg, my).catch(toastErr); } });
+    };
+
     // a finished job re-renders the page, but only for jobs that change what this page shows, and never while the user is
     // typing into a voice card / relation form (a re-render would replace the input under the cursor); a skipped refresh runs
     // once focus leaves the form.
@@ -1093,11 +1294,14 @@
       if (vforce) { await nameVoice(vforce.closest(".voice-card"), true); return; }
       const vf = e.target.closest("[data-vfill]");
       if (vf) { const inp = vf.closest(".voice-card").querySelector("[data-vname]"); inp.value = vf.dataset.vfill; inp.dispatchEvent(new Event("input")); inp.focus(); return; }
+      const vnot = e.target.closest("[data-vnot]");
+      if (vnot) { if (!vnot.disabled) await rejectVoice(vnot.closest(".voice-card"), vnot); return; }
       const b = e.target.closest("[data-act]"); if (!b) return;
       const card = b.closest("[data-sid]"); if (!card) return;
       const sid = Number(card.dataset.sid); const spk = data.speakers.find((s) => s.id === sid);
       const a = b.dataset.act;
       if (a === "add") enrollPanel(spk.name);
+      else if (a === "review") reviewModal(spk);
       else if (a === "self") {
         const text = me ? `把本人从「${me.name}」改为「${spk.name}」？日报、推送和问答都会站在本人的视角，记录里本人的话就是“我”说的。` : `把「${spk.name}」设为本人（你自己）？日报、推送和问答都会站在本人的视角，记录里本人的话就是“我”说的。`;
         if (await confirmModal(me ? "改为本人" : "设为本人", text, me ? "改为本人" : "设为本人")) { try { await api(`/api/speakers/${sid}`, { method: "PATCH", json: { is_self: true } }); toast(`本人：${spk.name}`, "ok"); await refreshStatus(); route(); } catch (err) { toastErr(err); } }
@@ -1114,18 +1318,36 @@
       }
       else if (a === "samples") {
         const box = card.querySelector(".samples");
-        if (!box.classList.contains("hidden")) { box.classList.add("hidden"); return; }
-        let rows;
-        try { rows = await api(`/api/speakers/${sid}/samples`); } catch (err) { toastErr(err); return; }
+        // 「样本列表」 toggles; the alert buttons (data-open) always (re)open the list and bring it into view
+        if (!box.classList.contains("hidden") && !b.dataset.open) { box.classList.add("hidden"); return; }
+        let rows, negs;
+        try {
+          // negatives: an older server has no such endpoint → null = leave the 负样本 group out
+          [rows, negs] = await Promise.all([api(`/api/speakers/${sid}/samples`), api(`/api/speakers/${sid}/negatives`).catch(() => null)]);
+        } catch (err) { toastErr(err); return; }
         box.classList.remove("hidden");
+        // influence (spec v4 C): utterances recognised as this speaker only thanks to this one sample; absent on an older server
+        const hasInf = rows.some((r) => r.influence != null);
+        const inf = (r) => (Number.isFinite(Number(r.influence)) ? Number(r.influence) : 0);
+        if (hasInf) rows = [...rows].sort((x, y) => inf(y) - inf(x) || x.id - y.id);
+        const RISKY_INFLUENCE = 20;                      // same cut as the backend's risky_samples (outlier and influence >= 20)
+        const rowCls = (r) => (r.outlier && inf(r) >= RISKY_INFLUENCE ? "risky" : r.outlier ? "outlier" : "");
+        const infCell = (r) => (hasInf ? `<td class="num influence ${r.outlier && inf(r) >= RISKY_INFLUENCE ? "bad" : ""}" title="${inf(r) ? `只靠这个样本才认出的 ${inf(r)} 句（去掉它这些句子就认不出了）` : "去掉这个样本也不影响识别"}">${inf(r) ? `单独认出 ${inf(r)} 句` : `<span class="faint">0</span>`}</td>` : "");
         const cons = (r) => r.consistency == null ? `<span class="faint" title="只有这一个样本，没法比">-</span>` : `${Number(r.consistency).toFixed(2)}${r.outlier ? " ⚠" : r.ambiguous ? " ?" : ""}`;
         const consCls = (r) => (r.outlier ? "bad" : r.ambiguous ? "amb" : "");
         const consTitle = (r) => (r.outlier ? "和其他样本不像，可能混了别人" : r.ambiguous ? "歧义：样本分成两组互不相像，这个属于其中一组；试听后删掉不是 TA 的" : "");
         const origin = (r) => (r.origin && ORIGIN_LABEL[r.origin] ? `<span class="badge plain" title="${esc(r.origin)}">${ORIGIN_LABEL[r.origin]}</span>` : `<span class="faint" title="老样本，没有记录来源">-</span>`);
-        box.innerHTML = `<table class="tbl small"><tr><th></th><th>文件</th><th title="样本是怎么来的：麦克风 = 说话人页录的；文件 = 上传的；标记 = 记录页标记的句子；声音组 = 给未识别的声音起名；簇 = 音频过期后留下的簇声纹。麦克风 / 文件的样本不可能混进别人，判一致性时以它们为准">来源</th><th class="num">时长</th><th class="num" title="和这个人其他样本的最高相似度；低于设置里的 sample_consistency_min 时标红（可能混了别人）；标 ? 的是歧义样本（分成两组互不相像，程序没法判断哪组是 TA）">一致性</th><th>加入时间</th><th></th></tr>${rows.map((r) => `<tr><td>#${r.id}</td><td>${esc(r.file)}</td><td>${origin(r)}</td><td class="num">${(r.duration_s || 0).toFixed(1)}s</td><td class="num consistency ${consCls(r)}" title="${esc(consTitle(r))}">${cons(r)}</td><td>${fmtDT(r.created_at)}</td><td class="nowrap">${r.audio ? `<button class="icon-btn" data-play="${r.id}" title="试听">▶</button>` : ""}<button class="icon-btn" data-delsample="${r.id}" title="删除样本">✕</button></td></tr>`).join("")}</table><div class="sample-player"></div>`;
+        box.innerHTML = `<table class="tbl small"><tr><th></th><th>文件</th><th title="样本是怎么来的：麦克风 = 说话人页录的；文件 = 上传的；标记 = 记录页标记的句子；声音组 = 给未识别的声音起名；簇 = 音频过期后留下的簇声纹。麦克风 / 文件的样本不可能混进别人，判一致性时以它们为准">来源</th><th class="num">时长</th><th class="num" title="和这个人其他样本的最高相似度；低于设置里的 sample_consistency_min 时标红（可能混了别人）；标 ? 的是歧义样本（分成两组互不相像，程序没法判断哪组是 TA）">一致性</th>${hasInf ? `<th class="num" title="只靠这一个样本才被认成 TA 的自动识别句数（按录音里的声音簇估算）。和其他样本不像、却单独认出很多句的样本（标红的行）多半混进了别人的声音：试听后删掉">单独认出</th>` : ""}<th>加入时间</th><th></th></tr>${rows.map((r) => `<tr class="${rowCls(r)}"><td>#${r.id}</td><td>${esc(r.file)}</td><td>${origin(r)}</td><td class="num">${(r.duration_s || 0).toFixed(1)}s</td><td class="num consistency ${consCls(r)}" title="${esc(consTitle(r))}">${cons(r)}</td>${infCell(r)}<td>${fmtDT(r.created_at)}</td><td class="nowrap">${r.audio ? `<button class="icon-btn" data-play="${r.id}" title="试听">▶</button>` : ""}<button class="icon-btn" data-delsample="${r.id}" title="删除样本">✕</button></td></tr>`).join("")}</table>
+          ${negs ? negativesHtml(negs) : ""}<div class="sample-player"></div>`;
+        if (b.dataset.open) box.scrollIntoView({ block: "nearest", behavior: "smooth" });
         box.onclick = async (ev) => {
           const p = ev.target.closest("[data-play]"); if (p) { box.querySelector(".sample-player").innerHTML = `<audio controls autoplay src="/api/speakers/samples/${p.dataset.play}/audio"></audio>`; return; }
-          const d = ev.target.closest("[data-delsample]"); if (d && await confirmModal("删除样本", "删除这个声纹样本。", "删除", true)) { try { await api(`/api/speakers/samples/${d.dataset.delsample}`, { method: "DELETE" }); route(); } catch (err) { toastErr(err); } }
+          const np = ev.target.closest("[data-negplay]"); if (np) { box.querySelector(".sample-player").innerHTML = `<audio controls autoplay src="/api/speakers/negatives/${np.dataset.negplay}/audio"></audio>`; const au = box.querySelector(".sample-player audio"); if (au) au.onerror = () => toast("音频无法播放（文件可能已删除）", "err"); return; }
+          const d = ev.target.closest("[data-delsample]"); if (d && await confirmModal("删除样本", "删除这个声纹样本。", "删除", true)) { try { await api(`/api/speakers/samples/${d.dataset.delsample}`, { method: "DELETE" }); route(); } catch (err) { toastErr(err); } return; }
+          const dn = ev.target.closest("[data-delneg]");
+          if (dn && await confirmModal("删除负样本", `删除这个负样本：像它的声音又可以被认成 ${spk.name}（已经标为「不是 TA」的句子不受影响）。`, "删除", true)) {
+            try { await api(`/api/speakers/negatives/${dn.dataset.delneg}`, { method: "DELETE" }); toast("已删除负样本", "ok"); route(); } catch (err) { toastErr(err); }
+          }
         };
       }
     };
@@ -1136,7 +1358,7 @@
     const panel = $("#enroll-panel");
     panel.classList.remove("hidden");
     const names = state.speakers.map((s) => s.name);
-    panel.innerHTML = `<div class="card-head"><div><h2>${name ? `为 ${esc(name)} 补充样本` : "用麦克风 / 文件补充样本"}</h2><div class="small muted">通常不需要：给上面的「未识别的声音」起名就会自动取样本；这里是识别不准时的补充手段。</div></div><button class="btn sm ghost" id="enroll-close">关闭</button></div>
+    panel.innerHTML = `<div class="card-head"><div><h2>${name ? `为 ${esc(name)} 补充样本` : "用麦克风 / 文件补充样本"}</h2><div class="small muted">通常不需要：给下方「未识别的声音」起名就会自动取样本；这里是识别不准时的补充手段。</div></div><button class="btn sm ghost" id="enroll-close">关闭</button></div>
       <div class="row mb"><div class="field" style="width:220px"><label>姓名</label><input class="input" id="en-name" list="en-list" value="${esc(name)}" placeholder="例如：我 / 张三"><datalist id="en-list">${names.map((n) => `<option value="${esc(n)}">`).join("")}</datalist></div></div>
       <div class="grid grid-2">
         <div><h3 class="mb">用麦克风录一段</h3><div class="row"><button class="btn rec" id="rec-btn">● 开始录音</button><span class="rec-timer" id="rec-timer">0:00</span><div class="level"><i id="rec-level"></i></div></div>

@@ -563,3 +563,25 @@ def test_process_segment_drops_faint_turn_and_stores_loudness(cfg, db):
     cfg["audio"]["min_speech_dbfs"] = None
     assert p.process_segment(seg_id) == 2 and db.get_segment(seg_id)["faint_s"] == 0.0
     assert [round(u["loudness_db"]) for u in db.utterances_for_day("2026-10-31")] == [-13, -53]
+
+
+
+def test_process_segment_mic_only_has_no_system_share(cfg, db):
+    seg_id = make_segment(cfg, db, datetime(2026, 10, 31, 10, 0, 0), 3.0)
+    p = Processor(cfg, db, client=object(), engine=FakeEngine([Turn(0.0, 3.0, 0)]), asr=FakeASR("你好世界"), corrector=EchoCorrector())
+    assert p.process_segment(seg_id) == 1
+    assert db.query("SELECT system_share FROM utterances WHERE segment_id=?", (seg_id,))[0]["system_share"] is None
+
+
+def test_process_segment_stores_system_share_from_channel_rms(cfg, db):
+    from audio_note.speech.pipeline import system_share, channel_pairs
+
+    seg_id = make_segment(cfg, db, datetime(2026, 10, 31, 10, 5, 0), 3.0)
+    ch = np.asarray([0.1, 0.0] * 3 + [0.0, 0.1] * 3, dtype=np.float16).tobytes()       # 0-1.5 s mic, 1.5-3 s system
+    db.execute("UPDATE segments SET channel_rms=?, channel_block_s=0.5 WHERE id=?", (ch, seg_id))
+    p = Processor(cfg, db, client=object(), engine=FakeEngine([Turn(0.0, 1.4, 0), Turn(1.6, 3.0, 1)]), asr=FakeASR("你好"),
+                  corrector=EchoCorrector())
+    assert p.process_segment(seg_id) == 2
+    shares = [r["system_share"] for r in db.query("SELECT system_share FROM utterances WHERE segment_id=? ORDER BY start_s", (seg_id,))]
+    assert shares[0] == pytest.approx(0.0) and shares[1] == pytest.approx(1.0)
+    assert system_share(channel_pairs(ch), 0.5, 1.0, 2.0) == pytest.approx(0.5)

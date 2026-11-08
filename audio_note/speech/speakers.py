@@ -16,12 +16,18 @@ speakers.sample_consistency_min, `force=True` overrides) and `audit_samples` fla
 v3b: the reference voice is anchored on samples the user recorded / uploaded themselves (speaker_embeddings.origin
 'mic' / 'file'); without such an anchor two rival factions of samples are reported as `ambiguous` instead of one
 being deleted (see _analyse_samples).
+v4 (negatives): `match` also takes the negative samples ("this voice is NOT X", speaker_negatives) and a set of
+excluded speaker ids: a candidate X wins only when its best positive score p >= threshold and p - (best negative
+of X) >= speakers.negative_margin, otherwise the next candidate (by p) is tried. Turns carry `exclude` (speakers
+vetoed for that sentence, or the self speaker for system-audio turns) which identify_turns / identify_utterances
+honour. audit_samples reports each sample's `influence` (automatic sentences only this sample lets through).
 """
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import sherpa_onnx
@@ -40,6 +46,8 @@ DEFAULT_SAMPLE_CONSISTENCY_MIN = 0.5
 DEFAULT_TURN_CHECK_MIN_S = 1.0
 DEFAULT_TURN_REJECT_MARGIN = 0.15
 DEFAULT_MIN_LABEL_SAMPLE_S = 2.5   # samples cut out of recordings (label / name a voice) need this much speech
+DEFAULT_NEGATIVE_MARGIN = 0.0      # p - n must reach this for a speaker with negative samples
+DEFAULT_IDENTIFY_THRESHOLD = 0.45
 
 
 class SampleMismatch(ValueError):
@@ -84,6 +92,43 @@ def min_label_sample_s(cfg: Config) -> float:
         return float(cfg.speakers.get("min_label_sample_s", DEFAULT_MIN_LABEL_SAMPLE_S))
     except (TypeError, ValueError, AttributeError):
         return DEFAULT_MIN_LABEL_SAMPLE_S
+
+
+def negative_margin(cfg: Config) -> float:
+    """speakers.negative_margin: how much more a voice must resemble X's samples than X's negative samples."""
+    try:
+        return float(cfg.speakers.get("negative_margin", DEFAULT_NEGATIVE_MARGIN))
+    except (TypeError, ValueError, AttributeError):
+        return DEFAULT_NEGATIVE_MARGIN
+
+
+def load_negatives(db: Any) -> list[tuple[int, np.ndarray]]:
+    """db.speaker_negatives(), tolerant of DB stand-ins without the method (older fakes)."""
+    fn = getattr(db, "speaker_negatives", None)
+    if not callable(fn):
+        return []
+    try:
+        return list(fn())
+    except Exception as e:  # noqa: BLE001 - a missing table on a foreign DB must not stop identification
+        log.debug("no negative samples: %s", e)
+        return []
+
+
+def negative_scores(emb: np.ndarray, negatives: list[tuple[int, np.ndarray]] | None) -> dict[int, float]:
+    """{speaker_id: best cosine between `emb` and that speaker's negative samples} (same dimension only)."""
+    out: dict[int, float] = {}
+    if not negatives:
+        return out
+    e = np.asarray(emb, dtype=np.float32).ravel()
+    for sid, n in negatives:
+        n = np.asarray(n, dtype=np.float32).ravel()
+        if n.shape[0] != e.shape[0]:
+            continue
+        nn = float(np.linalg.norm(n)) or 1.0
+        s = float(np.dot(e, n)) / nn
+        if s > out.get(int(sid), -1.0):
+            out[int(sid)] = s
+    return out
 
 
 ANCHOR_DURATION_CAP_S = 10.0   # duration weight cap when no trusted (mic / file) sample can anchor the core
@@ -178,10 +223,40 @@ def check_sample(db: DB, speaker_id: int, emb: np.ndarray, min_consistency: floa
     return s, s >= float(min_consistency)
 
 
-def audit_samples(db: DB, speaker_id: int, min_consistency: float) -> list[dict]:
+def sample_influence(db: DB, speaker_id: int, embs: list[np.ndarray | None], threshold: float) -> list[int]:
+    """Per sample (aligned with `embs`): number of the speaker's automatic sentences (speaker_source IS NULL) that only
+    this sample lets through. Approximated with the stored cluster embeddings: the sentences are grouped by
+    (segment_id, cluster_label); a cluster whose embedding reaches `threshold` against exactly one sample (removing
+    it drops the best score below the threshold) adds its sentence count to that sample. Sentences without a
+    cluster embedding are not counted. Pure numpy."""
+    out = [0] * len(embs)
+    if not embs:
+        return out
+    groups = db.query("SELECT segment_id, cluster_label, COUNT(*) AS n FROM utterances WHERE speaker_id=? AND speaker_source IS NULL"
+                      " AND cluster_label IS NOT NULL GROUP BY segment_id, cluster_label", (int(speaker_id),))
+    if not groups:
+        return out
+    counts = {(int(g["segment_id"]), int(g["cluster_label"])): int(g["n"]) for g in groups}
+    seg_ids = sorted({k[0] for k in counts})
+    thr = float(threshold)
+    for k in range(0, len(seg_ids), 500):
+        for seg, cl, emb, _s in db.cluster_embeddings(seg_ids[k:k + 500]):
+            n = counts.get((seg, cl))
+            if not n or emb.size == 0:
+                continue
+            c = _unit(emb)
+            hits = [i for i, e in enumerate(embs) if e is not None and e.size and e.shape[0] == c.shape[0]
+                    and float(np.dot(c, e)) >= thr]
+            if len(hits) == 1:
+                out[hits[0]] += n
+    return out
+
+
+def audit_samples(db: DB, speaker_id: int, min_consistency: float, identify_threshold: float | None = None) -> list[dict]:
     """Every stored sample of a speaker with its `origin`, its `consistency` (cosine to the core reference; None
-    when it is the only comparable one), `ambiguous` (part of a two-faction stand-off, see _analyse_samples) and
-    `outlier` (consistency < min_consistency and not ambiguous). Pure numpy, no model."""
+    when it is the only comparable one), `ambiguous` (part of a two-faction stand-off, see _analyse_samples),
+    `outlier` (consistency < min_consistency and not ambiguous) and `influence` (automatic sentences only this
+    sample lets through at `identify_threshold`, default 0.45; see sample_influence). Pure numpy, no model."""
     rows = _speaker_sample_rows(db, speaker_id)
     embs = [(_unit(np.frombuffer(r["embedding"], dtype=np.float32)) if r["dim"] else None) for r in rows]
     # the reference is built per embedding dimension (samples of an older model are compared among themselves)
@@ -193,6 +268,12 @@ def audit_samples(db: DB, speaker_id: int, min_consistency: float) -> list[dict]
         a = _analyse_samples([embs[i] for i in idx], [rows[i]["duration_s"] for i in idx], min_consistency,
                              [rows[i]["origin"] for i in idx])
         analyses[dim] = (a, idx)
+    try:
+        influence = sample_influence(db, speaker_id, embs,
+                                     DEFAULT_IDENTIFY_THRESHOLD if identify_threshold is None else float(identify_threshold))
+    except Exception as e:  # noqa: BLE001 - diagnostics only
+        log.debug("sample influence of speaker #%s failed: %s", speaker_id, e)
+        influence = [0] * len(rows)
     out: list[dict] = []
     for i, (r, ei) in enumerate(zip(rows, embs)):
         best: float | None = None
@@ -204,7 +285,8 @@ def audit_samples(db: DB, speaker_id: int, min_consistency: float) -> list[dict]
                 amb = idx.index(i) in a.ambiguous
         out.append({"id": int(r["id"]), "source_path": r["source_path"], "duration_s": r["duration_s"], "origin": r["origin"],
                     "consistency": round(best, 3) if best is not None else None, "ambiguous": amb,
-                    "outlier": best is not None and best < float(min_consistency) and not amb})
+                    "outlier": best is not None and best < float(min_consistency) and not amb,
+                    "influence": int(influence[i])})
     return out
 
 
@@ -221,6 +303,7 @@ class Turn:
     speaker_id: int | None = None
     speaker_name: str | None = None
     score: float | None = None
+    exclude: frozenset[int] = field(default_factory=frozenset)   # speaker ids this turn must never be identified as
 
     @property
     def duration(self) -> float:
@@ -329,15 +412,18 @@ class SpeakerEngine:
         return min_s, margin
 
     def _cluster_decisions(self, audio: np.ndarray, clusters: dict[int, list[Turn]], enrolled: list[tuple[int, str, np.ndarray]],
-                           thr: float) -> dict[int, tuple[int | None, str | None, float | None, np.ndarray | None]]:
-        """Per cluster: (speaker_id, speaker_name, score, embedding) - the decision as before v3."""
+                           thr: float, negatives: list[tuple[int, np.ndarray]] | None = None, margin: float = 0.0
+                           ) -> dict[int, tuple[int | None, str | None, float | None, np.ndarray | None]]:
+        """Per cluster: (speaker_id, speaker_name, score, embedding) - the decision as before v3. A speaker every turn
+        of the cluster excludes (Turn.exclude) is left out of the cluster's candidates."""
         out: dict[int, tuple[int | None, str | None, float | None, np.ndarray | None]] = {}
         for cid, ts in clusters.items():
             emb = self.cluster_embedding(audio, ts)
             if emb is None:
                 out[cid] = (None, None, None, None)
                 continue
-            sid, name, score = self.match(emb, enrolled, thr)
+            common = frozenset.intersection(*[frozenset(getattr(t, "exclude", ()) or ()) for t in ts]) if ts else frozenset()
+            sid, name, score = self.match(emb, enrolled, thr, negatives, margin=margin, exclude=common)
             out[cid] = (sid, name, score, emb)
         return out
 
@@ -345,7 +431,7 @@ class SpeakerEngine:
     def _sim_to_speaker(emb: np.ndarray, enrolled: list[tuple[int, str, np.ndarray]], sid: int) -> float:
         best = -1.0
         for s, _n, e in enrolled:
-            if s == sid:
+            if s == sid and e.shape[0] == emb.shape[0]:
                 best = max(best, float(np.dot(emb, _unit(e))))
         return best
 
@@ -360,16 +446,21 @@ class SpeakerEngine:
 
         Turn-level correction (only with enrolled speakers and speakers.turn_check_min_s > 0): every turn at
         least that long is embedded on its own; a turn that clearly belongs to another enrolled speaker, or
-        does not resemble the cluster's speaker at all, is moved to a new cluster id (one per (original
-        cluster, speaker) so build_chunks still merges neighbours). Shorter turns keep the cluster decision.
+        does not resemble the cluster's speaker at all (or resembles that speaker's negative samples more), is
+        moved to a new cluster id (one per (original cluster, speaker) so build_chunks still merges neighbours).
+        Shorter turns keep the cluster decision - unless it is a speaker the turn excludes (Turn.exclude: a
+        vetoed speaker, or the user themselves for system audio), then the cluster embedding is matched again
+        without that speaker. Negative samples (db.speaker_negatives) apply to every decision (see `match`).
         The list is returned in its original order; cluster ids of moved turns change in place."""
         enrolled = db.speaker_embeddings()
+        negatives = load_negatives(db)
+        nmargin = negative_margin(self.cfg)
         thr = float(self.cfg.speakers.identify_threshold)
         unknown = self.cfg.speakers.unknown_label
         clusters: dict[int, list[Turn]] = {}
         for t in turns:
             clusters.setdefault(t.cluster, []).append(t)
-        decisions = self._cluster_decisions(audio, clusters, enrolled, thr)
+        decisions = self._cluster_decisions(audio, clusters, enrolled, thr, negatives, nmargin)
         for cid, ts in clusters.items():
             sid, name, score, _emb = decisions[cid]
             for t in ts:
@@ -378,28 +469,32 @@ class SpeakerEngine:
         moved = 0
         moved_s = 0.0
         min_s, margin = self._turn_check_params()
-        if enrolled and min_s > 0 and turns:
+        if enrolled and turns:
             next_id = max(clusters) + 1
             new_ids: dict[tuple[int, int | None], int] = {}
             for cid, ts in list(clusters.items()):
-                s_c = decisions[cid][0]
+                s_c, _n_c, _sc_c, emb_c = decisions[cid]
                 for t in ts:
-                    if t.duration < min_s:
-                        continue
-                    seg = self._turn_audio(audio, t)
-                    if seg is None:
-                        continue
-                    e_t = self.embed(seg)
-                    s_t, name_t, score_t = self.match(e_t, enrolled, thr)
+                    excl = frozenset(getattr(t, "exclude", ()) or ())
+                    seg = self._turn_audio(audio, t) if (min_s > 0 and t.duration >= min_s) else None
                     target: tuple[int | None, str | None, float | None] | None = None
-                    if s_c is not None:
-                        sim_c = self._sim_to_speaker(e_t, enrolled, s_c)
-                        if s_t is not None and s_t != s_c and sim_c < thr:
+                    if seg is not None:
+                        e_t = self.embed(seg)
+                        s_t, name_t, score_t = self.match(e_t, enrolled, thr, negatives, margin=nmargin, exclude=excl)
+                        if s_c is not None:
+                            sim_c = self._sim_to_speaker(e_t, enrolled, s_c)
+                            neg_c = negative_scores(e_t, negatives).get(s_c, -1.0)
+                            holds = s_c not in excl and sim_c >= thr and sim_c - neg_c >= nmargin
+                            if s_t is not None and s_t != s_c and not holds:
+                                target = (s_t, name_t, score_t)
+                            elif s_t is None and (s_c in excl or sim_c < thr - margin or sim_c - neg_c < nmargin):
+                                target = (None, None, score_t)
+                        elif s_t is not None:
                             target = (s_t, name_t, score_t)
-                        elif s_t is None and sim_c < thr - margin:
-                            target = (None, None, score_t)
-                    elif s_t is not None:
-                        target = (s_t, name_t, score_t)
+                    elif s_c is not None and s_c in excl:
+                        # too short to check on its own: the cluster's voice, minus the speaker this turn excludes
+                        target = (self.match(emb_c, enrolled, thr, negatives, margin=nmargin, exclude=excl)
+                                  if emb_c is not None else (None, None, None))
                     if target is None:
                         continue
                     key = (cid, target[0])
@@ -428,14 +523,17 @@ class SpeakerEngine:
     def identify_utterances(self, audio: np.ndarray, turns: list[Turn], db: DB, segment_id: int | None = None) -> list[Turn]:
         """Per-utterance identification for relabel: cluster decision as a baseline (cluster embeddings stored
         with `segment_id`), then every turn at least speakers.turn_check_min_s long is matched on its own audio
-        and carries its own score; shorter turns keep the cluster result. Cluster ids never change."""
+        and carries its own score; shorter turns keep the cluster result (matched again without the speakers the
+        turn excludes, when the cluster's speaker is one of them). Negative samples apply. Cluster ids never change."""
         enrolled = db.speaker_embeddings()
+        negatives = load_negatives(db)
+        nmargin = negative_margin(self.cfg)
         thr = float(self.cfg.speakers.identify_threshold)
         unknown = self.cfg.speakers.unknown_label
         clusters: dict[int, list[Turn]] = {}
         for t in turns:
             clusters.setdefault(t.cluster, []).append(t)
-        decisions = self._cluster_decisions(audio, clusters, enrolled, thr)
+        decisions = self._cluster_decisions(audio, clusters, enrolled, thr, negatives, nmargin)
         min_s, _margin = self._turn_check_params()
         own = 0
         for cid, ts in clusters.items():
@@ -443,32 +541,57 @@ class SpeakerEngine:
             if emb is not None and segment_id is not None:
                 db.upsert_cluster_embedding(int(segment_id), int(cid), emb, sum(t.duration for t in ts))
             for t in ts:
+                excl = frozenset(getattr(t, "exclude", ()) or ())
                 t.speaker_id, t.speaker_name, t.score = sid, (name if sid is not None else unknown), score
-                if not enrolled or min_s <= 0 or t.duration < min_s:
-                    continue
-                seg = self._turn_audio(audio, t)
+                seg = None
+                if enrolled and min_s > 0 and t.duration >= min_s:
+                    seg = self._turn_audio(audio, t)
                 if seg is None:
+                    if sid is not None and sid in excl:
+                        s2, n2, sc2 = (self.match(emb, enrolled, thr, negatives, margin=nmargin, exclude=excl)
+                                       if emb is not None else (None, None, None))
+                        t.speaker_id, t.speaker_name, t.score = s2, (n2 if s2 is not None else unknown), sc2
                     continue
-                s_t, name_t, score_t = self.match(self.embed(seg), enrolled, thr)
+                s_t, name_t, score_t = self.match(self.embed(seg), enrolled, thr, negatives, margin=nmargin, exclude=excl)
                 t.speaker_id, t.speaker_name, t.score = s_t, (name_t if s_t is not None else unknown), score_t
                 own += 1
         log.debug("segment #%s: %d/%d utterances identified on their own audio", segment_id, own, len(turns))
         return turns
 
     @staticmethod
-    def match(emb: np.ndarray, enrolled: list[tuple[int, str, np.ndarray]], threshold: float) -> tuple[int | None, str | None, float | None]:
+    def match(emb: np.ndarray, enrolled: list[tuple[int, str, np.ndarray]], threshold: float,
+              negatives: list[tuple[int, np.ndarray]] | None = None, margin: float = 0.0,
+              exclude: Any = None) -> tuple[int | None, str | None, float | None]:
+        """(speaker_id, name, score) of the enrolled speaker `emb` belongs to, or (None, None, best score).
+
+        Candidate p = best cosine to the speaker's samples. Without `negatives` the best candidate wins when
+        p >= threshold (the rule before v4). With negatives (from db.speaker_negatives) a candidate X also needs
+        p - n >= `margin`, n = best cosine to X's negative samples (-1 without any); a candidate that fails is
+        skipped and the next one by p is tried. Speakers in `exclude` are never candidates. The score returned is
+        always p (of the winner, or the best remaining candidate when nobody qualifies); samples of another
+        embedding dimension are ignored."""
         if not enrolled:
             return None, None, None
+        emb = np.asarray(emb, dtype=np.float32).ravel()
+        excl = {int(x) for x in (exclude or ())}
         best: dict[int, tuple[str, float]] = {}
         for sid, name, e in enrolled:
+            if sid in excl or e.shape[0] != emb.shape[0]:
+                continue
             e = e / (np.linalg.norm(e) or 1.0)
             s = float(np.dot(emb, e))
             if sid not in best or s > best[sid][1]:
                 best[sid] = (name, s)
-        sid, (name, score) = max(best.items(), key=lambda kv: kv[1][1])
-        if score >= threshold:
-            return sid, name, score
-        return None, None, score
+        if not best:
+            return None, None, None
+        ranked = sorted(best.items(), key=lambda kv: -kv[1][1])
+        neg = negative_scores(emb, negatives)
+        for sid, (name, score) in ranked:
+            if score < threshold:
+                break
+            if score - neg.get(sid, -1.0) >= float(margin):
+                return sid, name, score
+        return None, None, ranked[0][1][1]
 
     # --- sample consistency ----------------------------------------------------
     def check_sample(self, db: DB, speaker_id: int, emb: np.ndarray) -> tuple[float | None, bool]:
@@ -478,7 +601,11 @@ class SpeakerEngine:
 
     def audit_samples(self, db: DB, speaker_id: int) -> list[dict]:
         """Stored samples with `consistency` / `outlier` (see module-level audit_samples); no model involved."""
-        return audit_samples(db, speaker_id, sample_consistency_min(self.cfg))
+        try:
+            thr: float | None = float(self.cfg.speakers.identify_threshold)
+        except (TypeError, ValueError, AttributeError):
+            thr = None
+        return audit_samples(db, speaker_id, sample_consistency_min(self.cfg), thr)
 
     def _guard_sample(self, db: DB, name: str, emb: np.ndarray, force: bool) -> float | None:
         """Raise SampleMismatch when `emb` does not resemble `name`'s existing samples (unless force).

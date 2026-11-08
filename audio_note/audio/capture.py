@@ -80,6 +80,14 @@ def _resample(x: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
     return np.interp(t_out, t_in, x).astype(np.float32)
 
 
+def _rms(x: np.ndarray, n: int) -> float:
+    """Root mean square of `x` over `n` samples (`n` >= len(x): the missing samples count as zeros)."""
+    if n <= 0 or len(x) == 0:
+        return 0.0
+    x64 = x.astype(np.float64, copy=False)
+    return float(np.sqrt(float(np.dot(x64, x64)) / n))
+
+
 class MicCapture:
     """Context manager; blocks arrive via .queue as float32 mono @16k arrays."""
 
@@ -189,7 +197,13 @@ class MixedCapture:
     `max_lead_s` queued means a hiccup, and the oldest part is dropped.
 
     If the system-audio stream cannot be opened the capture degrades to microphone only and records
-    the reason in `system_error` (the service keeps recording; the UI shows the problem)."""
+    the reason in `system_error` (the service keeps recording; the UI shows the problem).
+
+    After every ``read()`` that returned a block, ``last_channels`` holds that block's
+    ``(mic_rms, system_rms)``: the RMS of each side *before* mixing (system side after
+    ``system_gain``, averaged over the whole block; 0.0 when no loopback audio was mixed in). The
+    recorder stores these per segment so the pipeline can tell the remote side of a meeting from the
+    user. It is None while the loopback is unavailable (the recording is then microphone only)."""
 
     def __init__(self, mic: "MicCapture", system: Any, system_gain: float = 1.0, max_lead_s: float = 2.0):
         self.mic = mic
@@ -200,6 +214,7 @@ class MixedCapture:
         self._buf = np.zeros(0, dtype=np.float32)
         self.system_samples = 0      # loopback samples mixed in so far (diagnostics)
         self.lead_drops = 0
+        self.last_channels: tuple[float, float] | None = None   # (mic_rms, system_rms) of the last block read
 
     # the recorder only looks at these
     @property
@@ -251,7 +266,9 @@ class MixedCapture:
     def read(self, timeout: float = 1.0) -> np.ndarray | None:
         block = self.mic.read(timeout)
         if block is None or self.system is None:
+            self.last_channels = None
             return block
+        mic_rms = _rms(block, len(block))
         fresh = self.system.read_available()
         if len(fresh):
             self._buf = np.concatenate([self._buf, fresh]) if len(self._buf) else fresh
@@ -260,7 +277,8 @@ class MixedCapture:
             self.lead_drops += 1
             self._buf = self._buf[-self.max_lead // 2:]
         n = len(block)
-        if len(self._buf) == 0:
+        if len(self._buf) == 0 or n == 0:
+            self.last_channels = (mic_rms, 0.0)
             return block
         take = min(n, len(self._buf))
         mixed = block.copy()
@@ -268,6 +286,7 @@ class MixedCapture:
         if self.system_gain != 1.0:
             part = part * self.system_gain
         mixed[:take] += part
+        self.last_channels = (mic_rms, _rms(part, n))
         self._buf = self._buf[take:]
         self.system_samples += take
         np.clip(mixed, -1.0, 1.0, out=mixed)

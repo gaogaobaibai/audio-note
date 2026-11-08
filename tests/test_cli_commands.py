@@ -1275,3 +1275,38 @@ def test_speakers_record_stores_mic_origin(tmp_cfg, record_stubs, out: io.String
     with pytest.raises(SystemExit) as ex:
         cli.main(["loudness", "--help"])
     assert ex.value.code == 0
+
+
+
+# --- speakers reject / negatives (v4) ------------------------------------------------------------------------
+
+def test_speakers_reject_and_negatives(tmp_cfg, monkeypatch: pytest.MonkeyPatch, out: io.StringIO):
+    db = DB(tmp_cfg.db_path)
+    now = datetime(2026, 11, 4, 13, 17, 5)
+    seg = add_done_segment(db, tmp_cfg, now)                     # no audio file: veto only
+    jia = db.upsert_speaker("甲")
+    yi = db.upsert_speaker("乙")
+    u1, u2 = db.add_utterances([
+        {"segment_id": seg, "start_s": 0, "end_s": 2, "abs_start": now.isoformat(), "day": "2026-11-04", "cluster_label": 0,
+         "speaker_id": jia, "speaker_name": "甲", "text_raw": "不是我说的", "text": "不是我说的"},
+        {"segment_id": seg, "start_s": 2, "end_s": 4, "abs_start": (now + timedelta(seconds=2)).isoformat(), "day": "2026-11-04",
+         "cluster_label": 0, "speaker_id": jia, "speaker_name": "甲", "text_raw": "也不是", "text": "也不是"}])
+    monkeypatch.setattr(cli, "_optional_engine", lambda cfg: None)
+    assert cli.main(["speakers", "reject", "--at", "2026-11-04 13:17:05"]) == 0
+    assert "已标为不是 甲" in out.getvalue() and "只记下了否决" in out.getvalue()
+    assert db.one("SELECT speaker_id FROM utterances WHERE id=?", (u1,))["speaker_id"] is None
+    assert db.one("SELECT speaker_id FROM utterances WHERE id=?", (u2,))["speaker_id"] == jia
+    assert cli.main(["speakers", "reject", "--at", "2026-11-04 13:17:07", "--name", "乙", "--cluster"]) == 0
+    assert db.rejected_speakers([u1, u2]) == {u1: {jia}, u2: {yi}}         # --cluster only adds sentences that are 乙 now
+    assert cli.main(["speakers", "reject", "--at", "2026-11-04 13:17:05"]) == 2   # nobody to reject any more
+    assert "--name" in out.getvalue()
+    assert cli.main(["speakers", "reject", "--at", "2026-11-04 13:17:05", "--name", "丙"]) == 2
+    out.truncate(0); out.seek(0)
+    assert cli.main(["speakers", "negatives"]) == 0 and "没有负样本" in out.getvalue()
+    nid = db.add_speaker_negative(jia, np.ones(8, dtype=np.float32), "x.wav#0.0-2.0", 2.0, utterance_id=u1, segment_id=seg)
+    out.truncate(0); out.seek(0)
+    assert cli.main(["speakers", "negatives", "甲"]) == 0
+    text = out.getvalue()
+    assert "x.wav" in text and "不是我说的" in text and "2.0s" in text
+    assert cli.main(["speakers", "negatives", "--delete", str(nid)]) == 0 and db.speaker_negatives() == []
+    assert cli.main(["speakers", "negatives", "--delete", str(nid)]) == 2
