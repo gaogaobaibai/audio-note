@@ -6,10 +6,14 @@ agentic tools still get the raw question; the model converts dates itself there.
 
 parse_range(text, now) -> (day_from, day_to) as 'YYYY-MM-DD' strings, or None when the text
 carries no date. Only the first expression found is used.
+
+parse_hours(text) -> (hour_from, hour_to) for a part of the day ("上午", "中午", "晚上", "昨晚" ...), and
+parse_when(text, now) -> When(day_from, day_to, hours) combines both: "昨天晚上" is yesterday, 18:00-24:00.
 """
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
 _CN_NUM = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
@@ -115,3 +119,60 @@ def parse_range(text: str, now: datetime | date | None = None) -> tuple[str, str
         return None
     cands.sort(key=lambda c: c[0])
     return cands[0][1]
+
+
+# --- parts of the day --------------------------------------------------------------------------------
+#: (words, (hour_from, hour_to)). The windows are generous on purpose: people say "晚上" for 18:30 and for
+#: 23:00, and the filter only narrows a search that is ranked afterwards anyway.
+_PARTS: tuple[tuple[tuple[str, ...], tuple[float, float]], ...] = (
+    (("凌晨", "后半夜", "半夜"), (0.0, 6.0)),
+    (("大清早", "清晨", "早晨", "早上", "一早", "今早", "明早", "早饭", "早餐"), (5.0, 11.0)),
+    (("上午",), (6.0, 12.0)),
+    (("中午", "正午", "午饭", "午餐", "午休"), (11.0, 14.0)),
+    (("下午", "午后"), (12.0, 18.5)),
+    (("傍晚", "黄昏", "晚饭", "晚餐"), (17.0, 20.5)),
+    (("深夜",), (21.0, 24.0)),
+    (("晚上", "夜里", "夜晚", "昨晚", "今晚", "明晚", "当晚", "昨夜", "今夜"), (18.0, 24.0)),
+)
+
+
+@dataclass(frozen=True)
+class When:
+    """The time a question is about: an inclusive day range and / or a part of the day (clock hours)."""
+    day_from: str | None = None
+    day_to: str | None = None
+    hours: tuple[float, float] | None = None
+
+    @property
+    def label(self) -> str:
+        """Short description for the prompt: '2026-10-29', '2026-10-27~2026-10-29 18:00-24:00', '11:00-14:00'."""
+        parts: list[str] = []
+        if self.day_from or self.day_to:
+            a, b = self.day_from or "…", self.day_to or "…"
+            parts.append(a if a == b else f"{a}~{b}")
+        if self.hours:
+            def hm(h: float) -> str:
+                return f"{int(h):02d}:{int(round((h - int(h)) * 60)):02d}"
+            parts.append(f"{hm(self.hours[0])}-{hm(self.hours[1])}")
+        return " ".join(parts)
+
+
+def parse_hours(text: str) -> tuple[float, float] | None:
+    """Clock window of the first part-of-day word in `text` ("上午" -> (6, 12)), or None."""
+    t = (text or "").replace(" ", "")
+    best: tuple[int, int, tuple[float, float]] | None = None      # (position, -length, window)
+    for words, window in _PARTS:
+        for w in words:
+            i = t.find(w)
+            if i >= 0 and (best is None or (i, -len(w)) < best[:2]):
+                best = (i, -len(w), window)
+    return best[2] if best else None
+
+
+def parse_when(text: str, now: datetime | date | None = None) -> When | None:
+    """Day range (parse_range) and part of the day (parse_hours) of a question; None when it names neither."""
+    span = parse_range(text, now)
+    hours = parse_hours(text)
+    if span is None and hours is None:
+        return None
+    return When(span[0] if span else None, span[1] if span else None, hours)

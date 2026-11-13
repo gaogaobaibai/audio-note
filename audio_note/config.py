@@ -35,6 +35,9 @@ DEFAULTS: dict[str, Any] = {
         "timeout_s": 120,
         "max_retries": 3,
         "temperature": 0.2,
+        "listen_model": "mimo-v2.6-flash",   # chat model that can hear audio (the "second listener")
+        "asr_prompt": True,            # hand the lexicon's hot words to the ASR model as a system message
+        "asr_prompt_max_terms": 50,
     },
     "audio": {
         "device": None,                # None = system default input; or device index; or name substring
@@ -67,7 +70,7 @@ DEFAULTS: dict[str, Any] = {
         "embedding_model": "3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx",
         "segmentation_model": "sherpa-onnx-pyannote-segmentation-3-0/model.onnx",
         "vad_model": "silero_vad.onnx",
-        "num_threads": 4,
+        "num_threads": 0,              # onnxruntime threads of the speaker models; 0 = follow performance.mode / threads
         "identify_threshold": 0.45,    # cosine similarity to call a cluster a known speaker
         "cluster_threshold": 0.5,      # sherpa-onnx fast clustering threshold
         "min_turn_s": 0.3,
@@ -83,16 +86,49 @@ DEFAULTS: dict[str, Any] = {
         "turn_reject_margin": 0.15,     # a turn whose similarity to the cluster's speaker is below threshold - margin becomes unknown
         "negative_margin": 0.0,         # a voice is X only when (best positive sample) - (best negative sample of X) >= this
         "system_turn_share": 0.6,       # a turn with at least this share of system-audio energy is never the user themselves
+        # --- speakers v5: the scoring layer (speech/scoring.py, speech/tracks.py; defaults from scripts/bench/bench_speakers.py)
+        "scoring": "v5",                # v5 | legacy (pre-1.0 rule: best single sample >= identify_threshold, no "maybe")
+        "sure_norm": 0.25,              # normalised score (cosine above the closest impostors) to assign a speaker automatically
+        "guess_norm": 0.15,             # ... to say "maybe X" (review queue); below it the voice is unknown
+        "margin_norm": 0.05,            # the winner must beat the runner-up by this
+        "raw_floor": 0.30,              # a normalised decision never accepts a raw cosine below this
+        "guess_raw_margin": 0.08,       # without a cohort: raw cosine >= identify_threshold - this is a "maybe"
+        "cohort_min": 20,               # stored impostor voices needed before scores are normalised (else raw cosine + identify_threshold)
+        "cohort_top_share": 0.33,       # normalise against this share of the impostors, the closest ones
+        "cohort_max": 300,              # impostor voices kept per speaker (the most recent)
+        "cohort_max_raw": 0.35,         # a stored voice closer than this to a speaker is not used as their impostor
+        "short_s": 2.0,                 # a voice vector from less speech than this is soft evidence (follows its track)
+        "follow_s": 1.0,                # ... and from less than this never decides on its own
+        "short_extra_norm": 0.05,       # extra score a short_s vector needs to be accepted on its own
+        "far_dbfs": -30.0,              # speech quieter than this (dBFS) is scored against the "far" centroid
+        "adapt": True,                  # learn per-condition centroids (near / far / system) from confirmed and confident speech
+        "adapt_min_anchor_cos": 0.5,    # a learned centroid further than this from the enrolled voice is refused (drift guard)
+        "adapt_min_clusters": 3,        # evidence clusters a condition needs for a centroid of its own
+        "track_link_cos": 0.55,         # voices of one conversation at least this similar are one track (short sentences follow it)
+        "smooth": True,                 # give an isolated short undecided sentence between two sentences of A to A
+        "smooth_gap_s": 3.0,            # ... when both neighbours are at most this far away
     },
     "correction": {
         "enabled": True,
-        "glossary_file": "glossary.txt",   # one term per line, injected into the prompt
+        # first pass: segment (lexicon rules + LLM per segment) | session (lexicon rules only; the LLM work moves to the
+        # per-session refine, which 0.9 does not ship yet - hence segment stays the default for now) | off
+        "mode": "segment",
+        "glossary_file": "glossary.txt",   # one term per line; imported into / exported from the lexicon
         "max_chars_per_call": 3000,
+        "alias_auto_max_freq": 500,        # a mis-heard spelling that is a dictionary word more frequent than this is only a hint
     },
     "pipeline": {
         "process_interval_min": 10,    # how often to pick up new segments for ASR
         "min_segment_age_s": 20,       # don't touch files still being written
         "transcripts_dir": "transcripts",
+        "realtime": True,              # process a segment the moment it is recorded (process_interval_min is the safety net)
+        "max_failed_retries": 24,      # a segment that failed with a transient error is re-queued hourly at most this often
+    },
+    "performance": {
+        "mode": "balanced",            # eco | balanced | fast: how much CPU the local models may use
+        "threads": 0,                  # threads of the local models; 0 = follow mode (eco 1 / balanced 2 / fast 4)
+        "background_priority": True,   # run the process below normal priority (the recorder thread is raised back)
+        "defer_on_battery": False,     # on battery, postpone the heavy local work (diarization) until plugged in
     },
     "memory": {
         "top_k": 20,
@@ -106,8 +142,10 @@ DEFAULTS: dict[str, Any] = {
         "strategy": "prefetch",        # agentic | prefetch | rag   (see docs/DESIGN.md §7)
         "prefetch_k": 12,              # hits injected before the first model turn (prefetch / rag)
         "rrf_k": 60,                   # reciprocal-rank-fusion constant for hybrid retrieval
-        "fts_weight": 1.0,             # weight of the keyword list in hybrid fusion (vector list = 1.0)
-        "hybrid_fts_strict": True,     # hybrid: keyword list = exact AND matches only (the loose OR list adds noise)
+        "fts_weight": 1.0,             # weight of the keyword list in hybrid fusion (each vector list = 1.0)
+        "hybrid_keywords": "content",  # keyword list of hybrid retrieval: content (content words, entities, numbers) | strict | loose | off
+        "vector_views": ["plain", "window"],   # sentence views that get a vector: plain (always) + window (with neighbours) / speaker
+        "session_gap_min": 5,          # memory sessions: a silence longer than this many minutes starts a new session
     },
     "analysis": {
         "daily_time": "22:30",
@@ -125,11 +163,15 @@ DEFAULTS: dict[str, Any] = {
         "wxpusher": {"spt": "", "app_token": "", "uids": []},
         "ntfy": {"topic": "", "server": "https://ntfy.sh"},
     },
+    "inbox": {
+        "daily_max": 12,               # at most this many new "which word was this?" questions a day; the rest wait (0 = no limit)
+    },
     "ui": {
         "enabled": True,               # serve the web UI from `audio-note run` (always on for `audio-note ui`)
         "host": "127.0.0.1",           # local only; never expose the UI (no auth) on a public interface
         "port": 8765,
         "open_browser": False,         # `audio-note run`: open the UI in the browser on start
+        "events": True,                # server-sent events (GET /api/events); off = the page polls
     },
     "log": {"level": "INFO", "file": "audio_note.log"},
 }

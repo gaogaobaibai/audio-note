@@ -10,7 +10,8 @@ Pipeline
   map             one JSON call per block  (prompts.MAP_*)
   reduce          one JSON call merging the block results into the day's digest (prompts.REDUCE_*)
   render_markdown pure function: digest JSON -> Markdown (概览/主要话题/决定/待办/提到的人/情绪/未闭环/时间线)
-  memory_notes    todos / decisions / people upserted by (kind, title); day_to and content refreshed on re-run
+  memory items    todos / decisions / people go through memory.items.upsert (source 'digest'): no duplicates on
+                  a re-run, tombstones and user edits respected
 
 Model: cfg.mimo.analysis_model if set, else cfg.mimo.chat_model.
 """
@@ -293,6 +294,9 @@ class DailyAnalyzer:
             from ..llm.client import MimoClient
 
             self._client = MimoClient(self.cfg, rpm=int(self.cfg.mimo.rpm))
+            from .. import metrics
+
+            metrics.install(self._client, self.db)
         return self._client
 
     # --- grouping -------------------------------------------------------------------------
@@ -505,22 +509,27 @@ class DailyAnalyzer:
         )
 
     def _upsert_notes(self, day: str, js: dict[str, Any], rows: list[sqlite3.Row]) -> None:
-        notes: list[tuple[str, str, str, list[int]]] = []  # kind, title, content, source ids
+        """The digest's todos / decisions / people become memory items (memory.items.upsert, source 'digest').
+        Running the digest again never duplicates them, never brings back an item the user deleted and never
+        overwrites one the user edited; a person item collects one dated line per day."""
+        from ..memory import items as mem_items
+
+        notes: list[dict[str, Any]] = []
         for t in js.get("todos", []):
             text = t.get("text", "") if isinstance(t, dict) else str(t)
             if not text:
                 continue
-            extra = []
-            if isinstance(t, dict):
-                if t.get("owner"):
-                    extra.append(f"负责人：{t['owner']}")
-                if t.get("due"):
-                    extra.append(f"截止：{t['due']}")
-            notes.append(("todo", text[:NOTE_TITLE_MAX], text + (f"（{'，'.join(extra)}）" if extra else ""), []))
+            owner = (t.get("owner") or "") if isinstance(t, dict) else ""
+            due = (t.get("due") or "") if isinstance(t, dict) else ""
+            extra = ([f"负责人：{owner}"] if owner else []) + ([f"截止：{due}"] if due else [])
+            notes.append({"kind": "todo", "title": text[:NOTE_TITLE_MAX], "owner": owner or None,
+                          "content": text + (f"（{'，'.join(extra)}）" if extra else ""),
+                          # the digest says deadlines the way people do ("周三"): a date when it can be read as one
+                          "due": mem_items.parse_due(due, day)})
         for d in js.get("decisions", []):
             d = str(d)
             if d:
-                notes.append(("decision", d[:NOTE_TITLE_MAX], d, []))
+                notes.append({"kind": "decision", "title": d[:NOTE_TITLE_MAX], "content": d})
         self_name = js.get("self_name") or self.self_name()
         for p in js.get("people", []):
             name = p.get("name", "") if isinstance(p, dict) else str(p)
@@ -531,21 +540,17 @@ class DailyAnalyzer:
             ctx = p.get("context", "") if isinstance(p, dict) else ""
             ids = [int(r["id"]) for r in rows
                    if _speaker(r, self.unknown_label) == name or name in str(r["text"] or "")][:50]
-            notes.append(("person", name[:NOTE_TITLE_MAX], f"{day}：{ctx}" if ctx else day, ids))
-
-        with self.db.transaction() as c:
-            for kind, title, content, ids in notes:
-                row = c.execute("SELECT id, day_from, day_to FROM memory_notes WHERE kind=? AND title=?", (kind, title)).fetchone()
-                src = json.dumps(ids) if ids else None
-                if row:
-                    day_from = min(row["day_from"] or day, day)
-                    day_to = max(row["day_to"] or day, day)
-                    c.execute("UPDATE memory_notes SET content=?, day_from=?, day_to=?, source_utterance_ids=?, updated_at=? WHERE id=?",
-                              (content, day_from, day_to, src, now_iso(), row["id"]))
-                else:
-                    c.execute("INSERT INTO memory_notes(kind, title, content, day_from, day_to, source_utterance_ids) VALUES (?,?,?,?,?,?)",
-                              (kind, title, content, day, day, src))
-        log.debug("daily %s: upserted %d memory notes", day, len(notes))
+            notes.append({"kind": "person", "title": name[:NOTE_TITLE_MAX], "subject": name[:NOTE_TITLE_MAX],
+                          "content": f"{day}：{ctx}" if ctx else day, "evidence": ids})
+        counts: dict[str, int] = {}
+        for note in notes:
+            try:
+                _id, action = mem_items.upsert(self.db, self.cfg, {**note, "day": day}, source="digest")
+            except Exception as e:  # noqa: BLE001 - the digest itself is written; one bad item must not undo it
+                log.warning("daily %s: memory item %r not stored: %s", day, note.get("title"), e)
+                continue
+            counts[action] = counts.get(action, 0) + 1
+        log.debug("daily %s: memory items %s", day, counts)
 
     # --- push -----------------------------------------------------------------------------
     def push(self, day: str | date) -> dict[str, str | None]:

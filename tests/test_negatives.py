@@ -337,8 +337,10 @@ def test_review_queue_order_and_filters(ncfg, ndb, jia):
     assert [i["utterance_id"] for i in items] == [snull, s46_short, s46_long, s50, s90]
     assert review.review_total(ndb, ncfg, jia) == 5
     last = items[-1]
+    # speakers v5 added kind / influence / guess_score to every item (the queue also holds "maybe" sentences now)
     assert last == {"utterance_id": s90, "day": DAY, "time": "09:00:09", "text": "0.90", "seconds": 2.0, "score": 0.9,
-                    "loudness_db": -20.0, "system_share": None, "audio": True}
+                    "loudness_db": -20.0, "system_share": None, "audio": True,
+                    "kind": "sure", "influence": 0, "guess_score": None}
     assert [i["utterance_id"] for i in review.review_queue(ndb, ncfg, jia, limit=2, offset=1)] == [s46_short, s46_long]
 
 

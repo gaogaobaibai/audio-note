@@ -85,16 +85,18 @@ def test_prefetch_scopes_to_parsed_day(cfg_factory):
     chat = MemoryChat(cfg, db, C())
     chat.now = dt(2026, 10, 30, 21, 0)
     text = chat.prefetch("昨天晚上聊了什么")
-    assert "2026-10-29 优先" in text
+    # 1.0: the part of the day is read too ("晚上" = 18:00-24:00), and a question that is only a time browses that window
+    assert "2026-10-29 18:00-24:00 优先" in text and "按时间浏览" in text
     first_two = text.splitlines()[1:3]
     assert all("2026-10-29" in line for line in first_two)
     assert "2026-10-29 优先" not in chat.prefetch("聊聊蛋糕")
 
     # memory notes matching a content token of the question ride along; nothing else -> no notes block
-    db.execute("INSERT INTO memory_notes(kind, title, content, day_from, day_to) VALUES (?,?,?,?,?)",
-               ("decision", "生日礼物", "妈的生日礼物买科沃斯 T30", "2026-10-27", "2026-10-27"))
-    db.execute("INSERT INTO memory_notes(kind, title, content, day_from, day_to) VALUES (?,?,?,?,?)",
-               ("todo", "压测", "QPS 目标一千", "2026-10-28", "2026-10-29"))
+    from audio_note.memory import items   # 1.0: the notes of the prefetch are memory_items
+
+    items.upsert(db, cfg, {"kind": "decision", "title": "生日礼物", "content": "妈的生日礼物买科沃斯 T30", "day": "2026-10-27"})
+    items.upsert(db, cfg, {"kind": "todo", "title": "压测", "content": "QPS 目标一千", "valid_from": "2026-10-28",
+                           "day": "2026-10-29"})
     text = chat.prefetch("生日礼物买了什么")
     assert "相关记忆笔记" in text and "[decision] 生日礼物 (2026-10-27): 妈的生日礼物买科沃斯 T30" in text
     assert "[todo] 压测" not in text

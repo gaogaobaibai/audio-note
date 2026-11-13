@@ -224,10 +224,10 @@ def test_evidence_has_context_self_label_notes_and_choices(cfg, db):
         (None, None, "那我也去。"),
         (li, "李强", "带上球拍。"),
     ], D1)
-    db.execute("INSERT INTO memory_notes(kind, title, content, day_from, day_to) VALUES (?,?,?,?,?)",
-               ("person", "李强", "2026-10-27：约了周末打球", "2026-10-27", "2026-10-27"))
-    db.execute("INSERT INTO memory_notes(kind, title, content, day_from, day_to) VALUES (?,?,?,?,?)",
-               ("person", "别人", "不相关", "2026-10-27", "2026-10-27"))
+    from audio_note.memory import items   # 1.0: person notes are memory_items
+
+    items.upsert(db, cfg, {"kind": "person", "title": "李强", "content": "2026-10-27：约了周末打球", "day": "2026-10-27"})
+    items.upsert(db, cfg, {"kind": "person", "title": "别人", "content": "不相关", "day": "2026-10-27"})
     cfg2 = cfg
     cfg2["speakers"]["relation_min_utterances"] = 1
     client = FakeJson({"李强": {"relation": "朋友", "confidence": 0.9, "reason": "r"}})
@@ -376,7 +376,7 @@ def test_daily_run_passes_people_line_and_skips_self_person_note(cfg, db):
     assert "人物」一行" in client.calls[0]["system"] and "人物」一行" in client.calls[1]["system"]
     assert js["self_name"] == "张三" and js["speakers"] == ["张三", "李四"]
     # reduce result names 张三 and 李四 as people: no person note for the user themselves
-    titles = {r["title"] for r in db.query("SELECT title FROM memory_notes WHERE kind='person'")}
+    titles = {r["title"] for r in db.query("SELECT title FROM memory_items WHERE kind='person'")}
     assert titles == {"李四"}
     assert json.loads(db.one("SELECT summary_json FROM daily_summaries WHERE day='2026-10-30'")["summary_json"])["self_name"] == "张三"
     # no utterances: self_name still reported

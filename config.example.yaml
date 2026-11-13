@@ -21,6 +21,9 @@ mimo:
   timeout_s: 120                 # 单次请求超时（秒）
   max_retries: 3                 # 429/503/网络错误时的重试次数
   temperature: 0.2               # 聊天模型温度（thinking 关闭时生效）
+  listen_model: mimo-v2.6-flash  # 能直接听音频的对话模型，用来做"第二次听写"（只对拿不准的句子盲听一遍，取差异）（下一版启用）
+  asr_prompt: true               # 把词库里的专有名词作为提示交给 ASR（同音词更容易写对）；关掉则 ASR 不带任何提示（下一版启用）
+  asr_prompt_max_terms: 50       # 每次提示最多带多少个词（下一版启用）
 
 audio:
   device: null                   # 输入设备：null = 系统默认；或设备序号；或名称子串（`audio-note devices` 查看）
@@ -54,7 +57,7 @@ speakers:
   embedding_model: 3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx   # 声纹模型（相对于 models_dir）
   segmentation_model: sherpa-onnx-pyannote-segmentation-3-0/model.onnx  # 说话人分割模型
   vad_model: silero_vad.onnx     # VAD 模型
-  num_threads: 4                 # onnxruntime 线程数
+  num_threads: 0                 # 声纹 / 分离模型的线程数；0 = 跟随 performance（推荐）。非 0 时以这里为准
   identify_threshold: 0.45       # 余弦相似度 ≥ 此值即认定为已注册说话人（`speakers calibrate` 校准）
   cluster_threshold: 0.5         # 说话人聚类阈值（越小分出的人越多）
   min_turn_s: 0.3                # 最短说话轮次（秒）
@@ -70,16 +73,47 @@ speakers:
   turn_reject_margin: 0.15       # 轮次与簇内说话人的相似度低于 identify_threshold - 此值且不像任何人时，标为未知
   negative_margin: 0.0           # 负样本（「不是 TA」标出的声音）：只有和 TA 正样本的相似度比和负样本的高出至少这么多才认成 TA（0 = 只要更像正样本）
   system_turn_share: 0.6         # 一段话里来自系统声音（会议 / 通话的对方）的能量占比 ≥ 此值时，不会被认成本人（只对同时录系统声音的录音生效）
+  # —— 声音 v5：评分层（默认值由 scripts/bench/bench_speakers.py 实测决定，一般不用改）——
+  scoring: v5                    # v5 = 新评分层（确定 / 可能 / 未知）| legacy = 1.0 之前的规则（只看最像的一条样本，没有"可能是"）
+  sure_norm: 0.25                # 归一化分数（比最像的"别人"高出多少余弦）≥ 此值才自动认人；调高 = 更少认错、更多"可能是 / 未知"
+  guess_norm: 0.15               # ≥ 此值但不到 sure_norm：标成"可能是 TA"，进核对队列等你确认；再低就是未知
+  margin_norm: 0.05              # 第一名要比第二名高出这么多才算数
+  raw_floor: 0.30                # 原始余弦低于此值的，归一化分数再高也不自动认
+  guess_raw_margin: 0.08         # 还没攒够"别人的声音"、只能用原始余弦时：≥ identify_threshold - 此值 算"可能是"
+  cohort_min: 20                 # 至少存了这么多个"别人的声音"才做归一化，否则退回 原始余弦 + identify_threshold
+  cohort_top_share: 0.33         # 归一化时只看最像的这一部分"别人"
+  cohort_max: 300                # 每个说话人最多用多少个（最近的）"别人的声音"
+  cohort_max_raw: 0.35           # 和某人相似度 ≥ 此值的声音不当作他的"别人"（防止本人没被认出的话混进去）
+  short_s: 2.0                   # 不到这么多秒语音的声纹只算"软证据"：自己单独认要更高分，否则跟随同一段对话里的同一个声音
+  follow_s: 1.0                  # 不到这么多秒的句子不单独认人，只跟随
+  short_extra_norm: 0.05         # 短句单独认人时额外需要的分数
+  far_dbfs: -30.0                # 语音电平低于此值（dBFS）按"离麦克风远"的条件来比对
+  adapt: true                    # 从你确认过的句子和高把握的自动判定里，学出每个人"近 / 远 / 系统声音"三种条件下的声音中心
+  adapt_min_anchor_cos: 0.5      # 学出来的中心和登记样本的相似度低于此值就不用（防止越学越偏）
+  adapt_min_clusters: 3          # 一种条件下至少有这么多段证据才单独建中心
+  track_link_cos: 0.55           # 同一段对话里相似度 ≥ 此值的声音连成一条"轨迹"，短句跟随轨迹的判定
+  smooth: true                   # "A ? A"：夹在同一个人两句话中间、离得很近、自己也有点像 A 的短句，归给 A
+  smooth_gap_s: 3.0              # 上一条里"离得很近"的秒数
 
 correction:
-  enabled: true                  # 是否用 LLM 对 ASR 结果做纠错
-  glossary_file: glossary.txt    # 词表文件（每行一个词；相对于项目根目录）
+  enabled: true                  # 是否纠正转写里的错词（关掉则原样保存识别结果）
+  mode: segment                  # 转写后立刻做的校对：segment = 先按词库里确认过的写法替换，再逐片段用大模型校对（默认）| session = 只按词库替换，大模型校对等整段对话结束后再做（整段校对下一版才有，现在选它等于不用大模型校对）| off = 不改
+  glossary_file: glossary.txt    # 词表文件（每行一个词；相对于项目根目录）。只用来导入 / 导出，词都存在词库里
   max_chars_per_call: 3000       # 每次纠错请求最多字符数
+  alias_auto_max_freq: 500       # 一个"听错的写法"如果本身是常用词（词典词频高于此值），就不自动替换，只作为提示
 
 pipeline:
   process_interval_min: 10       # 多久处理一次新片段（分离 → ASR → 纠错）
   min_segment_age_s: 20          # 片段创建后至少等待多少秒再处理（避免处理正在写的文件）
   transcripts_dir: transcripts   # 文字记录目录（相对于 data_dir）
+  realtime: true                 # 片段一录完就处理（不用等 process_interval_min，它只做兜底）；关掉则只按间隔处理
+  max_failed_retries: 24         # 因网络 / 接口故障失败的片段每小时自动重试一次，每个片段最多重试这么多次
+
+performance:
+  mode: balanced                 # 本机模型用多少 CPU：eco 省电（1 线程）| balanced 均衡（2 线程）| fast 最快（4 线程，多花约 2.6 倍 CPU 只快 1.6 倍）
+  threads: 0                     # 本机模型线程数；0 = 跟随 mode
+  background_priority: true      # 把进程设为"低于正常"优先级（录音线程单独提高），不和前台程序抢 CPU
+  defer_on_battery: false        # 用电池时推迟本机重活（说话人分离、转写），等插上电源再做；录音不受影响
 
 memory:
   top_k: 20                      # 检索返回条数
@@ -93,8 +127,10 @@ memory:
   strategy: prefetch             # 问答策略：prefetch 先自动检索再按需调工具（默认）| agentic 只靠工具 | rag 只用预检索、单次调用
   prefetch_k: 12                 # 预检索条数
   rrf_k: 60                      # 混合检索 RRF 常数
-  fts_weight: 1.0                # 混合检索里关键词结果的权重（向量为 1.0）
-  hybrid_fts_strict: true        # 混合检索时关键词只取全部命中的精确结果
+  fts_weight: 1.0                # 混合检索里关键词结果的权重（每一路向量为 1.0）
+  hybrid_keywords: content       # 混合检索里的关键词一路：content 只用内容词 / 人名 / 数字 / 英文（默认）| strict 全部词都命中 | loose 任一词命中 | off 不用
+  vector_views: [plain, window]  # 每句话存哪几种向量：plain 原文（必有）、window 连同前后各一句、speaker 带说话人；每多一种，每句多占约 4 KB 磁盘、多算一次向量
+  session_gap_min: 5             # 记忆里的“会话”：两句话间隔超过这么多分钟就算新的一段（日报分段用 analysis.session_gap_min）
 
 analysis:
   daily_time: "22:30"            # 每日分析触发时间（本地时间 HH:MM）
@@ -122,11 +158,15 @@ push:
     topic: ""                    # ntfy 主题名（任何人知道主题名即可订阅，建议用随机字符串）
     server: https://ntfy.sh      # ntfy 服务器地址（可自建）
 
+inbox:
+  daily_max: 12                  # 每天最多新增多少个"这个词是什么"的问题；多出来的按重要程度排到之后几天（0 = 不限）
+
 ui:
   enabled: true                  # `audio-note run` 时一并提供网页界面（`audio-note ui` 总是提供）
   host: 127.0.0.1                # 只监听本机；界面没有登录，不要改成 0.0.0.0 暴露到局域网
   port: 8765                     # 浏览器打开 http://127.0.0.1:8765
   open_browser: false            # `audio-note run` 启动时自动打开浏览器（`audio-note ui` 默认会打开）
+  events: true                   # 服务端事件推送（页面实时刷新）；关掉则页面定时轮询
 
 log:
   level: INFO                    # 日志级别：DEBUG | INFO | WARNING | ERROR

@@ -89,6 +89,8 @@ def cfg_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Callable[...
         user = {
             "paths": {"data_dir": str(data_dir), "models_dir": str(MODELS_DIR)},
             "mimo": {"api_key": ""},
+            # the default is <project root>/glossary.txt, which no test may write
+            "correction": {"glossary_file": str(tmp_path / "glossary.txt")},
         }
         user = _deep_merge(user, overrides or {})
         p = tmp_path / name

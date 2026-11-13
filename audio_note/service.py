@@ -290,7 +290,11 @@ def start_tray(cfg: Config, db: DB, stop_event: threading.Event, recorder_ref: d
 # --- threads ------------------------------------------------------------------
 
 def _recorder_loop(cfg: Config, db: DB, stop_event: threading.Event, ref: dict[str, Any]) -> None:
-    """Run the Recorder; on crash, wait and restart until stop_event is set."""
+    """Run the Recorder; on crash, wait and restart until stop_event is set.
+
+    `ref` carries state both ways: the loop stores the live "recorder" and the "last_error"; the Runtime may
+    put an "events" bus and an "on_segment" callback into it, which every Recorder built here receives
+    (events for the page, the callback to wake the scheduler when a segment file is closed)."""
     from .audio.recorder import Recorder
 
     restarts = 0
@@ -304,6 +308,12 @@ def _recorder_loop(cfg: Config, db: DB, stop_event: threading.Event, ref: dict[s
                 refresh_devices()
             restarts += 1
             rec = Recorder(cfg, db, stop_event)
+            for key in ("events", "on_segment"):
+                if ref.get(key) is not None:
+                    try:
+                        setattr(rec, key, ref[key])
+                    except Exception:  # noqa: BLE001 - a stand-in recorder that takes no attributes
+                        pass
             ref["recorder"] = rec
             rec.run()
             if not stop_event.is_set():
@@ -333,6 +343,16 @@ def _install_signal_handlers(stop_event: threading.Event) -> None:
             pass  # not main thread / unsupported
 
 
+def _apply_priority(cfg: Config) -> None:
+    """performance.background_priority: run this (long-lived) process below normal priority. Never raises."""
+    try:
+        from . import governor
+
+        governor.apply_process_priority(cfg)
+    except Exception as e:  # noqa: BLE001
+        log.debug("process priority not changed: %s", e)
+
+
 def start_ui(rt: Any, open_browser: bool = False) -> Any | None:
     """Serve the web UI for a Runtime (or a RuntimeHolder, so the page can switch profiles) on a
     background thread. Returns the UIServer, or None when it could not start (port taken, missing
@@ -344,6 +364,7 @@ def start_ui(rt: Any, open_browser: bool = False) -> Any | None:
 
         holder = rt if isinstance(rt, RuntimeHolder) else RuntimeHolder(rt)
         rt = holder.rt
+        _apply_priority(rt.cfg)      # a process that serves the UI is the long-running one (`run` and `ui` both get here)
         srv = UIServer(create_app(holder), str(rt.cfg.ui.host or "127.0.0.1"), int(rt.cfg.ui.port or 8765))
         rt.ui_url = srv.start()
         if open_browser:
@@ -367,6 +388,7 @@ def run_service(cfg: Config, tray: bool = False, stop_event: threading.Event | N
 
     stop_event = stop_event or threading.Event()
     cfg.ensure_dirs()
+    _apply_priority(cfg)
     rt = Runtime(cfg)
     try:
         rt.start_service(record=record, schedule=schedule)

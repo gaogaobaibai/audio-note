@@ -38,6 +38,10 @@ def normalise(a: np.ndarray) -> np.ndarray:
 class BaseEmbedder:
     name: str = "base"
     dim: int = 0
+    #: sentence views to index with this embedder (memory.vectors.VIEWS); the plain text only unless configured
+    views: tuple[str, ...] = ("plain",)
+    #: True for the profile's own embedder (get_embedder): memory items / session summaries are indexed with it too
+    index_memory: bool = False
 
     def embed_passages(self, texts: Sequence[str]) -> np.ndarray:
         raise NotImplementedError
@@ -121,8 +125,17 @@ class Embedder(BaseEmbedder):
 
 
 def get_embedder(cfg) -> BaseEmbedder:
-    """Embedder per config: memory.embedding_model 'hash' -> HashEmbedder, else a fastembed model id."""
+    """Embedder per config: memory.embedding_model 'hash' -> HashEmbedder, else a fastembed model id.
+    The embedder also carries `views`, the sentence views this profile indexes (memory.vector_views): whoever
+    is handed the embedder (the pipeline, the reindex job, the retriever) then fills the same views without
+    having to know the config (memory.vectors.index_missing reads it)."""
     name = str(cfg.memory.embedding_model or "").strip() or DEFAULT_MODEL
     if name == "hash":
-        return HashEmbedder()
-    return Embedder(name, cfg.embeddings_dir, threads=int(cfg.memory.get("embedding_threads", 2)))
+        emb: BaseEmbedder = HashEmbedder()
+    else:
+        emb = Embedder(name, cfg.embeddings_dir, threads=int(cfg.memory.get("embedding_threads", 2)))
+    from .vectors import DEFAULT_VIEWS, normalise_views
+
+    emb.views = normalise_views(cfg.memory.get("vector_views", DEFAULT_VIEWS))
+    emb.index_memory = True      # index_missing also embeds memory items and session summaries with this one
+    return emb

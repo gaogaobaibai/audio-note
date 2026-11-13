@@ -21,6 +21,11 @@ excluded speaker ids: a candidate X wins only when its best positive score p >= 
 of X) >= speakers.negative_margin, otherwise the next candidate (by p) is tried. Turns carry `exclude` (speakers
 vetoed for that sentence, or the self speaker for system-audio turns) which identify_turns / identify_utterances
 honour. audit_samples reports each sample's `influence` (automatic sentences only this sample lets through).
+v5 (1.0): WHO a voice vector belongs to is decided by scoring.py (core samples + per-condition centroids + cohort
+normalisation + duration-aware thresholds, three states). identify_turns / identify_utterances / score call it and
+leave the Decision on every Turn (`decision`, plus the vectors they computed: `emb`, `cluster_emb`), so the pipeline
+can store them instead of embedding the audio again. `match` is the pre-1.0 rule, kept unchanged for its callers
+(and what scoring falls back to in spirit when there is nothing to normalise with).
 """
 from __future__ import annotations
 
@@ -33,10 +38,15 @@ import numpy as np
 import sherpa_onnx
 import soundfile as sf
 
+from .. import governor
 from ..config import Config
 from ..db import DB
 from ..audio.storage import read_segment
 from ..audio.vad import SAMPLE_RATE, GateConfig, SileroVAD, segment_audio
+# the pure-numpy parts (sample analysis, negatives) moved to scoring.py; these names stay importable from here
+from .scoring import ANCHOR_DURATION_CAP_S, SampleAnalysis, negative_scores  # noqa: F401
+from .scoring import analyse_samples as _analyse_samples
+from .scoring import unit as _unit
 
 log = logging.getLogger(__name__)
 
@@ -70,12 +80,6 @@ class TooShortSample(ValueError):
         self.speech_s = float(speech_s)
         self.min_s = float(min_s)
         super().__init__(f"选中的范围只有 {self.speech_s:.1f}s 语音（至少需要 {self.min_s:g}s），没有加入声纹样本")
-
-
-def _unit(v: np.ndarray) -> np.ndarray:
-    v = np.asarray(v, dtype=np.float32).ravel()
-    n = float(np.linalg.norm(v))
-    return v / n if n > 0 else v
 
 
 def sample_consistency_min(cfg: Config) -> float:
@@ -112,82 +116,6 @@ def load_negatives(db: Any) -> list[tuple[int, np.ndarray]]:
     except Exception as e:  # noqa: BLE001 - a missing table on a foreign DB must not stop identification
         log.debug("no negative samples: %s", e)
         return []
-
-
-def negative_scores(emb: np.ndarray, negatives: list[tuple[int, np.ndarray]] | None) -> dict[int, float]:
-    """{speaker_id: best cosine between `emb` and that speaker's negative samples} (same dimension only)."""
-    out: dict[int, float] = {}
-    if not negatives:
-        return out
-    e = np.asarray(emb, dtype=np.float32).ravel()
-    for sid, n in negatives:
-        n = np.asarray(n, dtype=np.float32).ravel()
-        if n.shape[0] != e.shape[0]:
-            continue
-        nn = float(np.linalg.norm(n)) or 1.0
-        s = float(np.dot(e, n)) / nn
-        if s > out.get(int(sid), -1.0):
-            out[int(sid)] = s
-    return out
-
-
-ANCHOR_DURATION_CAP_S = 10.0   # duration weight cap when no trusted (mic / file) sample can anchor the core
-
-
-@dataclass
-class SampleAnalysis:
-    """Result of _analyse_samples: the reference voice, which samples form the core and which are ambiguous."""
-    ref: np.ndarray | None
-    core: frozenset[int] = frozenset()        # indices of the core faction (medoid + its neighbours)
-    ambiguous: frozenset[int] = frozenset()   # indices of samples in a two-faction stand-off (core + the rival faction)
-
-
-def _analyse_samples(embs: list[np.ndarray], durs: list[float], min_consistency: float,
-                     origins: list[str | None] | None = None) -> SampleAnalysis:
-    """Reference voice of a speaker from their stored samples (v3b anchor rules):
-
-    * The medoid (the sample most similar to all the others, duration-weighted, ties to the longer one) is chosen
-      among the samples whose origin is 'mic' or 'file' (the user recorded / uploaded them: they cannot contain
-      somebody else). Only when there is none is it chosen among all samples, with the duration weight capped at
-      ANCHOR_DURATION_CAP_S so a long mixed clip cannot buy its way in.
-    * Core = medoid + every sample at least `min_consistency` similar to it; the reference is their duration-
-      weighted mean, normalised. Consistency is always measured against the core, so two stray samples that
-      merely resemble each other cannot vouch for one another.
-    * Without a trusted anchor, non-core samples that form a faction of their own (>= 2 samples resembling each
-      other) make the speaker *ambiguous*: nobody can tell which faction is the real voice, so both factions are
-      flagged `ambiguous` and neither is an outlier (the user decides by ear). A lone stranger stays an outlier.
-    """
-    if not embs:
-        return SampleAnalysis(None)
-    if len(embs) == 1:
-        return SampleAnalysis(embs[0], frozenset({0}))
-    n = len(embs)
-    origins = list(origins) if origins is not None else [None] * n
-    from ..db import TRUSTED_SAMPLE_ORIGINS
-
-    trusted = [i for i in range(n) if origins[i] in TRUSTED_SAMPLE_ORIGINS]
-    E = np.stack(embs)
-    w = np.asarray([max(float(d or 0.0), 0.1) for d in durs], dtype=np.float64)
-    if not trusted:
-        w = np.minimum(w, ANCHOR_DURATION_CAP_S)
-    S = E @ E.T
-    score = np.zeros(n)
-    for i in range(n):
-        others = [j for j in range(n) if j != i]
-        score[i] = float(np.dot(S[i, others], w[others]) / w[others].sum())
-    candidates = trusted or list(range(n))
-    # tie-break on duration so a long clean recording beats a short snippet
-    medoid = int(max(candidates, key=lambda i: (round(score[i], 6), w[i])))
-    thr = float(min_consistency)
-    core = [j for j in range(n) if j == medoid or S[medoid, j] >= thr]
-    ref = _unit((E[core] * w[core][:, None]).sum(axis=0))
-    ambiguous: set[int] = set()
-    if not trusted:
-        rest = [j for j in range(n) if j not in core]
-        faction = {i for i in rest if any(j != i and S[i, j] >= thr for j in rest)}
-        if len(faction) >= 2:
-            ambiguous = faction | set(core)
-    return SampleAnalysis(ref, frozenset(core), frozenset(ambiguous))
 
 
 def _core_reference(embs: list[np.ndarray], durs: list[float], min_consistency: float,
@@ -304,6 +232,11 @@ class Turn:
     speaker_name: str | None = None
     score: float | None = None
     exclude: frozenset[int] = field(default_factory=frozenset)   # speaker ids this turn must never be identified as
+    system_share: float | None = None    # share of the turn's energy that came from system audio (None = unknown)
+    # left by SpeakerEngine.identify_*: how the turn was decided and the vectors that were computed on the way
+    decision: Any = field(default=None, repr=False, compare=False)       # scoring.Decision
+    emb: Any = field(default=None, repr=False, compare=False)            # the turn's own voice vector, when embedded
+    cluster_emb: Any = field(default=None, repr=False, compare=False)    # the vector of the (final) cluster it is in
 
     @property
     def duration(self) -> float:
@@ -315,7 +248,7 @@ class SpeakerEngine:
         self.cfg = cfg
         sp = cfg.speakers
         self.extractor = sherpa_onnx.SpeakerEmbeddingExtractor(
-            sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=str(cfg.model_path("embedding_model")), num_threads=int(sp.num_threads))
+            sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=str(cfg.model_path("embedding_model")), num_threads=governor.threads(cfg))
         )
         self.dim = self.extractor.dim
         self._diar: sherpa_onnx.OfflineSpeakerDiarization | None = None
@@ -329,8 +262,8 @@ class SpeakerEngine:
             dcfg = sherpa_onnx.OfflineSpeakerDiarizationConfig(
                 segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
                     pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(model=str(self.cfg.model_path("segmentation_model"))),
-                    num_threads=int(sp.num_threads)),
-                embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=str(self.cfg.model_path("embedding_model")), num_threads=int(sp.num_threads)),
+                    num_threads=governor.threads(self.cfg)),
+                embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=str(self.cfg.model_path("embedding_model")), num_threads=governor.threads(self.cfg)),
                 clustering=sherpa_onnx.FastClusteringConfig(num_clusters=-1, threshold=float(sp.cluster_threshold)),
                 min_duration_on=float(sp.min_turn_s), min_duration_off=0.5,
             )
@@ -411,149 +344,217 @@ class SpeakerEngine:
             margin = DEFAULT_TURN_REJECT_MARGIN
         return min_s, margin
 
-    def _cluster_decisions(self, audio: np.ndarray, clusters: dict[int, list[Turn]], enrolled: list[tuple[int, str, np.ndarray]],
-                           thr: float, negatives: list[tuple[int, np.ndarray]] | None = None, margin: float = 0.0
-                           ) -> dict[int, tuple[int | None, str | None, float | None, np.ndarray | None]]:
-        """Per cluster: (speaker_id, speaker_name, score, embedding) - the decision as before v3. A speaker every turn
-        of the cluster excludes (Turn.exclude) is left out of the cluster's candidates."""
-        out: dict[int, tuple[int | None, str | None, float | None, np.ndarray | None]] = {}
-        for cid, ts in clusters.items():
-            emb = self.cluster_embedding(audio, ts)
-            if emb is None:
-                out[cid] = (None, None, None, None)
-                continue
-            common = frozenset.intersection(*[frozenset(getattr(t, "exclude", ()) or ()) for t in ts]) if ts else frozenset()
-            sid, name, score = self.match(emb, enrolled, thr, negatives, margin=margin, exclude=common)
-            out[cid] = (sid, name, score, emb)
-        return out
-
-    @staticmethod
-    def _sim_to_speaker(emb: np.ndarray, enrolled: list[tuple[int, str, np.ndarray]], sid: int) -> float:
-        best = -1.0
-        for s, _n, e in enrolled:
-            if s == sid and e.shape[0] == emb.shape[0]:
-                best = max(best, float(np.dot(emb, _unit(e))))
-        return best
-
     def _turn_audio(self, audio: np.ndarray, t: Turn) -> np.ndarray | None:
         seg = audio[int(t.start * SAMPLE_RATE): int(t.end * SAMPLE_RATE)]
         return seg if len(seg) >= int(MIN_CLUSTER_SPEECH_S * SAMPLE_RATE) else None
 
+    # --- identification: who a vector belongs to is decided by scoring.py ----------------
+    def gallery(self, db: DB) -> Any:
+        """The reference voices of `db` (scoring.Gallery; cached there until samples, centroids or settings change)."""
+        from . import scoring
+
+        return scoring.Gallery.load(db, self.cfg)
+
+    def score(self, db: DB, emb: np.ndarray, *, speech_s: float | None = None, loudness_db: float | None = None,
+              system_share: float | None = None, exclude: Any = frozenset()) -> Any:
+        """Decide one voice vector with the scoring layer -> scoring.Decision (sure / guess / unknown)."""
+        return self.gallery(db).score(emb, speech_s=speech_s, loudness_db=loudness_db, system_share=system_share,
+                                      exclude=frozenset(int(x) for x in (exclude or ())))
+
+    @staticmethod
+    def _facts(audio: np.ndarray, ts: list[Turn]) -> tuple[float | None, float | None]:
+        """(speech level in dBFS, system-audio share) of the turns `ts`: the recording condition their vector is
+        scored under. The share is the duration-weighted mean of Turn.system_share (set by the pipeline)."""
+        from ..audio.loudness import speech_dbfs
+
+        parts = [audio[int(t.start * SAMPLE_RATE): int(t.end * SAMPLE_RATE)] for t in ts]
+        clip = np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
+        loud: float | None = None
+        if len(clip):
+            try:
+                loud = float(speech_dbfs(clip))
+            except Exception:  # noqa: BLE001 - a level is a hint, never a reason to fail
+                loud = None
+        sh = [(float(t.system_share), max(float(t.duration), 1e-3)) for t in ts if getattr(t, "system_share", None) is not None]
+        share = sum(a * b for a, b in sh) / sum(b for _, b in sh) if sh else None
+        return loud, share
+
+    @staticmethod
+    def _label(t: Turn, d: Any, unknown: str) -> None:
+        t.speaker_id, t.speaker_name, t.score = d.speaker_id, (d.name if d.speaker_id is not None else unknown), d.score
+        t.decision = d
+
+    def _decide_clusters(self, audio: np.ndarray, clusters: dict[int, list[Turn]], gallery: Any, unknown: str
+                         ) -> dict[int, tuple[Any, np.ndarray | None, tuple[float | None, float | None]]]:
+        """Per cluster: (scoring.Evaluation or None, embedding, (loudness, system share)); every turn is labelled
+        with its cluster's decision. A speaker every turn of the cluster excludes is not a candidate."""
+        from .scoring import NO_DECISION
+
+        out: dict[int, tuple[Any, np.ndarray | None, tuple[float | None, float | None]]] = {}
+        for cid, ts in clusters.items():
+            emb = self.cluster_embedding(audio, ts)
+            if emb is None:
+                out[cid] = (None, None, (None, None))
+                for t in ts:
+                    self._label(t, NO_DECISION, unknown)
+                continue
+            common = frozenset.intersection(*[frozenset(getattr(t, "exclude", ()) or ()) for t in ts]) if ts else frozenset()
+            facts = self._facts(audio, ts)
+            ev = gallery.evaluate(emb, speech_s=sum(t.duration for t in ts), loudness_db=facts[0], system_share=facts[1],
+                                  exclude=common)
+            out[cid] = (ev, emb, facts)
+            for t in ts:
+                self._label(t, ev.decision, unknown)
+                t.cluster_emb = emb
+        return out
+
+    def _evaluate_turn(self, gallery: Any, seg: np.ndarray, t: Turn, excl: frozenset[int]) -> Any:
+        """Embed one turn's own audio (kept on the turn as `emb`) and score it."""
+        from ..audio.loudness import speech_dbfs
+
+        t.emb = self.embed(seg)
+        try:
+            loud: float | None = float(speech_dbfs(seg))
+        except Exception:  # noqa: BLE001
+            loud = None
+        return gallery.evaluate(t.emb, speech_s=t.duration, loudness_db=loud, system_share=getattr(t, "system_share", None),
+                                exclude=excl)
+
+    def _store_cluster(self, db: DB, segment_id: int, cid: int, emb: np.ndarray, ts: list[Turn],
+                       facts: tuple[float | None, float | None]) -> None:
+        """Keep the cluster vector with its recording condition (the adaptive centroids are split by it)."""
+        db.upsert_cluster_embedding(int(segment_id), int(cid), emb, sum(t.duration for t in ts))
+        try:
+            from .scoring import model_id
+
+            db.execute("UPDATE cluster_embeddings SET loudness_db=?, system_share=?, model=? WHERE segment_id=? AND cluster_label=?",
+                       (facts[0], facts[1], model_id(self.cfg), int(segment_id), int(cid)))
+        except Exception as e:  # noqa: BLE001 - DB stand-ins / databases without the 1.0 columns
+            log.debug("cluster condition not stored for #%s/%s: %s", segment_id, cid, e)
+
     def identify_turns(self, audio: np.ndarray, turns: list[Turn], db: DB, segment_id: int | None = None) -> list[Turn]:
-        """Embed each cluster (all its turns concatenated, speech up to 60 s) and match against enrolled speakers.
+        """Embed each cluster (all its turns concatenated, speech up to 60 s) and decide it with the scoring layer.
         With `segment_id` every cluster embedding is also stored in cluster_embeddings (speech_s = sum of its
-        turn durations) so the unknown voices can later be grouped and named without re-reading the audio.
+        turn durations, plus its loudness / system share) so voices can later be grouped, named and re-scored
+        without re-reading the audio.
 
         Turn-level correction (only with enrolled speakers and speakers.turn_check_min_s > 0): every turn at
         least that long is embedded on its own; a turn that clearly belongs to another enrolled speaker, or
         does not resemble the cluster's speaker at all (or resembles that speaker's negative samples more), is
         moved to a new cluster id (one per (original cluster, speaker) so build_chunks still merges neighbours).
         Shorter turns keep the cluster decision - unless it is a speaker the turn excludes (Turn.exclude: a
-        vetoed speaker, or the user themselves for system audio), then the cluster embedding is matched again
-        without that speaker. Negative samples (db.speaker_negatives) apply to every decision (see `match`).
+        vetoed speaker, or the user themselves for system audio), then the cluster embedding is decided again
+        without that speaker. Every turn carries the Decision that labelled it (`decision`: a "maybe X" lives
+        there, never in speaker_id) and the vectors computed on the way (`emb`, `cluster_emb`).
         The list is returned in its original order; cluster ids of moved turns change in place."""
-        enrolled = db.speaker_embeddings()
-        negatives = load_negatives(db)
-        nmargin = negative_margin(self.cfg)
-        thr = float(self.cfg.speakers.identify_threshold)
+        from .scoring import NO_DECISION
+
+        gallery = self.gallery(db)
         unknown = self.cfg.speakers.unknown_label
         clusters: dict[int, list[Turn]] = {}
         for t in turns:
             clusters.setdefault(t.cluster, []).append(t)
-        decisions = self._cluster_decisions(audio, clusters, enrolled, thr, negatives, nmargin)
-        for cid, ts in clusters.items():
-            sid, name, score, _emb = decisions[cid]
-            for t in ts:
-                t.speaker_id, t.speaker_name, t.score = sid, (name if sid is not None else unknown), score
+        decided = self._decide_clusters(audio, clusters, gallery, unknown)
 
         moved = 0
         moved_s = 0.0
-        min_s, margin = self._turn_check_params()
-        if enrolled and turns:
+        min_s, _margin = self._turn_check_params()
+        if gallery.has_speakers and turns:
             next_id = max(clusters) + 1
             new_ids: dict[tuple[int, int | None], int] = {}
             for cid, ts in list(clusters.items()):
-                s_c, _n_c, _sc_c, emb_c = decisions[cid]
+                ev_c, emb_c, facts_c = decided[cid]
+                s_c = ev_c.decision.speaker_id if ev_c is not None else None
                 for t in ts:
                     excl = frozenset(getattr(t, "exclude", ()) or ())
                     seg = self._turn_audio(audio, t) if (min_s > 0 and t.duration >= min_s) else None
-                    target: tuple[int | None, str | None, float | None] | None = None
+                    target: Any = None
                     if seg is not None:
-                        e_t = self.embed(seg)
-                        s_t, name_t, score_t = self.match(e_t, enrolled, thr, negatives, margin=nmargin, exclude=excl)
+                        ev_t = self._evaluate_turn(gallery, seg, t, excl)
+                        d_t = ev_t.decision
                         if s_c is not None:
-                            sim_c = self._sim_to_speaker(e_t, enrolled, s_c)
-                            neg_c = negative_scores(e_t, negatives).get(s_c, -1.0)
-                            holds = s_c not in excl and sim_c >= thr and sim_c - neg_c >= nmargin
-                            if s_t is not None and s_t != s_c and not holds:
-                                target = (s_t, name_t, score_t)
-                            elif s_t is None and (s_c in excl or sim_c < thr - margin or sim_c - neg_c < nmargin):
-                                target = (None, None, score_t)
-                        elif s_t is not None:
-                            target = (s_t, name_t, score_t)
+                            holds = s_c not in excl and ev_t.holds(s_c)
+                            if d_t.speaker_id is not None and d_t.speaker_id != s_c and not holds:
+                                target = d_t
+                            elif d_t.speaker_id is None and (s_c in excl or ev_t.rejects(s_c)):
+                                target = d_t
+                        elif d_t.speaker_id is not None:
+                            target = d_t
                     elif s_c is not None and s_c in excl:
                         # too short to check on its own: the cluster's voice, minus the speaker this turn excludes
-                        target = (self.match(emb_c, enrolled, thr, negatives, margin=nmargin, exclude=excl)
-                                  if emb_c is not None else (None, None, None))
+                        target = (gallery.evaluate(emb_c, speech_s=sum(x.duration for x in ts), loudness_db=facts_c[0],
+                                                   system_share=facts_c[1], exclude=excl).decision
+                                  if emb_c is not None else NO_DECISION)
                     if target is None:
                         continue
-                    key = (cid, target[0])
+                    key = (cid, target.speaker_id)
                     if key not in new_ids:
                         new_ids[key] = next_id
                         next_id += 1
                     t.cluster = new_ids[key]
-                    t.speaker_id, t.speaker_name, t.score = target[0], (target[1] if target[0] is not None else unknown), target[2]
+                    self._label(t, target, unknown)
                     moved += 1
                     moved_s += t.duration
             if moved:
                 log.info("segment #%s: turn-level check moved %d turns (%.1f s)",
                          segment_id if segment_id is not None else "?", moved, moved_s)
 
-        if segment_id is not None:
-            final: dict[int, list[Turn]] = {}
-            for t in turns:
-                final.setdefault(t.cluster, []).append(t)
-            for cid, ts in final.items():
-                emb = self.cluster_embedding(audio, ts) if (moved or cid not in decisions) else decisions[cid][3]
-                if emb is None:
-                    continue
-                db.upsert_cluster_embedding(int(segment_id), int(cid), emb, sum(t.duration for t in ts))
+        final: dict[int, list[Turn]] = {}
+        for t in turns:
+            final.setdefault(t.cluster, []).append(t)
+        for cid, ts in final.items():
+            if moved or cid not in decided:
+                emb = self.cluster_embedding(audio, ts)
+                facts = self._facts(audio, ts) if emb is not None else (None, None)
+            else:
+                _ev, emb, facts = decided[cid]
+            for t in ts:
+                t.cluster_emb = emb
+            if emb is not None and segment_id is not None:
+                self._store_cluster(db, int(segment_id), int(cid), emb, ts, facts)
         return turns
 
     def identify_utterances(self, audio: np.ndarray, turns: list[Turn], db: DB, segment_id: int | None = None) -> list[Turn]:
-        """Per-utterance identification for relabel: cluster decision as a baseline (cluster embeddings stored
-        with `segment_id`), then every turn at least speakers.turn_check_min_s long is matched on its own audio
-        and carries its own score; shorter turns keep the cluster result (matched again without the speakers the
-        turn excludes, when the cluster's speaker is one of them). Negative samples apply. Cluster ids never change."""
-        enrolled = db.speaker_embeddings()
-        negatives = load_negatives(db)
-        nmargin = negative_margin(self.cfg)
-        thr = float(self.cfg.speakers.identify_threshold)
+        """Per-utterance identification for relabel: the cluster decision as a baseline (cluster embeddings stored
+        with `segment_id`), then every turn at least speakers.turn_check_min_s long is embedded and decided on its
+        own audio. A sentence its own voice is sure about keeps that answer; one that is only "maybe" (or short)
+        takes its cluster's speaker when its own voice does not speak against it; a turn too short to embed keeps
+        the cluster result (decided again without the speakers the turn excludes, when the cluster's speaker is
+        one of them). Negative samples apply. Cluster ids never change."""
+        from .scoring import NO_DECISION
+
+        gallery = self.gallery(db)
         unknown = self.cfg.speakers.unknown_label
         clusters: dict[int, list[Turn]] = {}
         for t in turns:
             clusters.setdefault(t.cluster, []).append(t)
-        decisions = self._cluster_decisions(audio, clusters, enrolled, thr, negatives, nmargin)
+        decided = self._decide_clusters(audio, clusters, gallery, unknown)
         min_s, _margin = self._turn_check_params()
+        short_s = float(gallery.params.short_s)
         own = 0
         for cid, ts in clusters.items():
-            sid, name, score, emb = decisions[cid]
+            ev_c, emb, facts = decided[cid]
+            d_c = ev_c.decision if ev_c is not None else NO_DECISION
+            s_c = d_c.speaker_id
             if emb is not None and segment_id is not None:
-                db.upsert_cluster_embedding(int(segment_id), int(cid), emb, sum(t.duration for t in ts))
+                self._store_cluster(db, int(segment_id), int(cid), emb, ts, facts)
             for t in ts:
                 excl = frozenset(getattr(t, "exclude", ()) or ())
-                t.speaker_id, t.speaker_name, t.score = sid, (name if sid is not None else unknown), score
                 seg = None
-                if enrolled and min_s > 0 and t.duration >= min_s:
+                if gallery.has_speakers and min_s > 0 and t.duration >= min_s:
                     seg = self._turn_audio(audio, t)
                 if seg is None:
-                    if sid is not None and sid in excl:
-                        s2, n2, sc2 = (self.match(emb, enrolled, thr, negatives, margin=nmargin, exclude=excl)
-                                       if emb is not None else (None, None, None))
-                        t.speaker_id, t.speaker_name, t.score = s2, (n2 if s2 is not None else unknown), sc2
+                    if s_c is not None and s_c in excl:
+                        d = (gallery.evaluate(emb, speech_s=sum(x.duration for x in ts), loudness_db=facts[0],
+                                              system_share=facts[1], exclude=excl).decision if emb is not None else NO_DECISION)
+                        self._label(t, d, unknown)
                     continue
-                s_t, name_t, score_t = self.match(self.embed(seg), enrolled, thr, negatives, margin=nmargin, exclude=excl)
-                t.speaker_id, t.speaker_name, t.score = s_t, (name_t if s_t is not None else unknown), score_t
+                ev_t = self._evaluate_turn(gallery, seg, t, excl)
+                d = ev_t.decision
+                if d.speaker_id is None and s_c is not None and s_c not in excl:
+                    if ev_t.plausible(s_c) or (t.duration < short_s and ev_t.leans(s_c)):
+                        d = ev_t.following(s_c, d_c.name, "track", d_c.runner_up)
+                self._label(t, d, unknown)
                 own += 1
         log.debug("segment #%s: %d/%d utterances identified on their own audio", segment_id, own, len(turns))
         return turns

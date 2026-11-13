@@ -1,5 +1,18 @@
-"""LLM correction of ASR text as *edit pairs* with hard guardrails (DESIGN.md section 6).
+"""The first correction pass of a freshly transcribed segment (SPEC v1 section 6.4).
 
+    correction.mode   corrector built by default_corrector()   what it does
+    session           LexiconCorrector                          deterministic: Lexicon.apply, no LLM call; the careful
+                                                                LLM work happens later, per session (speech.refine)
+    segment (default) SegmentCorrector                          the lexicon pass, then the legacy per-segment LLM
+                                                                corrector (Corrector) on the result
+    off               None                                      text is stored as the recogniser wrote it
+
+All of them are used through one seam, `corrector.correct(items, glossary) -> [{"i", "text", "edits"}]`
+(items = [{"i", "speaker", "text"}]); tests inject their own object there. An edit is {"from", "to", "reason"}
+plus, from the correctors of this module, "source" ('lexicon' | 'llm': who made it - the pipeline writes one
+revision per edit with that source) and for lexicon edits "alias_id", "lexicon_id", "start", "end".
+
+Legacy LLM corrector (`Corrector`): edit pairs with hard guardrails (DESIGN.md section 6).
 The model never rewrites the whole text; it returns ``{"edits": [{"i", "from", "to", "reason"}]}``
 and this module applies them locally under code-enforced rules:
 
@@ -21,10 +34,10 @@ import json
 import logging
 import os
 import re
-from pathlib import Path
 from typing import Any
 
 from ..config import Config
+from . import glossary_file
 
 log = logging.getLogger(__name__)
 
@@ -132,25 +145,9 @@ def _find_unreplaced(cur: str, frm: str, replaced: list[tuple[int, int]]) -> int
 
 
 def load_glossary(path: str | os.PathLike | None) -> list[str]:
-    """Read one term per line; blank lines and ``#`` comments are ignored. Missing file -> ``[]``."""
-    if not path:
-        return []
-    p = Path(path)
-    if not p.is_file():
-        return []
-    out: list[str] = []
-    seen: set[str] = set()
-    with open(p, "r", encoding="utf-8") as f:
-        for line in f:
-            s = line.strip()
-            if not s or s.startswith("#"):
-                continue
-            if " #" in s:
-                s = s.split(" #", 1)[0].strip()
-            if s and s not in seen:
-                seen.add(s)
-                out.append(s)
-    return out
+    """Terms of a glossary file (one per line; blank lines, ``#`` lines and inline `` #`` comments dropped).
+    Missing file -> ``[]``. A thin wrapper: the rules live in glossary_file, the one parser."""
+    return glossary_file.read_glossary(path)
 
 
 # ---------------------------------------------------------------------------
@@ -323,3 +320,95 @@ def parse_edits(resp: Any, item_ids: list[Any]) -> dict[Any, list[dict[str, Any]
             continue
         by_item.setdefault(key, []).append(e)
     return by_item
+
+
+# ---------------------------------------------------------------------------
+# first pass by mode (SPEC v1 section 6.4)
+# ---------------------------------------------------------------------------
+MODES = ("session", "segment", "off")
+# segment until speech.refine (the per-session LLM pass that session mode relies on) ships: session mode alone would
+# drop the LLM correction the owner had before the upgrade.
+DEFAULT_MODE = "segment"
+
+
+def correction_mode(cfg: Any) -> str:
+    """correction.mode, or 'off' when correction.enabled is false. An unknown value counts as the default ('segment')."""
+    try:
+        c = cfg.correction
+        if not bool(c.get("enabled", True)):
+            return "off"
+        mode = str(c.get("mode", DEFAULT_MODE) or DEFAULT_MODE).strip().lower()
+    except (AttributeError, TypeError):
+        return DEFAULT_MODE
+    return mode if mode in MODES else DEFAULT_MODE
+
+
+class LexiconCorrector:
+    """Deterministic first pass: every scope='auto' mishear alias of the lexicon is rewritten to its entry.
+
+    No LLM, no network, microseconds per sentence - so it runs on every segment the moment it is transcribed,
+    and what the user taught the lexicon (an answered question, a hand edit) holds for everything recorded
+    afterwards. The `glossary` argument of the seam is ignored: the lexicon already contains it."""
+
+    source = "lexicon"
+
+    def __init__(self, cfg: Any, db: Any):
+        self.cfg = cfg
+        self.db = db
+
+    def correct(self, items: list[dict[str, Any]], glossary: list[str] | None = None) -> list[dict[str, Any]]:
+        from . import lexicon
+
+        if self.db is None:
+            return [{"i": it["i"], "text": str(it.get("text") or ""), "edits": []} for it in items]
+        lexicon.sync_sources_throttled(self.db, self.cfg)
+        lex = lexicon.Lexicon.load(self.db)
+        out: list[dict[str, Any]] = []
+        for it in items:
+            text, edits = lex.apply(str(it.get("text") or ""))
+            out.append({"i": it["i"], "text": text, "edits": [{**e, "source": "lexicon"} for e in edits]})
+        return out
+
+
+class SegmentCorrector(Corrector):
+    """correction.mode = segment: the lexicon pass first (the user's own rules always hold), then the legacy
+    LLM corrector on the result. Each edit says who made it ("source")."""
+
+    def __init__(self, cfg: Config, client: Any, db: Any = None):
+        super().__init__(cfg, client)
+        self.db = db
+        self._lexicon = LexiconCorrector(cfg, db)
+
+    def correct(self, items: list[dict[str, Any]], glossary: list[str] | None = None) -> list[dict[str, Any]]:
+        if not items:
+            return []
+        try:
+            first = self._lexicon.correct(items, glossary)
+        except Exception as e:  # noqa: BLE001 - a broken lexicon must not cost the LLM pass
+            log.warning("lexicon pass failed (%s), continuing with the LLM corrector only", e)
+            first = [{"i": it["i"], "text": str(it.get("text") or ""), "edits": []} for it in items]
+        second = super().correct([{**it, "text": f["text"]} for it, f in zip(items, first)], glossary)
+        out: list[dict[str, Any]] = []
+        for f, s in zip(first, second):
+            out.append({"i": f["i"], "text": s["text"],
+                        "edits": list(f["edits"]) + [{**e, "source": "llm"} for e in s["edits"]]})
+        return out
+
+
+def default_corrector(cfg: Any, db: Any = None, client: Any = None) -> Any:
+    """The corrector correction.mode asks for (see the module docstring), or None for 'off'.
+
+    `client` may be a MiMo client or a zero-argument callable returning one (called only in segment mode, so
+    session mode never needs an API key). Segment mode without a usable client falls back to the lexicon pass."""
+    mode = correction_mode(cfg)
+    if mode == "off":
+        return None
+    if mode == "segment":
+        try:
+            c = client() if callable(client) and not hasattr(client, "json") else client
+        except Exception as e:  # noqa: BLE001 - no API key
+            log.warning("no MiMo client for the per-segment corrector (%s): lexicon pass only", e)
+            c = None
+        if c is not None:
+            return SegmentCorrector(cfg, c, db)
+    return LexiconCorrector(cfg, db) if db is not None else None

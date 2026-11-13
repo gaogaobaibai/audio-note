@@ -191,9 +191,13 @@ def test_run_writes_markdown_db_and_notes(cfg, db):
     assert row["utterance_count"] == 5 and row["model"] == "mimo-v2.6-pro" and row["pushed_at"] is None
     assert json.loads(row["summary_json"])["overview"] == js["overview"]
 
-    # memory notes
-    notes = db.query("SELECT kind, title, content, day_from, day_to, source_utterance_ids FROM memory_notes ORDER BY kind, title")
+    # memory notes (1.0: written to memory_items; valid_from / day / evidence are the old day_from / day_to / source ids)
+    notes = db.query("SELECT kind, title, content, valid_from AS day_from, day AS day_to, evidence AS source_utterance_ids,"
+                     " source, status, owner FROM memory_items ORDER BY kind, title")
     by = {(n["kind"], n["title"]): n for n in notes}
+    assert {n["source"] for n in notes} == {"digest"} and {n["status"] for n in notes} == {"active"}
+    assert by[("todo", "整理测试用例")]["owner"] == "张三"
+    assert db.one("SELECT COUNT(*) AS n FROM memory_notes")["n"] == 0          # the 0.3 table is no longer written
     assert set(by) == {("todo", "整理测试用例"), ("todo", "预约会议室"), ("decision", "周五前完成接口联调"),
                        ("person", "张三"), ("person", "李四")}
     assert by[("todo", "整理测试用例")]["content"] == "整理测试用例（负责人：张三，截止：周三）"
@@ -218,16 +222,18 @@ def test_rerun_uses_cache_unless_forced_and_dedupes_notes(cfg, db):
     md3, _ = an.run(DAY, force=True)
     assert len(client.calls) == n_calls * 2
     assert "负责测试用例和联调" in md3
-    assert db.one("SELECT COUNT(*) AS n FROM memory_notes WHERE kind='person' AND title='张三'")["n"] == 1
-    assert db.one("SELECT content FROM memory_notes WHERE kind='person' AND title='张三'")["content"] == f"{DAY}：负责测试用例和联调"
-    assert db.one("SELECT COUNT(*) AS n FROM memory_notes")["n"] == 6
+    assert db.one("SELECT COUNT(*) AS n FROM memory_items WHERE kind='person' AND title='张三'")["n"] == 1
+    assert db.one("SELECT content FROM memory_items WHERE kind='person' AND title='张三'")["content"] == f"{DAY}：负责测试用例和联调"
+    assert db.one("SELECT COUNT(*) AS n FROM memory_items")["n"] == 6
     assert db.one("SELECT COUNT(*) AS n FROM daily_summaries")["n"] == 1
 
     # a later day touching the same person extends day_to, keeps day_from
     _insert(db, [(datetime(2026, 10, 31, 8, 0, 0), "张三", "继续联调。")])
     an.run("2026-10-31")
-    p = db.one("SELECT day_from, day_to FROM memory_notes WHERE kind='person' AND title='张三'")
+    p = db.one("SELECT valid_from AS day_from, day AS day_to, content FROM memory_items WHERE kind='person' AND title='张三'")
     assert (p["day_from"], p["day_to"]) == (DAY, "2026-10-31")
+    # 1.0: a person item keeps one dated line per day instead of being overwritten by the latest digest
+    assert p["content"].split("\n") == [f"{DAY}：负责测试用例和联调", "2026-10-31：负责测试用例和联调"]
 
 
 def test_reduce_failure_falls_back_to_block_concat(cfg, db):

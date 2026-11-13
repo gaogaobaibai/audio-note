@@ -14,15 +14,32 @@ Last-run times live in the kv table (last_process_at, last_cleanup_at, last_dail
 last_daily_at, last_daily_recheck_day) so restarts do not re-run everything. Due-time logic is in pure functions
 (parse_hhmm / next_daily_due / is_due / daily_days_due) so it can be unit-tested without
 threads or a clock.
+
+1.0 additions (docs/SPEC_v1.md section 4.6):
+  realtime            the recorder calls notify_segment(id) when a segment file is closed; the loop wakes up at once
+                      and processes exactly those segments (pipeline.realtime; min_segment_age_s does not apply,
+                      the file is complete). The interval-driven `process` stays as the safety net.
+  chain()             post-processing (sessions -> refine -> episodes, chain.run_chain) after every process run, on a
+                      tick that finds finished-but-untreated sessions, and right before a daily digest.
+  consolidate()       memory consolidation right after a daily digest; brief() once a day at analysis.brief_time.
+  deferral            governor.defer_reason(cfg) (on battery with performance.defer_on_battery) postpones the local
+                      heavy work (`process`); `deferred` holds the reason for status().
+  events / history    job state changes are published on the event bus and written to job_runs.
+None of the new work shows up in run_once()'s return value: it lists process / cleanup / daily / push as before.
 """
 from __future__ import annotations
 
+import inspect
 import logging
+import sqlite3
 import threading
 import time
+from collections import deque
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from . import events as events_mod
 from .config import Config
 from .db import DB, now_iso
 
@@ -45,6 +62,38 @@ PUSH_RETRY_MIN = 30.0                # a digest whose push failed is re-sent at 
 MAX_PUSH_RETRIES = 8
 MAX_PARTIAL_RETRIES = 6              # regenerate a partial digest at most this often before accepting it
 DEFAULT_CATCHUP_DAYS = 7             # cfg.analysis.catchup_days: how many missed days get a report after downtime
+
+KV_BRIEF_DAY = "last_brief_day"      # the day whose morning brief was already attempted
+WAKE_POLL_S = 0.25                   # while idle the loop looks at its stop event this often (a wake-up is immediate)
+CHAIN_LIMIT = 3                      # sessions a chain step may treat per tick (new audio is never kept waiting long)
+CHAIN_RETRY_S = 300.0                # pending chain work that made no progress is tried again after this long
+CHAIN_PROBE_S = 60.0                 # how often to look whether any chain step is installed at all
+DEFAULT_SESSION_GAP_MIN = 5.0        # cfg.memory.session_gap_min until package B3 adds the key
+BRIEF_WINDOW_H = 6.0                 # a morning brief more than this late is skipped for the day
+
+
+def _jsonable(v: Any) -> Any:
+    """A job result reduced to what JSON can carry (paths / dates / sets become strings / lists)."""
+    if isinstance(v, dict):
+        return {str(k): _jsonable(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple, set, frozenset)):
+        return [_jsonable(x) for x in v]
+    if isinstance(v, (str, int, float, bool)) or v is None:
+        return v
+    if isinstance(v, Path):
+        return str(v)
+    return str(v)
+
+
+def _is_noop_result(name: str, result: Any) -> bool:
+    """True for the outcome of a periodic run that found nothing to do (kept out of the job history)."""
+    if name == "process":
+        return not (isinstance(result, dict) and int(result.get("processed") or 0) > 0)
+    if name == "cleanup":
+        return not (isinstance(result, dict) and any(isinstance(v, (int, float)) and v for v in result.values()))
+    if name == "chain":
+        return not (isinstance(result, dict) and (result.get("ran") or result.get("failed")))
+    return False
 
 
 # --- pure helpers ---------------------------------------------------------
@@ -180,11 +229,17 @@ class Scheduler:
 
     def __init__(self, cfg: Config, db: DB, stop_event: threading.Event | None = None,
                  jobs: dict[str, Callable] | None = None, tick_s: float = 5.0,
-                 engine_factory: Callable[[], Any] | None = None):
+                 engine_factory: Callable[[], Any] | None = None, events: Any = None):
         self.cfg = cfg
         self.db = db
         self.stop_event = stop_event or threading.Event()
         self.tick_s = float(tick_s)
+        self.events = events if events is not None else events_mod.NULL
+        #: set by notify_segment() (recorder thread) and by whoever wants the loop to look right now
+        self.wake = threading.Event()
+        self._wake_ids: deque[int] = deque()
+        self._wake_all = False
+        self._wake_lock = threading.Lock()
         #: held while a tick or a manually triggered job runs, so the web UI's "process now" and the
         #: periodic tick never work on the same segments at the same time
         self.lock = threading.RLock()
@@ -195,13 +250,28 @@ class Scheduler:
             "cleanup": jobs.get("cleanup") or self._default_cleanup,
             "daily": jobs.get("daily") or self._default_daily,
             "push": jobs.get("push") or self._default_push,     # fn(day) -> {channel: error|None}
+            "chain": jobs.get("chain") or self._default_chain,                  # fn() -> chain.run_chain result
+            "consolidate": jobs.get("consolidate") or self._default_consolidate,   # fn() -> dict
+            "brief": jobs.get("brief") or self._default_brief,                  # fn() -> dict
         }
+        self._process_injected = jobs.get("process") is not None
         self.runs: dict[str, int] = {"process": 0, "cleanup": 0, "daily": 0}
         self.errors: dict[str, int] = {"process": 0, "cleanup": 0, "daily": 0}
+        #: counters of the 1.0 work (kept apart from runs / errors, whose shape the status page relies on)
+        self.extra_runs: dict[str, int] = {"realtime": 0, "chain": 0, "consolidate": 0, "brief": 0}
+        self.extra_errors: dict[str, int] = {"realtime": 0, "chain": 0, "consolidate": 0, "brief": 0}
+        #: why the local heavy work is postponed right now (governor.defer_reason), or None
+        self.deferred: str | None = None
         self._daily_retry_after: datetime | None = None
         self._processor = None
+        self._proc_events = False        # the cached Processor publishes segment / utterances events itself
+        self._llm = None                 # the MiMo client shared by processor / daily / chain (rebuilt after a reload)
         self._vad = None
         self._client_warned = False
+        self._chain_sig: tuple[int, int, int] | None = None     # pending-work signature after the last chain run
+        self._chain_retry_at = 0.0
+        self._chain_probe: tuple[float, bool] = (0.0, False)
+        self._brief_warned = False
 
     # --- loop ---------------------------------------------------------------
     def run(self) -> None:
@@ -215,8 +285,34 @@ class Scheduler:
                 self.run_once()
             except Exception as e:  # noqa: BLE001  (never let the loop die)
                 log.exception("scheduler tick failed: %s", e)
-            stop_event.wait(self.tick_s)
+            self._sleep(stop_event)
         log.info("scheduler stopped")
+
+    def _sleep(self, stop_event: threading.Event) -> None:
+        """Wait for the next tick: returns at once when `wake` is set (a segment was just recorded), after
+        tick_s otherwise, and within WAKE_POLL_S of the stop event."""
+        deadline = time.monotonic() + self.tick_s
+        while not stop_event.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or self.wake.wait(min(remaining, WAKE_POLL_S)):
+                return
+
+    def notify_segment(self, seg_id: int | None = None) -> None:
+        """Called (from any thread; the recorder's, typically) when a segment was stored: the loop wakes up
+        and, with pipeline.realtime on, processes it right away. Without an id: "run `process` now"."""
+        with self._wake_lock:
+            if seg_id is None:
+                self._wake_all = True
+            else:
+                self._wake_ids.append(int(seg_id))
+        self.wake.set()
+
+    def _take_wake(self) -> tuple[list[int], bool]:
+        with self._wake_lock:
+            self.wake.clear()
+            ids, self._wake_ids = list(dict.fromkeys(self._wake_ids)), deque()
+            every, self._wake_all = self._wake_all, False
+        return ids, every
 
     def run_once(self, now: datetime | None = None) -> list[str]:
         """Run every job that is due at `now`. Returns the names of the jobs that ran."""
@@ -234,7 +330,10 @@ class Scheduler:
         """Pick up an edited config: the cached Processor (and its MiMo client) is rebuilt on next use."""
         self.cfg = cfg
         self._processor = None
+        self._llm = None
         self._client_warned = False
+        self._brief_warned = False
+        self._chain_sig = None
 
     def processor(self) -> Any | None:
         """The shared speech Processor, built on first use; None while no MiMo API key is configured."""
@@ -250,16 +349,43 @@ class Scheduler:
                     engine = self.engine_factory()
                 except Exception as e:  # noqa: BLE001 - the Processor builds its own when needed
                     log.warning("shared speaker engine unavailable (%s); processor builds its own", e)
-            self._processor = Processor(self.cfg, self.db, client, engine=engine, stop_event=self.stop_event)
+            extra: dict[str, Any] = {}
+            try:
+                # the split pipeline (package A4) may take the event bus; older Processors (and test doubles) do not
+                if "events" in inspect.signature(Processor).parameters:
+                    extra["events"] = self.events
+            except (TypeError, ValueError):
+                pass
+            self._proc_events = "events" in extra
+            self._processor = Processor(self.cfg, self.db, client, engine=engine, stop_event=self.stop_event, **extra)
         return self._processor
 
     def _run_once(self, now: datetime | None = None) -> list[str]:
         now = now or datetime.now()
         ran: list[str] = []
-        if is_due(self.db.get_kv(KV_PROCESS), float(self.cfg.pipeline.process_interval_min), now):
+        ids, every = self._take_wake()
+        deferred = self._defer()
+        fresh = False        # new sentences may have been written during this tick: the chain should look
+        chained = False
+        realtime = bool(self.cfg.pipeline.get("realtime", True))
+        if (every or (ids and realtime)) and not deferred and not self.stop_event.is_set():
+            if every or self._process_injected:
+                self._run_job("process", now)
+                ran.append("process")
+                fresh = True
+            else:
+                fresh = self._run_realtime(ids)
+        if "process" not in ran and not deferred \
+                and is_due(self.db.get_kv(KV_PROCESS), float(self.cfg.pipeline.process_interval_min), now):
             self._requeue_failed(now)
             self._run_job("process", now)
             ran.append("process")
+            fresh = True
+        if self.stop_event.is_set():
+            return ran
+        if fresh or self._chain_pending(now):
+            self._run_chain(now)
+            chained = True
         if self.stop_event.is_set():
             return ran
         if bool(self.cfg.storage.cleanup_enabled) and is_due(self.db.get_kv(KV_CLEANUP), float(self.cfg.storage.cleanup_interval_min), now):
@@ -267,22 +393,267 @@ class Scheduler:
             ran.append("cleanup")
         if self.stop_event.is_set():
             return ran
+        dailies = 0
         if self._daily_due(now):
             days = self._days_due(now)
-            if days and "process" not in ran:
+            if days and "process" not in ran and not deferred:
                 # transcribe what was recorded in the last minutes before summarising the day
                 self._run_job("process", now)
                 ran.append("process")
+                chained = False
+            if days and not chained and not self.stop_event.is_set():
+                self._run_chain(now)       # the digest reuses session summaries: bring them up to date first
             for day in days:
                 if self.stop_event.is_set():
                     break
                 if self._run_daily(day, now):
                     ran.append("daily")
+                    dailies += 1
         if not self.stop_event.is_set() and self._recheck_yesterday(now):
             ran.append("daily")
+            dailies += 1
+        if not self.stop_event.is_set() and self._rebuild_forgotten(now):
+            ran.append("daily")
+            dailies += 1
+        if dailies and not self.stop_event.is_set():
+            self._run_extra("consolidate")
         if not self.stop_event.is_set() and self._retry_pushes(now):
             ran.append("push")
+        if not self.stop_event.is_set() and self._brief_due(now):
+            self._run_extra("brief")
         return ran
+
+    # --- 1.0: deferral, realtime, chain, brief ------------------------------------------
+    def _defer(self) -> str | None:
+        """Ask the governor whether local heavy work should wait (on battery ...); remembers the answer for status()."""
+        try:
+            from . import governor
+
+            reason = governor.defer_reason(self.cfg)
+        except Exception as e:  # noqa: BLE001 - never let a power query stop the loop
+            log.debug("defer_reason failed: %s", e)
+            reason = None
+        if reason != self.deferred:
+            if reason:
+                log.info("local processing deferred: %s", reason)
+            else:
+                log.info("local processing resumed")
+            self.deferred = reason
+        return reason
+
+    def _max_utterance_id(self) -> int:
+        try:
+            row = self.db.one("SELECT COALESCE(MAX(id), 0) AS n FROM utterances")
+            return int(row["n"]) if row else 0
+        except sqlite3.Error:
+            return 0
+
+    def announce_new(self, since_id: int, seg_ids: Iterable[int] = ()) -> None:
+        """Publish what a process run produced, unless the Processor publishes its own events: one `segment`
+        event per segment touched and one `utterances` event per (day, segment) with the new sentence ids."""
+        if self._proc_events or self.events is events_mod.NULL:
+            return
+        try:
+            rows = self.db.query("SELECT id, day, segment_id FROM utterances WHERE id > ? ORDER BY id", (int(since_id),))
+            groups: dict[tuple[str, int], list[int]] = {}
+            for r in rows:
+                groups.setdefault((r["day"], int(r["segment_id"])), []).append(int(r["id"]))
+            touched = {int(i) for i in seg_ids} | {seg for _day, seg in groups}
+            for sid in sorted(touched):
+                seg = self.db.get_segment(sid)
+                if seg is not None:
+                    self.events.publish("segment", id=sid, status=seg["status"])
+            for (day, seg), utt_ids in groups.items():
+                self.events.publish("utterances", day=day, segment_id=seg, ids=utt_ids)
+        except Exception as e:  # noqa: BLE001 - events are best effort
+            log.debug("announce_new failed: %s", e)
+
+    def _requeue_stopped(self) -> int:
+        """Segments a stop request interrupted (stored as failed with db.STOPPED_ERROR) go back to 'new'."""
+        try:
+            n = self.db.requeue_stopped()
+        except Exception as e:  # noqa: BLE001 - e.g. the database is being closed
+            log.debug("requeue_stopped failed: %s", e)
+            return 0
+        if n:
+            log.info("%d segment(s) interrupted by a stop are queued again", n)
+        return n
+
+    def _run_realtime(self, ids: list[int]) -> bool:
+        """Process the segments the recorder just reported, without waiting for process_interval_min or
+        min_segment_age_s. Returns True when at least one segment went through the pipeline."""
+        proc = self.processor()
+        if proc is None:
+            return False                       # no API key: the periodic path reports that
+        fn = getattr(proc, "process_segment", None)
+        if not callable(fn):
+            return False
+        self._requeue_stopped()
+        since = self._max_utterance_id()
+        done: list[int] = []
+        t0 = time.monotonic()
+        for sid in ids:
+            if self.stop_event.is_set():
+                break
+            seg = self.db.get_segment(sid)
+            if seg is None or seg["status"] != "new":
+                continue                       # already handled (periodic run, manual job) or gone
+            done.append(sid)
+            try:
+                self.db.execute("UPDATE segments SET realtime=1 WHERE id=?", (sid,))
+                if not self._proc_events:
+                    self.events.publish("segment", id=sid, status="processing")
+                fn(sid)
+            except Exception as e:  # noqa: BLE001 - process_segment stored the error and logged the traceback
+                if self.stop_event.is_set() or str(e) == "stopped":
+                    # a stop request cut it short (pipeline: Stopped / RuntimeError("stopped")): not a failure,
+                    # the segment is (or is about to be put) back to 'new'
+                    log.info("segment #%d: stop requested during realtime processing", sid)
+                    break
+                self.extra_errors["realtime"] += 1
+                log.error("segment #%d failed (realtime): %s", sid, e)
+        self._requeue_stopped()
+        if not done:
+            return False
+        self.extra_runs["realtime"] += 1
+        self.announce_new(since, done)
+        log.info("realtime: %d segment(s) processed in %.1fs", len(done), time.monotonic() - t0)
+        return True
+
+    def _session_gap_min(self) -> float:
+        try:
+            return float(self.cfg.memory.get("session_gap_min", DEFAULT_SESSION_GAP_MIN))
+        except (TypeError, ValueError, AttributeError):
+            return DEFAULT_SESSION_GAP_MIN
+
+    def _chain_installed(self) -> bool:
+        t, ok = self._chain_probe
+        if time.monotonic() - t < CHAIN_PROBE_S and t:
+            return ok
+        try:
+            from . import chain
+
+            ok = chain.has_steps()
+        except Exception:  # noqa: BLE001
+            ok = False
+        self._chain_probe = (time.monotonic(), ok)
+        return ok
+
+    def _chain_signature(self, now: datetime) -> tuple[int, int, int] | None:
+        """(sentences without a session, open sessions whose gap has passed, closed sessions still to refine or
+        digest), or None when nothing is waiting."""
+        try:
+            cutoff = (now - timedelta(minutes=self._session_gap_min())).isoformat(timespec="seconds")
+            a = int(self.db.one("SELECT COUNT(*) AS n FROM utterances WHERE session_id IS NULL")["n"])
+            b = int(self.db.one("SELECT COUNT(*) AS n FROM sessions WHERE status='open' AND replace(ended_at, ' ', 'T') <= ?",
+                                (cutoff,))["n"])
+            c = int(self.db.one("SELECT COUNT(*) AS n FROM sessions WHERE status='closed' AND ("
+                                " COALESCE(refined_hash, '') <> COALESCE(raw_hash, '')"
+                                " OR COALESCE(digested_hash, '') <> COALESCE(text_hash, ''))")["n"])
+        except sqlite3.Error as e:
+            log.debug("chain signature unavailable: %s", e)
+            return None
+        return (a, b, c) if (a or b or c) else None
+
+    def _chain_pending(self, now: datetime) -> bool:
+        """True when the chain has something to do and is not backing off: work that did not shrink since the
+        last run (no API key, a step that keeps failing) is only tried again after CHAIN_RETRY_S."""
+        if self.jobs["chain"] == self._default_chain and not self._chain_installed():
+            return False
+        sig = self._chain_signature(now)
+        if sig is None:
+            self._chain_sig = None
+            return False
+        if sig == self._chain_sig and time.monotonic() < self._chain_retry_at:
+            return False
+        return True
+
+    def _run_chain(self, now: datetime) -> Any:
+        """Run the post-processing chain once (never raises)."""
+        if self.jobs["chain"] == self._default_chain and not self._chain_installed():
+            return None
+        started = now_iso()
+        t0 = time.monotonic()
+        try:
+            res = self.jobs["chain"]()
+        except Exception as e:  # noqa: BLE001
+            self.extra_errors["chain"] += 1
+            log.exception("chain failed: %s", e)
+            self._job_event("chain", "failed", started, error=f"{type(e).__name__}: {e}")
+            res = None
+        else:
+            self.extra_runs["chain"] += 1
+            if not _is_noop_result("chain", res):
+                log.info("chain done in %.1fs: %s", time.monotonic() - t0, res)
+                self._job_event("chain", "done", started, result=res)
+        # remember what is still waiting: the same picture next tick means "no progress", so back off
+        self._chain_sig = self._chain_signature(now)
+        self._chain_retry_at = time.monotonic() + CHAIN_RETRY_S
+        return res
+
+    def _run_extra(self, name: str) -> Any:
+        """Run consolidate / brief (never raises; a feature that is not installed is skipped quietly)."""
+        from . import chain
+
+        started = now_iso()
+        t0 = time.monotonic()
+        try:
+            res = self.jobs[name]()
+        except chain.StepUnavailable as e:
+            log.debug("%s skipped: %s", name, e)
+            return None
+        except Exception as e:  # noqa: BLE001
+            self.extra_errors[name] += 1
+            log.exception("%s failed: %s", name, e)
+            self._job_event(name, "failed", started, error=f"{type(e).__name__}: {e}")
+            return None
+        self.extra_runs[name] += 1
+        log.info("%s done in %.1fs: %s", name, time.monotonic() - t0, res)
+        self._job_event(name, "done", started, result=res)
+        return res
+
+    def _brief_due(self, now: datetime) -> bool:
+        """Once a day, from analysis.brief_time on ('' = off; the key arrives with the memory package). The day
+        is stamped before the brief runs, so a failing brief is not retried on every tick."""
+        try:
+            hhmm = str(self.cfg.analysis.get("brief_time", "") or "").strip()
+        except AttributeError:
+            return False
+        if not hhmm:
+            return False
+        try:
+            h, m = parse_hhmm(hhmm)
+        except ValueError as e:
+            if not self._brief_warned:
+                log.error("analysis.brief_time invalid: %s", e)
+                self._brief_warned = True
+            return False
+        today = now.date().isoformat()
+        if str(self.db.get_kv(KV_BRIEF_DAY) or "") >= today:
+            return False
+        due = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        if now < due:
+            return False
+        self.db.set_kv(KV_BRIEF_DAY, today)
+        if now - due > timedelta(hours=BRIEF_WINDOW_H):
+            log.info("morning brief for %s skipped: more than %.0f h late", today, BRIEF_WINDOW_H)
+            return False
+        return True
+
+    def _job_event(self, name: str, state: str, started_at: str | None = None, result: Any = None,
+                   error: str | None = None, source: str = "scheduler") -> None:
+        """Publish a `job` event and, for a finished run worth keeping, write the job_runs row. Never raises."""
+        try:
+            data: dict[str, Any] = {"name": name, "state": state, "source": source}
+            if result is not None:
+                data["result"] = _jsonable(result)
+            if error is not None:
+                data["error"] = error
+            self.events.publish("job", **data)
+            if state in ("done", "failed") and started_at and not (state == "done" and _is_noop_result(name, result)):
+                self.db.add_job_run(name, source, state, started_at, _jsonable(result) if result is not None else None, error)
+        except Exception as e:  # noqa: BLE001 - history / events never break a job
+            log.debug("job event %s/%s not recorded: %s", name, state, e)
 
     # --- due-time helpers -----------------------------------------------------
     def _catchup_days(self) -> int:
@@ -343,13 +714,26 @@ class Scheduler:
         # record the attempt first so a crashing job still backs off to the interval
         self.db.set_kv(key, now.isoformat(timespec="seconds"))
         t0 = time.monotonic()
+        started = now_iso()
+        since = 0
+        if name == "process":
+            self._requeue_stopped()
+            since = self._max_utterance_id()
+        self._job_event(name, "running")
         try:
             result = self.jobs[name]()
             self.runs[name] += 1
             log.info("job %s done in %.1fs%s", name, time.monotonic() - t0, f": {result}" if result is not None else "")
+            self._job_event(name, "done", started, result=result)
         except Exception as e:  # noqa: BLE001
             self.errors[name] += 1
             log.exception("job %s failed: %s", name, e)
+            self._job_event(name, "failed", started, error=f"{type(e).__name__}: {e}")
+        finally:
+            if name == "process":
+                # a stop request in the middle of a segment leaves it 'failed: stopped': that is not a failure
+                self._requeue_stopped()
+                self.announce_new(since)
 
     def _daily_due(self, now: datetime) -> bool:
         if self._daily_retry_after is not None and now < self._daily_retry_after:
@@ -360,6 +744,39 @@ class Scheduler:
             log.error("analysis.daily_time invalid: %s", e)
             self._daily_retry_after = now + timedelta(hours=1)
             return False
+
+    def _rebuild_forgotten(self, now: datetime) -> bool:
+        """memory.forget removes the digest of every day it touched (it may quote what was forgotten) and lists the
+        day under KV_REBUILD_DAYS: write that digest again from what is left, one day per tick, never pushed.
+        A day with nothing left just leaves the list; a failure waits like any daily retry."""
+        if self._daily_retry_after is not None and now < self._daily_retry_after:
+            return False
+        try:
+            from .memory.forget import KV_REBUILD_DAYS
+        except ImportError:
+            return False
+        days = [str(d) for d in (self.db.get_kv(KV_REBUILD_DAYS, []) or [])]
+        if not days:
+            return False
+        day, rest = days[0], days[1:]
+        if self.db.one("SELECT 1 FROM utterances WHERE day=? LIMIT 1", (day,)) is None:
+            self.db.set_kv(KV_REBUILD_DAYS, rest)
+            return False
+        started = now_iso()
+        self._job_event("daily", "running")
+        try:
+            self.jobs["daily"](day, False)
+        except Exception as e:  # noqa: BLE001
+            self.errors["daily"] += 1
+            self._daily_retry_after = now + timedelta(minutes=DAILY_RETRY_MIN)
+            log.warning("digest of %s (rebuilt after forgetting) failed, retry in %.0f min: %s", day, DAILY_RETRY_MIN, e)
+            self._job_event("daily", "failed", started, error=f"{type(e).__name__}: {e}")
+            return False
+        self.db.set_kv(KV_REBUILD_DAYS, [d for d in (self.db.get_kv(KV_REBUILD_DAYS, []) or []) if str(d) != day])
+        self._job_event("daily", "done", started, result={"day": day, "rebuilt": True})
+        self.events.publish("daily", day=day)
+        log.info("digest of %s written again after forgetting part of it", day)
+        return True
 
     def _run_daily(self, day: str, now: datetime) -> bool:
         push = bool(self.cfg.analysis.push_daily)
@@ -377,13 +794,18 @@ class Scheduler:
             self._mark_daily(day, now)
             return False
         t0 = time.monotonic()
+        started = now_iso()
+        self._job_event("daily", "running")
         try:
             res = self.jobs["daily"](day, push)
         except Exception as e:  # noqa: BLE001
             self.errors["daily"] += 1
             self._daily_retry_after = now + timedelta(minutes=DAILY_RETRY_MIN)
             log.exception("daily %s failed (retry in %.0f min): %s", day, DAILY_RETRY_MIN, e)
+            self._job_event("daily", "failed", started, error=f"{type(e).__name__}: {e}")
             return False
+        self._job_event("daily", "done", started, result={"day": day, "partial": _result_is_partial(res)})
+        self.events.publish("daily", day=day)
         if _result_is_partial(res):
             # some blocks failed in the map stage: the digest is on disk (flagged) but the day is not
             # done; regenerate after a pause, a bounded number of times
@@ -492,15 +914,58 @@ class Scheduler:
 
     # --- default jobs (lazy imports: sibling modules may not exist yet) ------
     def _client(self):
+        """The scheduler's MiMo client (one per configuration, with usage accounting); None without an API key."""
+        if self._llm is not None:
+            return self._llm
         from .llm.client import MimoClient, MissingAPIKey
 
         try:
-            return MimoClient(self.cfg, rpm=int(self.cfg.mimo.rpm))
+            client = MimoClient(self.cfg, rpm=int(self.cfg.mimo.rpm))
         except MissingAPIKey as e:
             if not self._client_warned:
                 log.warning("%s -- processing/daily jobs are skipped until a key is configured", e)
                 self._client_warned = True
             return None
+        from . import metrics
+
+        metrics.install(client, self.db)
+        self._llm = client
+        return client
+
+    def _client_quiet(self):
+        """_client() for optional work (the chain): a missing key is not worth a warning of its own."""
+        warned, self._client_warned = self._client_warned, True
+        try:
+            return self._client()
+        finally:
+            self._client_warned = warned
+
+    def _chain_stop(self) -> Any:
+        """What the chain's steps see as their stop event. With realtime processing on, a segment arriving
+        from the recorder also ends the chain early (between two items of a step): the chain holds the
+        scheduler lock, and a session being refined must not keep a fresh recording waiting. The next tick
+        processes the segment and then runs the chain again."""
+        if bool(self.cfg.pipeline.get("realtime", True)) and not self._process_injected and self._defer() is None:
+            return _EitherEvent(self.stop_event, self.wake)
+        return self.stop_event
+
+    def _default_chain(self):
+        from . import chain
+
+        return chain.run_chain(self.cfg, self.db, self._client_quiet, stop_event=self._chain_stop(), events=self.events,
+                               limit=CHAIN_LIMIT)
+
+    def _default_consolidate(self):
+        from . import chain
+
+        return chain.call_step(chain.CONSOLIDATE, self.cfg, self.db, self._client_quiet(), name="consolidate",
+                               stop_event=self.stop_event, events=self.events)
+
+    def _default_brief(self):
+        from . import chain
+
+        return chain.call_step(chain.BRIEF, self.cfg, self.db, self._client_quiet(), name="brief",
+                               stop_event=self.stop_event, events=self.events)
 
     def _default_process(self):
         proc = self.processor()
@@ -534,7 +999,7 @@ class Scheduler:
             raise RuntimeError("no MiMo API key")
         from .analysis.daily import DailyAnalyzer
 
-        analyzer = DailyAnalyzer(self.cfg, self.db, client)
+        analyzer = DailyAnalyzer(self.cfg, self.db, _scoped(client, "daily"))
         result = analyzer.run(day)
         if push:
             if analyzer.last_run_cached and self._already_pushed(day):
@@ -550,7 +1015,7 @@ class Scheduler:
         try:
             from .analysis.relations import maybe_infer_after_daily
 
-            maybe_infer_after_daily(self.cfg, self.db, client)
+            maybe_infer_after_daily(self.cfg, self.db, _scoped(client, "relations"))
         except Exception as e:  # noqa: BLE001  (relation inference is best effort)
             log.warning("relation inference after daily %s failed: %s", day, e)
         return result
@@ -560,6 +1025,36 @@ class Scheduler:
         from .analysis.daily import DailyAnalyzer
 
         return DailyAnalyzer(self.cfg, self.db, None).push(day)
+
+
+class _EitherEvent:
+    """Read-only view over several threading.Event objects: set as soon as one of them is."""
+
+    def __init__(self, *events: threading.Event):
+        self._events = events
+
+    def is_set(self) -> bool:
+        return any(e.is_set() for e in self._events)
+
+    def wait(self, timeout: float | None = None) -> bool:
+        deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
+        while not self.is_set():
+            left = None if deadline is None else deadline - time.monotonic()
+            if left is not None and left <= 0:
+                return False
+            self._events[0].wait(0.05 if left is None else min(0.05, left))
+        return True
+
+
+def _scoped(client: Any, purpose: str) -> Any:
+    """client.scoped(purpose) when the client can tag its usage (MimoClient), the client itself otherwise."""
+    fn = getattr(client, "scoped", None)
+    if callable(fn):
+        try:
+            return fn(purpose)
+        except Exception:  # noqa: BLE001
+            return client
+    return client
 
 
 def run_scheduler(cfg: Config, db: DB, stop_event: threading.Event | None = None,
@@ -573,5 +1068,5 @@ __all__: Iterable[str] = (
     "Scheduler", "run_scheduler", "parse_hhmm", "next_daily_due", "is_due", "daily_days_due",
     "requeue_transient_failures",
     "KV_PROCESS", "KV_CLEANUP", "KV_DAILY_DAY", "KV_DAILY_AT", "KV_DAILY_RECHECK",
-    "KV_FAILED_REQUEUE_AT", "KV_FAILED_ATTEMPTS", "KV_PUSH_PENDING", "KV_DAILY_PARTIAL",
+    "KV_FAILED_REQUEUE_AT", "KV_FAILED_ATTEMPTS", "KV_PUSH_PENDING", "KV_DAILY_PARTIAL", "KV_BRIEF_DAY",
 )

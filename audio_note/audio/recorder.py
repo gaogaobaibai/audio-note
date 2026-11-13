@@ -31,6 +31,7 @@ from typing import Any
 
 import numpy as np
 
+from .. import events as events_mod
 from ..config import Config
 from ..db import DB
 from .capture import MicCapture, open_capture
@@ -73,6 +74,10 @@ class Recorder:
         self._recover_vad: SileroVAD | None = None   # separate instance: recovery must not reset the live VAD state
         self.partials_recovered = 0
         self.capture: Any = None                  # the open MicCapture / MixedCapture while run() is inside it
+        #: event bus for `segment` / `recording` events (the service sets it; NULL drops everything)
+        self.events: Any = events_mod.NULL
+        #: called with the segment id right after a segment was stored (the service wakes its scheduler with it)
+        self.on_segment: Any = None
         # (start sample, n samples, mic_rms, system_rms) per delivered block, oldest first; only while mixing
         self._channels: deque[tuple[int, int, float, float]] = deque()
 
@@ -82,6 +87,27 @@ class Recorder:
         return self.stream_t0 + timedelta(seconds=sample / SAMPLE_RATE)
 
     def run(self) -> None:
+        """Record until the stop event is set. While it runs, the calling thread is raised above the process's
+        (possibly below-normal, see performance.background_priority) priority so capture never starves."""
+        boosted = False
+        try:
+            from .. import governor
+
+            if bool((self.cfg.get("performance") or {}).get("background_priority", False)):
+                governor.boost_current_thread()
+                boosted = True
+        except Exception as e:  # noqa: BLE001 - priorities are a nicety
+            log.debug("recorder thread priority not raised: %s", e)
+        try:
+            self._run()
+        finally:
+            if boosted:
+                try:
+                    governor.restore_current_thread()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def _run(self) -> None:
         cfg = self.cfg
         cfg.ensure_dirs()
         recover_partials(cfg, self.db, self.vad)
@@ -148,7 +174,9 @@ class Recorder:
                 self._abandon_partial()
         for seg in segs:
             self._emit(seg)
-        self.is_speaking = self.gate.active
+        if self.gate.active != self.is_speaking:
+            self.is_speaking = self.gate.active
+            self.events.publish("recording", on=True, speaking=bool(self.is_speaking))
 
     # --- channel levels (mic + system audio) -----------------------------------
     def _note_channels(self, pair: Any, n: int) -> None:
@@ -282,6 +310,22 @@ class Recorder:
         if seg_id is not None:
             self.segments_written += 1
             self.speech_total_s += seg.speech_s
+            self._announce(seg_id, started, seg)
+
+    def _announce(self, seg_id: int, started: datetime, seg: Any) -> None:
+        """Tell the page (a `segment` event) and the scheduler (on_segment) that a segment is ready.
+        Neither may ever disturb the recording."""
+        try:
+            self.events.publish("segment", id=int(seg_id), status="new", day=started.strftime("%Y-%m-%d"),
+                                duration_s=round(len(seg.audio) / SAMPLE_RATE, 2), speech_s=round(float(seg.speech_s), 2))
+        except Exception as e:  # noqa: BLE001
+            log.debug("segment event not published: %s", e)
+        cb = self.on_segment
+        if cb is not None:
+            try:
+                cb(int(seg_id))
+            except Exception as e:  # noqa: BLE001
+                log.debug("on_segment callback failed: %s", e)
 
 
 def run_recorder(cfg: Config, db: DB, stop_event: threading.Event | None = None) -> Recorder:

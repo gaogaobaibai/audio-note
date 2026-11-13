@@ -206,8 +206,9 @@ def test_tools_transcript_summary_days_speakers_notes(db, cfg):
     assert "张三" in out and "李四" in out and "同事" in out and "未知" in out and "1 条" in out
 
     assert "没有找到" in run_tool("search_notes", {"query": "预算"}, db, cfg)
-    db.execute("INSERT INTO memory_notes(kind, title, content, day_from, day_to) VALUES (?,?,?,?,?)",
-               ("todo", "确认预算", "和王总开会前确认预算数字", "2026-10-30", "2026-10-30"))
+    from audio_note.memory import items   # 1.0: the tool reads memory_items (memory_notes is no longer used)
+
+    items.upsert(db, cfg, {"kind": "todo", "title": "确认预算", "content": "和王总开会前确认预算数字", "day": "2026-10-30"})
     out = run_tool("search_notes", {"query": "预算", "kind": "todo"}, db, cfg)
     assert "[todo] 确认预算 (2026-10-30)" in out
     assert "没有找到" in run_tool("search_notes", {"query": "预算", "kind": "person"}, db, cfg)

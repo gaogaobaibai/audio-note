@@ -1,0 +1,218 @@
+/* audio-note design tokens — "安静的日记本".
+   Light values live on :root; the dark block appears twice on purpose (explicit [data-theme="dark"] and the OS
+   preference when no explicit theme is set) and tests/test_v1_frontend.py checks that both copies are identical
+   and that every text token keeps a contrast of at least 4.5:1 on the surfaces it is used on. */
+:root {
+  color-scheme: light;
+  /* surfaces */
+  --bg: #F6F5F1;
+  --surface: #FFFFFF;
+  --surface-2: #F0EEE8;
+  --surface-3: #E8E5DC;
+  --line: #E4E1D9;
+  --line-strong: #C2BDB1;
+  /* text */
+  --text: #1F1E1B;
+  --text-2: #5E5B54;
+  --text-3: #68645B;
+  /* accent (indigo) */
+  --accent: #3A56D4;
+  --accent-hover: #2F47B8;
+  --on-accent: #FFFFFF;
+  --accent-soft: #E9EDFB;
+  --accent-text: #2F47B8;
+  /* recording */
+  --rec: #BE3B1B;
+  --on-rec: #FFFFFF;
+  --rec-soft: #FBE9E4;
+  --rec-text: #A83418;
+  /* status */
+  --ok: #2A7354;
+  --on-ok: #FFFFFF;
+  --ok-soft: #E3F2EA;
+  --ok-text: #1F5C42;
+  --warn: #8F5E0C;
+  --on-warn: #FFFFFF;
+  --warn-soft: #FAF0D9;
+  --warn-text: #7A4F08;
+  --danger: #BF3535;
+  --on-danger: #FFFFFF;
+  --danger-soft: #FBE8E7;
+  --danger-text: #A32B2B;
+  /* speakers: 12 ink / tint pairs, assigned by speaker id (see js/ui/speaker.js) */
+  --spk-0: #1D4ED8;  --spk-0-bg: #DBE7FE;
+  --spk-1: #047857;  --spk-1-bg: #D3F5E4;
+  --spk-2: #A8500A;  --spk-2-bg: #FDF0C8;
+  --spk-3: #6D28D9;  --spk-3-bg: #ECE7FD;
+  --spk-4: #0E7490;  --spk-4-bg: #D2F5FA;
+  --spk-5: #BE185D;  --spk-5-bg: #FCE4F0;
+  --spk-6: #44700C;  --spk-6-bg: #EAF8CE;
+  --spk-7: #B23A09;  --spk-7-bg: #FFE9D2;
+  --spk-8: #0F766E;  --spk-8-bg: #CFF7EE;
+  --spk-9: #BE123C;  --spk-9-bg: #FFE2E5;
+  --spk-10: #4338CA; --spk-10-bg: #E2E6FE;
+  --spk-11: #A21CAF; --spk-11-bg: #F8E6FD;
+  /* elevation */
+  --shadow-1: 0 1px 2px rgba(31, 30, 27, .05), 0 1px 1px rgba(31, 30, 27, .03);
+  --shadow-2: 0 6px 20px rgba(31, 30, 27, .10), 0 1px 3px rgba(31, 30, 27, .06);
+  --shadow-3: 0 18px 48px rgba(31, 30, 27, .18), 0 2px 8px rgba(31, 30, 27, .08);
+  --scrim: rgba(31, 30, 27, .38);
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #151513;
+  --surface: #1E1D1B;
+  --surface-2: #262522;
+  --surface-3: #302E2B;
+  --line: #34322E;
+  --line-strong: #4A4742;
+  --text: #ECEAE4;
+  --text-2: #B3AFA6;
+  --text-3: #9D998F;
+  --accent: #8DA2FF;
+  --accent-hover: #A5B5FF;
+  --on-accent: #12162B;
+  --accent-soft: #252B49;
+  --accent-text: #A9B8FF;
+  --rec: #F0704F;
+  --on-rec: #2A0E06;
+  --rec-soft: #3F1F17;
+  --rec-text: #FF9C82;
+  --ok: #5DC596;
+  --on-ok: #06241A;
+  --ok-soft: #1B3229;
+  --ok-text: #7FD8AE;
+  --warn: #E0B050;
+  --on-warn: #2A1D03;
+  --warn-soft: #3A2E14;
+  --warn-text: #EBC477;
+  --danger: #F0807A;
+  --on-danger: #2B0A0A;
+  --danger-soft: #3F1E1D;
+  --danger-text: #FFA19B;
+  --spk-0: #93C5FD;  --spk-0-bg: #1E3A5F;
+  --spk-1: #6EE7B7;  --spk-1-bg: #0B4636;
+  --spk-2: #FCD34D;  --spk-2-bg: #4A3410;
+  --spk-3: #C4B5FD;  --spk-3-bg: #3B2A6B;
+  --spk-4: #67E8F9;  --spk-4-bg: #164E63;
+  --spk-5: #F9A8D4;  --spk-5-bg: #5B1F3F;
+  --spk-6: #BEF264;  --spk-6-bg: #2F4410;
+  --spk-7: #FDBA74;  --spk-7-bg: #5A2A10;
+  --spk-8: #5EEAD4;  --spk-8-bg: #134E4A;
+  --spk-9: #FDA4AF;  --spk-9-bg: #5C1A2A;
+  --spk-10: #A5B4FC; --spk-10-bg: #2E2F6B;
+  --spk-11: #F0ABFC; --spk-11-bg: #4F1D57;
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, .35);
+  --shadow-2: 0 8px 24px rgba(0, 0, 0, .45), 0 1px 3px rgba(0, 0, 0, .3);
+  --shadow-3: 0 20px 56px rgba(0, 0, 0, .6), 0 2px 8px rgba(0, 0, 0, .35);
+  --scrim: rgba(0, 0, 0, .55);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #151513;
+    --surface: #1E1D1B;
+    --surface-2: #262522;
+    --surface-3: #302E2B;
+    --line: #34322E;
+    --line-strong: #4A4742;
+    --text: #ECEAE4;
+    --text-2: #B3AFA6;
+    --text-3: #9D998F;
+    --accent: #8DA2FF;
+    --accent-hover: #A5B5FF;
+    --on-accent: #12162B;
+    --accent-soft: #252B49;
+    --accent-text: #A9B8FF;
+    --rec: #F0704F;
+    --on-rec: #2A0E06;
+    --rec-soft: #3F1F17;
+    --rec-text: #FF9C82;
+    --ok: #5DC596;
+    --on-ok: #06241A;
+    --ok-soft: #1B3229;
+    --ok-text: #7FD8AE;
+    --warn: #E0B050;
+    --on-warn: #2A1D03;
+    --warn-soft: #3A2E14;
+    --warn-text: #EBC477;
+    --danger: #F0807A;
+    --on-danger: #2B0A0A;
+    --danger-soft: #3F1E1D;
+    --danger-text: #FFA19B;
+    --spk-0: #93C5FD;  --spk-0-bg: #1E3A5F;
+    --spk-1: #6EE7B7;  --spk-1-bg: #0B4636;
+    --spk-2: #FCD34D;  --spk-2-bg: #4A3410;
+    --spk-3: #C4B5FD;  --spk-3-bg: #3B2A6B;
+    --spk-4: #67E8F9;  --spk-4-bg: #164E63;
+    --spk-5: #F9A8D4;  --spk-5-bg: #5B1F3F;
+    --spk-6: #BEF264;  --spk-6-bg: #2F4410;
+    --spk-7: #FDBA74;  --spk-7-bg: #5A2A10;
+    --spk-8: #5EEAD4;  --spk-8-bg: #134E4A;
+    --spk-9: #FDA4AF;  --spk-9-bg: #5C1A2A;
+    --spk-10: #A5B4FC; --spk-10-bg: #2E2F6B;
+    --spk-11: #F0ABFC; --spk-11-bg: #4F1D57;
+    --shadow-1: 0 1px 2px rgba(0, 0, 0, .35);
+    --shadow-2: 0 8px 24px rgba(0, 0, 0, .45), 0 1px 3px rgba(0, 0, 0, .3);
+    --shadow-3: 0 20px 56px rgba(0, 0, 0, .6), 0 2px 8px rgba(0, 0, 0, .35);
+    --scrim: rgba(0, 0, 0, .55);
+  }
+}
+
+/* theme-independent scales */
+:root {
+  --font: "Segoe UI Variable Text", "Segoe UI", "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
+  --mono: ui-monospace, "Cascadia Mono", Consolas, "SF Mono", Menlo, monospace;
+  /* type: 12 / 13 / 14 / 15 (reading) / 17 / 20 / 28 */
+  --fs-xs: 12px;
+  --fs-sm: 13px;
+  --fs-md: 14px;
+  --fs-read: 15px;
+  --fs-lg: 17px;
+  --fs-xl: 20px;
+  --fs-2xl: 28px;
+  --lh-tight: 1.3;
+  --lh: 1.55;
+  --lh-read: 1.7;
+  /* space: 4 / 8 / 12 / 16 / 24 / 32 / 48 */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+  --sp-6: 32px;
+  --sp-7: 48px;
+  /* shape */
+  --r-sm: 6px;
+  --r-md: 10px;
+  --r-lg: 14px;
+  --r-full: 999px;
+  /* layout */
+  --rail-w: 232px;
+  --rail-w-collapsed: 64px;
+  --topbar-h: 56px;
+  --tabbar-h: 58px;
+  --content-max: 1120px;
+  --read-max: 760px;
+  --hit: 32px;
+  /* motion */
+  --dur-1: 120ms;
+  --dur-2: 180ms;
+  --ease: cubic-bezier(.2, .7, .3, 1);
+  /* layers */
+  --z-bar: 20;
+  --z-rail: 30;
+  --z-player: 35;
+  --z-drawer: 40;
+  --z-modal: 50;
+  --z-palette: 60;
+  --z-pop: 70;
+  --z-toast: 80;
+  --focus: 0 0 0 2px var(--surface), 0 0 0 4px var(--accent);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root { --dur-1: 0ms; --dur-2: 0ms; }
+}

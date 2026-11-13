@@ -38,7 +38,7 @@ UNSURE = "不确定"
 
 MAX_EVIDENCE = 60          # utterances of the speaker handed to the model
 MAX_LINE_CHARS = 200       # one utterance line in the evidence
-MAX_NOTE_CHARS = 600       # person notes from memory_notes
+MAX_NOTE_CHARS = 600       # person items from memory_items
 KV_PREFIX = RELATION_KV_PREFIX     # "relation_inferred_n:"
 CACHE_GROWTH = 1.5         # re-infer only once the utterance count grew this much
 DEFAULT_MIN_UTTERANCES = 15
@@ -200,14 +200,13 @@ def build_evidence(db: Any, sid: int, *, unknown: str, max_items: int = MAX_EVID
 
 
 def person_notes(db: Any, name: str) -> str:
-    """Content of the daily analysis's person notes for this name ('' when none)."""
-    rows = db.query("SELECT content, day_from, day_to FROM memory_notes WHERE kind='person' AND title=? ORDER BY updated_at DESC, id DESC",
-                    (name,))
+    """Content of the memory items about this person ('' when none): the dated lines the digests collected."""
+    rows = db.query("SELECT content, valid_from, day FROM memory_items WHERE kind='person' AND status='active'"
+                    " AND (title=? OR subject=?) ORDER BY updated_at DESC, id DESC", (name, name))
     parts: list[str] = []
     for r in rows:
-        span = str(r["day_from"] or "")
-        if r["day_to"] and r["day_to"] != r["day_from"]:
-            span += f"~{r['day_to']}"
+        first, last = str(r["valid_from"] or r["day"] or ""), str(r["day"] or "")
+        span = first + (f"~{last}" if last and last != first else "")
         content = " ".join(str(r["content"] or "").split())
         if content:
             parts.append(f"{content}" + (f"（{span}）" if span and span not in content else ""))

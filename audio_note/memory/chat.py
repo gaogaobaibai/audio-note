@@ -111,17 +111,24 @@ class MemoryChat:
 
     def prefetch(self, question: str, k: int | None = None) -> str:
         """Retriever hits for the question, formatted for the system prompt ('' when nothing found).
-        A relative date in the question ("昨天晚上", "上周三") becomes a day filter: those hits come
-        first, a global search fills the rest."""
+        The time a question names ("昨天晚上", "上周三", "中午") narrows the search to that day range and part
+        of the day (Retriever.search_question): those hits come first, a global search fills the rest."""
         k = k or self.prefetch_k
+        when = None
         try:
-            span = temporal.parse_range(question, self.now or datetime.now())
-            res = self.retriever.search(question, limit=k)
-            hits = list(res.hits)
-            if span:
-                scoped = self.retriever.search(question, day_from=span[0], day_to=span[1], limit=k)
-                if scoped.hits:
-                    hits = rrf_fuse([scoped.hits, hits], self.retriever.rrf_k, [1.0, 0.5])[:k]
+            ask = getattr(self.retriever, "search_question", None)
+            if callable(ask):      # the retriever reads the time the question names (day and part of the day)
+                res = ask(question, now=self.now or datetime.now(), limit=k)
+                hits, when = list(res.hits), res.when
+            else:                  # a minimal stand-in retriever (tests): the day range only
+                span = temporal.parse_range(question, self.now or datetime.now())
+                res = self.retriever.search(question, limit=k)
+                hits = list(res.hits)
+                if span:
+                    when = temporal.When(span[0], span[1])
+                    scoped = self.retriever.search(question, day_from=span[0], day_to=span[1], limit=k)
+                    if scoped.hits:
+                        hits = rrf_fuse([scoped.hits, hits], self.retriever.rrf_k, [1.0, 0.5])[:k]
         except Exception as e:  # noqa: BLE001 - never block the answer on retrieval
             log.warning("prefetch failed: %s", e)
             return ""
@@ -132,40 +139,29 @@ class MemoryChat:
         note = f"（{res.how_label}"
         if res.expansions:
             note += "，扩展词：" + "、".join(res.expansions)
-        if span:
-            note += "，问题里的日期按 " + (span[0] if span[0] == span[1] else f"{span[0]}~{span[1]}") + " 优先"
+        if when is not None:
+            note += "，问题里的日期按 " + when.label + " 优先"
         out = note + "）\n" + "\n".join(lines)
         if notes:
             out += "\n\n相关记忆笔记（每日分析整理，可能过时，以记录为准）：\n" + "\n".join(notes)
         return out
 
     def related_notes(self, question: str, limit: int = 3) -> list[str]:
-        """memory_notes (decisions / todos / people / facts from the daily analysis) whose title or
-        content contains a content token of the question; newest first."""
-        toks = index.content_tokens(index.tokenize(question).split())
-        toks = [t for t in toks if len(t) > 1][:8]
-        if not toks:
+        """Memory items (decisions / todos / people / facts ...) about the question, best first, one line each.
+        Keyword match on the question's content words, plus vector neighbours when the retriever's embedding
+        model is already loaded (the prefetch search loaded it). A question without content words gets none."""
+        from . import items as mem_items
+
+        if not index.query_terms(question):
             return []
-        where = " OR ".join("(title LIKE ? OR content LIKE ?)" for _ in toks)
-        params: list[str] = []
-        for t in toks:
-            pat = "%" + t.replace("%", "").replace("_", "") + "%"
-            params += [pat, pat]
+        loaded = getattr(self.retriever, "loaded_embedder", None)
         try:
-            rows = self.db.query(
-                f"SELECT kind, title, content, day_from, day_to FROM memory_notes WHERE {where}"
-                " ORDER BY updated_at DESC, id DESC LIMIT ?", [*params, int(limit)])
+            rows = mem_items.search(self.db, self.cfg, question, status=("active",), limit=int(limit),
+                                    embedder=loaded() if callable(loaded) else None, now=self.now)
         except Exception as e:  # noqa: BLE001
             log.debug("related_notes failed: %s", e)
             return []
-        out = []
-        for r in rows:
-            span = r["day_from"] or ""
-            if r["day_to"] and r["day_to"] != r["day_from"]:
-                span += f"~{r['day_to']}"
-            content = " ".join((r["content"] or "").split())[:200]
-            out.append(f"[{r['kind']}] {r['title']}{(' (' + span + ')') if span else ''}: {content}")
-        return out
+        return [mem_items.format_line(r) for r in rows]
 
     # --- agentic loop -----------------------------------------------------------
     def ask(self, question: str, history: list[dict[str, Any]] | None = None) -> str:

@@ -87,7 +87,9 @@ def e2e_cfg(cfg_factory, tmp_path: Path):
         "audio": {"min_silence_s": 1.0},            # 272 s sample -> ~29 segments (2.0 s gives only 9)
         "pipeline": {"min_segment_age_s": 0},       # freshly imported rows are picked up at once
         "speakers": {"num_threads": 2},
-        "correction": {"glossary_file": str(glossary)},
+        # mode segment: this test follows the per-segment LLM corrector (since 1.0 the default first pass is the
+        # lexicon's deterministic one, correction.mode = session, which makes no LLM call)
+        "correction": {"glossary_file": str(glossary), "mode": "segment"},
     })
 
 
@@ -152,7 +154,7 @@ def test_offline_end_to_end(e2e_cfg, db, silero):
     assert (cfg.daily_dir / "2026-10-30.md").read_text(encoding="utf-8") == daily_md
     row = db.one("SELECT * FROM daily_summaries WHERE day='2026-10-30'")
     assert row and row["utterance_count"] == len(utts) and row["pushed_at"] is None
-    assert db.one("SELECT COUNT(*) AS n FROM memory_notes WHERE kind='person' AND title='雷军'")["n"] == 1
+    assert db.one("SELECT COUNT(*) AS n FROM memory_items WHERE kind='person' AND title='雷军'")["n"] == 1
 
     # 4. full-text search
     hits = mem_index.search(db, "雷军")

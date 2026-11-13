@@ -295,7 +295,8 @@ def test_notes_list_filter_and_delete(client: TestClient, rt: Runtime):
     for kind, title, content, upd in (("todo", "买菜", "明天买菜", "2026-10-30 10:00:00"),
                                       ("person", "张三", "同事，负责预算", "2026-10-30 11:00:00"),
                                       ("topic", "预算", "本月预算讨论", "2026-10-30 11:00:00")):
-        rt.db.execute("INSERT INTO memory_notes(kind, title, content, day_from, day_to, updated_at) VALUES (?,?,?,?,?,?)",
+        # 1.0: /api/notes is a compatibility view of memory_items (same shape; delete = tombstone)
+        rt.db.execute("INSERT INTO memory_items(kind, title, content, valid_from, day, updated_at) VALUES (?,?,?,?,?,?)",
                       (kind, title, content, DAY, DAY, upd))
     rows = client.get("/api/notes").json()
     assert [r["title"] for r in rows] == ["预算", "张三", "买菜"]                 # updated_at desc, id desc

@@ -294,15 +294,13 @@ def test_init_targets_the_root_config(root: Path, monkeypatch: pytest.MonkeyPatc
 
 @pytest.mark.skipif(not NODE, reason="node not installed")
 def test_markdown_renderer_never_emits_raw_source():
-    """md() in app.js: list items starting with '<input' used to be emitted unescaped (XSS)."""
-    src = (STATIC / "app.js").read_text(encoding="utf-8")
-    start = src.index("  function md(src) {")
-    end = src.index("\n  }\n", start) + 4
-    fn = src[start:end]
-    helpers = 'const esc = (s) => String(s ?? "").replace(/[&<>"\']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", \'"\': "&quot;", "\'": "&#39;" }[c]));\n'
+    """md() (static/js/core/md.js): list items starting with '<input' used to be emitted unescaped (XSS)."""
+    mod = (STATIC / "js" / "core" / "md.js").as_uri()
     cases = ["- <input onfocus=alert(1) autofocus> hi", "1. <input x", "- [x] <b>done</b>", "<script>x</script>", "| a | <i> |\n|---|---|\n| <u> | b |"]
-    script = helpers + fn + "\nconst out = " + json.dumps(cases) + ".map(md); process.stdout.write(JSON.stringify(out));"
-    res = subprocess.run([NODE, "-e", script], capture_output=True, text=True, timeout=30, check=True)
+    script = (f"import {{ md }} from {json.dumps(mod)}; "
+              f"const out = {json.dumps(cases)}.map(md); process.stdout.write(JSON.stringify(out));")
+    res = subprocess.run([NODE, "--input-type=module", "-e", script], capture_output=True, text=True, encoding="utf-8",
+                         timeout=30, check=True)
     outs = json.loads(res.stdout)
     for case, html in zip(cases, outs):
         assert "<input onfocus" not in html and "<script>" not in html and "<b>" not in html and "<u>" not in html, (case, html)

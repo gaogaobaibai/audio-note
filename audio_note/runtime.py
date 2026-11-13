@@ -10,9 +10,18 @@ recorder thread optional and switchable at run time. Only one process may run th
 a data directory (service.lock); a second `audio-note ui` still works for browsing and memory chat
 but cannot record or run jobs ("read-only mode").
 
-Jobs (process / daily / cleanup / reindex / relabel / push / voices / relations / loudness) run one at a time on a worker thread
-and under Scheduler.lock, so a job started from the UI never overlaps a scheduler tick. Their state
-(running / last result / last error) is kept per job name for the UI to poll.
+Jobs (process / daily / cleanup / reindex / relabel / push / voices / relations / loudness, plus the 1.0 ones:
+chain / refine / episodes / consolidate / recorrect / rescore / brief / maintenance) run one at a time on a
+worker thread and under Scheduler.lock, so a job started from the UI never overlaps a scheduler tick. Their
+state (running / last result / last error) is kept per job name; every state change is also published on the
+event bus (`job` events) and written to the job_runs table.
+
+A job is either a `_job_<name>` method of Runtime or an entry of JOB_TARGETS ("module:function", imported
+when the job runs, called as fn(rt, **kwargs)); the method wins when both exist. A target whose module is
+not installed fails that job with a clear message, nothing else.
+
+The event bus (`Runtime.events`) is created by whoever builds the first Runtime and belongs to the
+RuntimeHolder: a profile switch hands the same bus to the next Runtime, so open event streams survive it.
 """
 from __future__ import annotations
 
@@ -28,19 +37,38 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from . import __version__, governor, metrics
 from .config import (DEFAULT_PROFILE, Config, canonical_profile_name, find_config_path, list_profiles, load_config,
                      profile_exists, set_current_profile)
 from .db import DB
-from .scheduler import KV_DAILY_AT, KV_DAILY_DAY, KV_PROCESS, Scheduler, next_daily_due
+from .events import EventBus
+from .scheduler import KV_DAILY_AT, KV_DAILY_DAY, KV_PROCESS, Scheduler, _jsonable, _scoped, next_daily_due
 from .service import AlreadyRunning, _recorder_loop, acquire_lock, release_lock, running_pid
 
 log = logging.getLogger(__name__)
 
-JOBS = ("process", "daily", "cleanup", "reindex", "relabel", "push", "voices", "relations", "loudness")
+JOBS = ("process", "daily", "cleanup", "reindex", "relabel", "push", "voices", "relations", "loudness",
+        "chain", "refine", "episodes", "consolidate", "recorrect", "rescore", "brief", "maintenance")
 JOB_LABELS = {"process": "转写处理", "daily": "生成日报", "cleanup": "清理音频", "reindex": "重建索引",
               "relabel": "重新识别说话人", "push": "推送日报", "voices": "扫描未识别的声音", "relations": "推断关系",
-              "loudness": "统计音量分布"}
+              "loudness": "统计音量分布",
+              "chain": "整理新内容", "refine": "校对会话", "episodes": "会话摘要", "consolidate": "整理记忆",
+              "recorrect": "按词库重校历史", "rescore": "重判说话人", "brief": "晨报", "maintenance": "数据库维护"}
+#: jobs implemented outside this module: name -> "package.module:function", called as fn(rt, **kwargs) -> dict.
+#: The module is imported when the job runs; a Runtime method `_job_<name>` takes precedence over an entry here.
+#: Feature packages add / re-point entries (and append the name to JOBS + JOB_LABELS when it is new).
+JOB_TARGETS: dict[str, str] = {
+    "chain": "audio_note.chain:job_chain",
+    "refine": "audio_note.chain:job_refine",
+    "episodes": "audio_note.chain:job_episodes",
+    "consolidate": "audio_note.chain:job_consolidate",
+    "brief": "audio_note.chain:job_brief",
+    "recorrect": "audio_note.speech.lexicon:job_recorrect",
+    "rescore": "audio_note.speech.scoring:job_rescore",
+}
 JOIN_TIMEOUT_S = 15.0
+#: Runtime.status() walks the audio directory at most this often (a new segment / a cleanup refreshes it at once)
+DISK_CACHE_S = 60.0
 #: message for a speaker-embedding request / job when the CAM++ model file is absent
 VOICE_MODELS_MISSING_MSG = "模型文件缺失，无法提取声纹（运行 scripts/download_models.ps1）"
 BUSY_REQUEST_LABEL = "说话人请求（登记声纹 / 标记）"
@@ -76,11 +104,20 @@ class JobState:
 
 
 class Runtime:
-    def __init__(self, cfg: Config, db: DB | None = None, config_path: str | os.PathLike | None = None):
+    def __init__(self, cfg: Config, db: DB | None = None, config_path: str | os.PathLike | None = None,
+                 events: Any = None):
         self.cfg = cfg
         self.config_path = Path(config_path or cfg.get("_config_path") or find_config_path())
         cfg.ensure_dirs()
         self.db = db or DB(cfg.db_path)
+        #: the process's event bus (a private one unless the RuntimeHolder passes its own on a profile switch)
+        self.events = events if events is not None else EventBus()
+        try:
+            self.schema_version: int | None = int(self.db.schema_version())
+        except Exception:  # noqa: BLE001 - a stand-in database without the helper
+            self.schema_version = None
+        self._disk_cache: tuple[Any, float, int] | None = None     # (signature, monotonic time, bytes)
+        self._disk_epoch = 0
         self.started_at = datetime.now()
         self.ui_url: str | None = None
         self.alive = True            # False after shutdown(): the object must not be used any more
@@ -97,7 +134,7 @@ class Runtime:
         self._busy_n = 0
         self.switching = False       # True once RuntimeHolder.switch decided to tear this runtime down
 
-        self.sched = Scheduler(cfg, self.db, self._svc_stop, engine_factory=self.engine)
+        self.sched = Scheduler(cfg, self.db, self._svc_stop, engine_factory=self.engine, events=self.events)
 
         self._engine: Any = None
         self._client: Any = None
@@ -125,7 +162,7 @@ class Runtime:
         """Label of the UI job currently running, or None."""
         for j in self.jobs.values():
             if j.running:
-                return j.label if hasattr(j, "label") else JOB_LABELS.get(j.name, j.name)
+                return JOB_LABELS.get(j.name, j.name)
         return None
 
     def service_running(self) -> bool:
@@ -188,6 +225,11 @@ class Runtime:
             if not self._lock_held:
                 acquire_lock(self.cfg)
                 self._lock_held = True
+                try:
+                    # we are the one service on this data directory: a run still marked 'running' died earlier
+                    self.db.close_orphan_job_runs()
+                except Exception as e:  # noqa: BLE001 - history only
+                    log.debug("close_orphan_job_runs failed: %s", e)
             if schedule and not self.scheduler_running():
                 if self._sched_thread is not None and self._sched_thread.is_alive():
                     raise JobError("后台处理还在停止中（上一轮任务没结束），稍后再试")
@@ -211,11 +253,19 @@ class Runtime:
                 acquire_lock(self.cfg)
                 self._lock_held = True
             self._rec_stop = threading.Event()
-            self._rec_ref = {}
+            # the recorder loop hands these two to every Recorder it builds: the bus for `segment` / `recording`
+            # events, and the callback that wakes the scheduler the moment a segment file is closed
+            self._rec_ref = {"events": self.events, "on_segment": self._on_segment}
             self._rec_thread = threading.Thread(target=_recorder_loop, args=(self.cfg, self.db, self._rec_stop, self._rec_ref),
                                                 name="recorder", daemon=True)
             self._rec_thread.start()
             log.info("recorder started")
+            self.events.publish("recording", on=True, speaking=False)
+
+    def _on_segment(self, seg_id: int | None = None) -> None:
+        """A segment was just stored (recorder thread): refresh the disk figure, wake the scheduler."""
+        self._disk_epoch += 1
+        self.sched.notify_segment(seg_id)
 
     def stop_recording(self, timeout: float = JOIN_TIMEOUT_S) -> None:
         with self._state_lock:
@@ -225,13 +275,17 @@ class Runtime:
                 t.join(timeout)
                 if t.is_alive():
                     log.warning("recorder thread did not stop in %.0fs", timeout)
+            was_recording = self._rec_thread is not None
             self._rec_thread = None
             log.info("recorder stopped")
+            if was_recording:
+                self.events.publish("recording", on=False, speaking=False)
 
     def stop_service(self, timeout: float = JOIN_TIMEOUT_S) -> None:
         with self._state_lock:
             self.stop_recording(timeout)
             self._svc_stop.set()
+            self.sched.wake.set()        # the loop notices the stop at once instead of at its next poll
             t = self._sched_thread
             if t is not None and t.is_alive():
                 t.join(timeout)
@@ -282,6 +336,7 @@ class Runtime:
                     self._client = MimoClient(self.cfg, rpm=int(self.cfg.mimo.rpm))
                 except MissingAPIKey as e:
                     raise JobError("没有配置 MiMo API key：在「设置」里填写，或设置环境变量 MIMO_API_KEY") from e
+                metrics.install(self._client, self.db)      # every request -> usage_llm
             return self._client
 
     def retriever(self, mode: str | None = None, expand: bool | None = None) -> Any:
@@ -301,7 +356,7 @@ class Runtime:
     def chat(self, strategy: str | None = None, retrieval: str | None = None, expand: bool | None = None) -> Any:
         from .memory.chat import MemoryChat
 
-        client = self.client()
+        client = _scoped(self.client(), "chat")
         return MemoryChat(self.cfg, self.db, client, retriever=self.retriever(retrieval, expand), strategy=strategy)
 
     # ------------------------------------------------------------------ config
@@ -318,13 +373,18 @@ class Runtime:
         changed = sorted(k for k in set(old) | set(cfg) if not str(k).startswith("_") and old.get(k) != cfg.get(k))
         cfg.ensure_dirs()
         self.cfg = cfg
+        notes: list[str] = []
         with self._heavy_lock:
             self._client = None
             self._retrievers.clear()
             if self._engine is not None:
-                self._engine.cfg = cfg
+                if governor.threads(old) != governor.threads(cfg):
+                    # the thread count is fixed when the models are loaded: build a new engine on next use
+                    self._engine = None
+                    notes.append("本机模型的线程数已更新，下一次处理时生效")
+                else:
+                    self._engine.cfg = cfg
         self.sched.reload_config(cfg)
-        notes: list[str] = []
         restarted = False
         if "audio" in changed and self.recording():
             self.stop_recording()
@@ -338,6 +398,8 @@ class Runtime:
         if "log" in changed:
             notes.append("日志设置的修改需要重启程序才会生效")
         log.info("config reloaded: changed sections %s", changed)
+        self._disk_cache = None
+        self.events.publish("config", changed=changed)
         return {"changed": changed, "restarted_recorder": restarted, "notes": notes}
 
     # ------------------------------------------------------------------ jobs
@@ -359,7 +421,12 @@ class Runtime:
             st.result = None
             st.args = {k: v for k, v in kwargs.items() if v is not None}
         self._job_q.put((name, kwargs))
+        self.events.publish("job", name=name, state="queued", source="ui")
         return st
+
+    def job_stop_event(self) -> threading.Event | None:
+        """The event a long job should watch: the service's stop event while the scheduler runs, else None."""
+        return self._svc_stop if self.scheduler_running() else None
 
     def run_job(self, name: str, **kwargs: Any) -> Any:
         """Run a job synchronously on the calling thread (CLI / tests). Raises on failure."""
@@ -384,6 +451,7 @@ class Runtime:
             name, kwargs = item
             st = self.jobs[name]
             t0 = time.monotonic()
+            run_id = self._job_run_started(name)
             try:
                 fn = self._job_fn(name)
                 with self.sched.lock:
@@ -395,20 +463,74 @@ class Runtime:
                 st.error = str(e) if isinstance(e, (JobError, ReadOnly)) else f"{type(e).__name__}: {e}"
                 log.exception("job %s (ui) failed: %s", name, e)
             finally:
-                st.running = False
                 st.finished_at = datetime.now().isoformat(timespec="seconds")
+                try:
+                    self._job_run_finished(name, run_id, st)   # history first: it is complete once `running` drops
+                finally:
+                    st.running = False
+                state = "failed" if st.error else "done"
+                self.events.publish("job", name=name, state=state, source="ui",
+                                    **({"error": st.error} if st.error else {"result": st.result}))
+
+    def _job_run_started(self, name: str) -> int | None:
+        """`job running` event + the job_runs row of a UI job. Never raises (history must not stop a job)."""
+        if name in ("cleanup", "process"):
+            self._disk_epoch += 1
+        self.events.publish("job", name=name, state="running", source="ui")
+        try:
+            return self.db.start_job_run(name, "ui")
+        except Exception as e:  # noqa: BLE001
+            log.debug("job_runs: start of %s not recorded: %s", name, e)
+            return None
+
+    def _job_run_finished(self, name: str, run_id: int | None, st: JobState) -> None:
+        if name in ("cleanup", "process"):
+            self._disk_epoch += 1
+        if run_id is None:
+            return
+        try:
+            self.db.finish_job_run(run_id, "failed" if st.error else "done", st.result, st.error)
+        except Exception as e:  # noqa: BLE001 - e.g. the database was closed by a shutdown
+            log.debug("job_runs: end of %s not recorded: %s", name, e)
 
     def _job_fn(self, name: str) -> Callable[..., Any]:
         fn = getattr(self, f"_job_{name}", None)
-        if fn is None:
+        if fn is not None:
+            return fn
+        target = JOB_TARGETS.get(name)
+        if target is None:
             raise JobError(f"未知任务 {name!r}")
-        return fn
+        return lambda **kwargs: self._call_target(name, target, **kwargs)
+
+    def _call_target(self, name: str, target: str, **kwargs: Any) -> Any:
+        """Run a JOB_TARGETS job: import "module:function" now and call fn(self, **kwargs). A module that is
+        not installed (or cannot be imported) fails this job with a readable JobError; the worker lives on."""
+        from . import chain
+
+        label = JOB_LABELS.get(name, name)
+        try:
+            fn = chain.resolve(target)
+        except chain.StepUnavailable as e:
+            raise JobError(f"{label}：这个功能在当前版本里还不可用（{e}）") from e
+        except Exception as e:  # noqa: BLE001 - the module exists but its import failed
+            log.exception("job %s: cannot load %s", name, target)
+            raise JobError(f"{label}：功能模块加载失败（{type(e).__name__}: {e}）") from e
+        try:
+            return fn(self, **kwargs)
+        except chain.StepUnavailable as e:
+            raise JobError(str(e)) from e
 
     def _job_process(self, retry_failed: bool = False, limit: int | None = None) -> dict[str, Any]:
         proc = self.sched.processor()
         if proc is None:
             raise JobError("没有配置 MiMo API key，无法转写：在「设置」里填写后再试")
-        stats = proc.process_pending(limit=limit, retry_failed=bool(retry_failed))
+        self.sched._requeue_stopped()
+        since = self.sched._max_utterance_id()
+        try:
+            stats = proc.process_pending(limit=limit, retry_failed=bool(retry_failed))
+        finally:
+            self.sched._requeue_stopped()      # a segment cut short by a stop request is not a failure
+            self.sched.announce_new(since)
         self.db.set_kv(KV_PROCESS, datetime.now().isoformat(timespec="seconds"))
         return dict(stats)
 
@@ -416,14 +538,15 @@ class Runtime:
         from .analysis.daily import DailyAnalyzer
 
         day = day or datetime.now().strftime("%Y-%m-%d")
-        analyzer = DailyAnalyzer(self.cfg, self.db, self.client())
+        analyzer = DailyAnalyzer(self.cfg, self.db, _scoped(self.client(), "daily"))
         md, js = analyzer.run(day, force=bool(force))
         out: dict[str, Any] = {"day": day, "utterances": int(js.get("utterance_count") or 0),
                                "cached": analyzer.last_run_cached, "partial": analyzer.last_run_partial, "chars": len(md)}
+        self.events.publish("daily", day=day)
         try:
             from .analysis import relations
 
-            out["relations"] = relations.maybe_infer_after_daily(self.cfg, self.db, self.client())
+            out["relations"] = relations.maybe_infer_after_daily(self.cfg, self.db, _scoped(self.client(), "relations"))
         except Exception as e:  # noqa: BLE001 - relation inference never fails the digest
             log.warning("relation inference after daily %s failed: %s", day, e)
             out["relations"] = []
@@ -445,7 +568,8 @@ class Runtime:
         from .analysis import relations
 
         ids = [int(speaker_id)] if speaker_id else None
-        results = list(relations.infer_relations(self.cfg, self.db, self.client(), speaker_ids=ids, force=bool(force)))
+        results = list(relations.infer_relations(self.cfg, self.db, _scoped(self.client(), "relations"), speaker_ids=ids,
+                                                 force=bool(force)))
         return {"speakers": len(results), "applied": sum(1 for r in results if r.get("applied")), "results": results}
 
     def _job_push(self, day: str) -> dict[str, Any]:
@@ -463,6 +587,11 @@ class Runtime:
 
     def _job_cleanup(self) -> dict[str, Any]:
         return dict(self.sched._default_cleanup() or {})
+
+    def _job_maintenance(self, vacuum: bool = False) -> dict[str, Any]:
+        """Database housekeeping: prune the job history, optimise the full-text indexes, checkpoint the WAL
+        (`vacuum` also rewrites the file to give space back; that can take a while on a large database)."""
+        return dict(self.db.maintenance(vacuum=bool(vacuum)))
 
     def _job_reindex(self, vectors: bool = True) -> dict[str, Any]:
         from .memory import index as mem_index
@@ -501,8 +630,58 @@ class Runtime:
         return dict(proc.relabel(day=day, segment_id=segment_id))
 
     # ------------------------------------------------------------------ status
-    def status(self) -> dict[str, Any]:
+    def audio_bytes(self) -> int:
+        """Size of the audio directory. Walking it costs more the more recordings there are, so the figure is
+        kept for DISK_CACHE_S; a new segment, a cleanup or a process run refresh it at once."""
         from .audio.storage import dir_size_bytes
+
+        sig = (self._disk_epoch, self.sched.runs.get("cleanup"), self.sched.runs.get("process"), str(self.cfg.audio_dir))
+        now = time.monotonic()
+        c = self._disk_cache
+        if c is not None and c[0] == sig and now - c[1] < DISK_CACHE_S:
+            return c[2]
+        n = int(dir_size_bytes(self.cfg.audio_dir)) if self.cfg.audio_dir.exists() else 0
+        self._disk_cache = (sig, now, n)
+        return n
+
+    def inbox_open(self) -> int:
+        """Open questions waiting for the user (0 while nothing ever asked one). The same number as
+        inbox.counts()["open"]: that call also wakes snoozed / queued questions that are due."""
+        try:
+            from . import inbox
+
+            return int(inbox.counts(self.db, self.cfg)["open"])
+        except Exception:  # noqa: BLE001 - the module failed: fall back to the plain count
+            pass
+        try:
+            row = self.db.one("SELECT COUNT(*) AS n FROM inbox_items WHERE status='open'")
+            return int(row["n"]) if row else 0
+        except Exception:  # noqa: BLE001 - a database from before the table / a closed one
+            return 0
+
+    def status_lite(self) -> dict[str, Any]:
+        """The few fields a page needs the moment it connects to the event stream (one query, no directory walk)."""
+        rec = self.recorder
+        other = self.other_pid()
+        counts = {r["status"]: int(r["n"]) for r in self.db.query("SELECT status, COUNT(*) AS n FROM segments GROUP BY status")}
+        return {
+            "now": datetime.now().isoformat(timespec="seconds"),
+            "version": __version__,
+            "schema_version": self.schema_version,
+            "profile": {"name": self.profile, "label": profile_label(self.profile)},
+            "api_key": bool(self.cfg.mimo.api_key),
+            "service": {"running": self.service_running(), "read_only": bool(other), "scheduler": self.scheduler_running(),
+                        "recording": self.recording(),
+                        "is_speaking": bool(getattr(rec, "is_speaking", False)) if rec else False},
+            "pending": counts.get("new", 0) + counts.get("processing", 0),
+            "failed": counts.get("failed", 0),
+            "jobs_running": [n for n, j in self.jobs.items() if j.running],
+            "inbox_open": self.inbox_open(),
+            "deferred": governor.defer_reason(self.cfg),
+        }
+
+    def status(self) -> dict[str, Any]:
+        from .audio.loudness import min_speech_dbfs
 
         cfg, db = self.cfg, self.db
         today = datetime.now().strftime("%Y-%m-%d")
@@ -515,7 +694,7 @@ class Runtime:
                            (f"{today}T00:00:00",))
         utt_all = db.one("SELECT COUNT(*) AS n, COUNT(DISTINCT day) AS days FROM utterances")
         last = db.one("SELECT day, created_at, pushed_at, utterance_count FROM daily_summaries ORDER BY day DESC LIMIT 1")
-        audio_bytes = dir_size_bytes(cfg.audio_dir) if cfg.audio_dir.exists() else 0
+        audio_bytes = self.audio_bytes()
         try:
             free = shutil.disk_usage(cfg.data_dir).free
         except OSError:
@@ -577,6 +756,18 @@ class Runtime:
             "scheduler_runs": dict(self.sched.runs),
             "scheduler_errors": dict(self.sched.errors),
             "jobs": {n: j.as_dict() for n, j in self.jobs.items()},
+            # --- 1.0 ---
+            "version": __version__,
+            "schema_version": self.schema_version,
+            "inbox_open": self.inbox_open(),
+            "min_speech_dbfs": min_speech_dbfs(cfg),
+            "unknown_label": str(cfg.speakers.unknown_label or "未知"),
+            "system_turn_share": float(cfg.speakers.get("system_turn_share", 0.6) or 0.0),
+            "deferred": governor.defer_reason(cfg),          # why local processing is postponed right now, or None
+            "realtime": bool(cfg.pipeline.get("realtime", True)),
+            "events": bool(cfg.ui.get("events", True)),
+            "performance": {"mode": governor.mode(cfg), "threads": governor.threads(cfg)},
+            "scheduler_extra": {"runs": dict(self.sched.extra_runs), "errors": dict(self.sched.extra_errors)},
         }
 
 
@@ -594,6 +785,8 @@ class RuntimeHolder:
     def __init__(self, rt: Runtime):
         self.rt = rt
         self.lock = threading.Lock()
+        #: the one event bus of the process: every Runtime this holder builds publishes on it
+        self.events = getattr(rt, "events", None) or EventBus()
 
     def switch(self, name: str) -> Runtime:
         """Switch the live runtime to profile `name`. The new Runtime (dirs, database, job thread) is
@@ -616,7 +809,7 @@ class RuntimeHolder:
             try:
                 was_recording = old.recording()
                 cfg = load_config(profile=name)
-                new = Runtime(cfg)          # may raise: the old runtime is still intact
+                new = Runtime(cfg, events=self.events)          # may raise: the old runtime is still intact
             except BaseException:
                 old.end_switch()
                 raise
@@ -640,20 +833,9 @@ class RuntimeHolder:
             except Exception as e:  # noqa: BLE001  (e.g. microphone gone): the runtime still serves the UI
                 log.exception("profile %s: service did not start: %s", name, e)
             log.info("switched to profile %s (data %s)", name, cfg.data_dir)
+            self.events.publish("profile", name=name)
             return new
 
 
-def _jsonable(v: Any) -> Any:
-    if isinstance(v, dict):
-        return {str(k): _jsonable(x) for k, x in v.items()}
-    if isinstance(v, (list, tuple, set)):
-        return [_jsonable(x) for x in v]
-    if isinstance(v, (str, int, float, bool)) or v is None:
-        return v
-    if isinstance(v, Path):
-        return str(v)
-    return str(v)
-
-
-__all__ = ["Runtime", "RuntimeHolder", "JobState", "JobError", "ReadOnly", "AlreadyRunning", "JOBS", "JOB_LABELS",
+__all__ = ["Runtime", "RuntimeHolder", "JobState", "JobError", "ReadOnly", "AlreadyRunning", "JOBS", "JOB_LABELS", "JOB_TARGETS",
            "profile_label", "VOICE_MODELS_MISSING_MSG", "BUSY_REQUEST_LABEL"]

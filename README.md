@@ -251,6 +251,12 @@ audio-note profile delete demo           # 删除档案及其全部数据（会�
 | `audio-note chat [question] [--strategy prefetch\|agentic\|rag] [--retrieval hybrid\|vector\|fts] [--expand]` | 记忆问答；不带参数进入交互式 REPL |
 | `audio-note reindex [--no-vectors]` | 重建关键词索引（改了词表/人名后）并补齐向量索引 |
 | `audio-note cleanup` | 立即执行一次清理（复检无语音片段 / 过期音频 / 磁盘上限） |
+| `audio-note doctor` | 只读体检：配置、数据目录、数据库版本、模型、API key、ffmpeg、卡住的片段、最近的错误日志 |
+| `audio-note speakers rescore` | 按现在的声纹库和评分规则重判历史记录的说话人（只用存下来的声纹，几秒钟，不读音频；手工标过的不动） |
+| `audio-note speakers scoring` | 查看现在是怎么认人的：评分方式、每个人学到的声音中心、确定 / 可能 / 未知各多少句 |
+| `audio-note lexicon list\|add\|alias\|import\|export\|apply` | 词库：人名 / 项目 / 术语的规范写法，以及它们常被听错成什么；`apply` 按词库修正以前的记录（不加 `--yes` 只预览） |
+| `audio-note inbox list\|answer\|dismiss` | 待确认：系统拿不准、想问你的事 |
+| `audio-note memory items\|todos\|people\|sessions\|forget` | 记忆条目、待办、人物、某天的会话；`forget "内容"` 从记录、音频、索引和记忆里一起删掉一段内容（默认只预览，加 `--yes` 才删） |
 
 调度参数：`pipeline.process_interval_min`（默认 10 分钟处理一次新片段）、`storage.cleanup_interval_min`（30 分钟）、`analysis.daily_time`（22:30 跑日报并推送；跑之前会先处理一遍新片段）。22:30 之后还在说话的内容会在第二天补进前一天的日报并重新推送一次；某天的片段还没处理完（没填 key、API 故障）时不会把那天标成"已完成"，处理完后自动补报。
 
@@ -351,6 +357,9 @@ schtasks /end   /tn AudioNote     # 停止
 MiMo 限制 100 RPM / 10K TPM，客户端默认 `mimo.rpm: 90` 并对 429 指数退避重试 `max_retries` 次。如果导入了大量历史录音，`process --limit 20` 分批跑，或把 `mimo.rpm` 调到 60。
 
 **402** 账户余额不足；**421** 内容被过滤（只跳过那个 ≤60 s 的块，片段其余部分照常入库）；**503** 服务过载，会自动重试。429 的退避是 10 / 20 / 40 / 60 s（并遵守 `Retry-After`），三次重试能跨过一个按分钟计的配额窗口；400 / 413 / 422 之类的确定性错误不重试。
+
+**从旧版本升级**
+拉取新代码、`uv sync` 之后照常启动即可。新版第一次打开数据库时会自动升级结构，升级前先把数据库备份到 `data/backups/`（保留最近 3 份）；想退回旧版本，停掉服务后把备份文件复制回 `data/audio_note.sqlite3` 即可。`audio-note doctor` 可以看数据库版本和备份。
 
 **服务被强杀 / 断电后片段卡在 `processing`**
 下次处理时会把超过 10 分钟没动静的 `processing` 片段自动放回 `new` 重新处理，不用手动改库。

@@ -86,12 +86,14 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "search_notes",
-            "description": "检索长期记忆笔记（由每日分析维护）：人物 person、话题 topic、待办 todo、决定 decision、事实 fact。",
+            "description": "检索长期记忆条目（系统从对话里整理出来、用户可以改）：人物 person、话题 topic、待办 todo、决定 decision、"
+                           "事实 fact、偏好 preference、项目 project、事件 event、备注 note。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "标题/内容中的关键词，可选（为空则列出最近的笔记）"},
-                    "kind": {"type": "string", "enum": ["person", "topic", "todo", "decision", "fact"],
+                    "kind": {"type": "string", "enum": ["person", "topic", "todo", "decision", "fact", "preference",
+                                                        "project", "event", "note"],
                              "description": "笔记类型，可选"},
                 },
             },
@@ -288,34 +290,27 @@ def list_speakers(args: dict, db: DB, cfg) -> str:
     return _cap("\n".join(lines))
 
 
-_KINDS = ("person", "topic", "todo", "decision", "fact")
+def search_notes(args: dict, db: DB, cfg, retriever: Any = None) -> str:
+    """Memory items (the successor of the 0.3 notes; the tool keeps its name for the model's sake). Open items
+    and finished todos are shown, deleted ones never. With a retriever whose embedding model is already
+    loaded the search is semantic as well as by keyword."""
+    from . import items as mem_items
 
-
-def search_notes(args: dict, db: DB, cfg) -> str:
     query = str(args.get("query") or "").strip()
     kind = (args.get("kind") or "").strip() or None
-    if kind and kind not in _KINDS:
-        raise ValueError(f"kind 必须是 {', '.join(_KINDS)} 之一")
-    sql, params = "SELECT * FROM memory_notes WHERE 1=1", []
-    if kind:
-        sql += " AND kind=?"
-        params.append(kind)
-    if query:
-        pat = "%" + query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
-        sql += " AND (title LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\')"
-        params += [pat, pat]
-    sql += " ORDER BY updated_at DESC, id DESC LIMIT 30"
-    rows = db.query(sql, params)
+    if kind and kind not in mem_items.KINDS:
+        raise ValueError(f"kind 必须是 {', '.join(mem_items.KINDS)} 之一")
+    loaded = getattr(retriever, "loaded_embedder", None)
+    embedder = loaded() if callable(loaded) else None
+    rows = mem_items.search(db, cfg, query, kinds=[kind] if kind else None, status=("active", "done"), limit=30,
+                            embedder=embedder)
     if not rows:
         what = f"「{query}」" if query else ""
         return f"没有找到{what}{('类型 ' + kind + ' 的') if kind else ''}笔记。笔记由每日分析生成，可改用 search_transcripts 直接检索记录。"
     lines = [f"找到 {len(rows)} 条笔记："]
     for r in rows:
-        span = r["day_from"] or ""
-        if r["day_to"] and r["day_to"] != r["day_from"]:
-            span += f"~{r['day_to']}"
-        content = " ".join((r["content"] or "").split())
-        lines.append(f"[{r['kind']}] {r['title']}{(' (' + span + ')') if span else ''}: {content}")
+        done = "（已完成）" if r["status"] == "done" else ""
+        lines.append(mem_items.format_line(r, content_chars=400) + done)
     return _cap("\n".join(lines))
 
 
@@ -362,7 +357,7 @@ def run_tool(name: str, args: dict | str | None, db: DB, cfg, retriever: Any = N
     if not isinstance(args, dict):
         return "ERROR: 参数必须是 JSON 对象"
     try:
-        out = fn(args, db, cfg, retriever) if name == "search_transcripts" else fn(args, db, cfg)
+        out = fn(args, db, cfg, retriever) if name in ("search_transcripts", "search_notes") else fn(args, db, cfg)
     except ValueError as e:
         return f"ERROR: {e}"
     except Exception as e:  # noqa: BLE001
