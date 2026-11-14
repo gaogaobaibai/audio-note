@@ -5,6 +5,8 @@
 // Keys: Space play / pause, J next, K previous (not while typing). The sentence being played gets the class
 // "playing" wherever it is on the page: any element with data-utt="<utterance id>" or data-clip="<clip key>".
 // Dialogs embed a small transport bound to the same player with mountInline().
+// While it plays, the player tells the server (POST /api/playback, then a heartbeat), so the recorder does not
+// record our own playback again as new speech (audio/playback.py).
 import { html } from "../core/html.js";
 import { $, $$, render, reveal } from "../core/dom.js";
 import { emit, on as busOn } from "../core/bus.js";
@@ -19,6 +21,28 @@ import { toast } from "./toast.js";
 export const RATES = [0.75, 1, 1.25, 1.5, 2];
 const st = { queue: [], index: -1, playing: false, time: 0, duration: 0, rate: 1 };
 let audio = null, bar = null, errorsInRow = 0, ui = null;
+
+// ---- self-playback guard: "this tab is playing" reports; the server stops trusting a tab TTL_S after its last one
+const HEARTBEAT_MS = 2000;
+const TAB = `t${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36).slice(-4)}`;
+let beat = null, seq = 0;
+function sendPlayback(playing) {
+  try {
+    // seq: reports can overtake each other on the way; the server ignores one older than what it already has
+    fetch("/api/playback", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tab: TAB, playing, seq: ++seq }), keepalive: true })
+      .catch(() => { /* the server is gone or busy: nothing to protect then */ });
+  } catch (e) { /* never disturb playback */ }
+}
+function guardOn() {
+  sendPlayback(true);
+  if (!beat) beat = setInterval(() => sendPlayback(true), HEARTBEAT_MS);
+}
+function guardOff() {
+  if (!beat) return;
+  clearInterval(beat);
+  beat = null;
+  sendPlayback(false);
+}
 
 const current = () => (st.index >= 0 ? st.queue[st.index] || null : null);
 const snapshot = () => ({ clip: current(), index: st.index, count: st.queue.length, playing: st.playing, time: st.time, duration: st.duration, rate: st.rate });
@@ -207,9 +231,11 @@ export function initPlayer() {
   });
   ui.seek.addEventListener("input", () => { ui.seeking = true; if (st.duration) player.seek((Number(ui.seek.value) / 1000) * st.duration); });
   ui.seek.addEventListener("change", () => { ui.seeking = false; });
-  audio.addEventListener("play", () => { st.playing = true; changed(); });
-  audio.addEventListener("playing", () => { errorsInRow = 0; });
-  audio.addEventListener("pause", () => { st.playing = false; changed(); });
+  audio.addEventListener("play", () => { guardOn(); st.playing = true; changed(); });
+  audio.addEventListener("playing", () => { guardOn(); errorsInRow = 0; });
+  audio.addEventListener("pause", () => { guardOff(); st.playing = false; changed(); });
+  audio.addEventListener("emptied", () => { if (audio.paused) guardOff(); });
+  window.addEventListener("pagehide", () => guardOff());
   audio.addEventListener("timeupdate", () => { st.time = audio.currentTime || 0; paintTime(); emit("player:time", snapshot()); });
   audio.addEventListener("durationchange", () => { st.duration = Number.isFinite(audio.duration) ? audio.duration : 0; paintTime(); emit("player:time", snapshot()); });
   audio.addEventListener("ended", () => {
@@ -217,6 +243,7 @@ export function initPlayer() {
     if (st.index < st.queue.length - 1) load(st.index + 1, { auto: true }); else changed();
   });
   audio.addEventListener("error", () => {
+    guardOff();
     if (!current()) return;                      // stop() clears the source, which also fires "error"
     errorsInRow++;
     st.playing = false;

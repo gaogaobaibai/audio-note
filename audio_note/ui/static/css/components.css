@@ -63,6 +63,7 @@ kbd + kbd { margin-left: 3px; }
 .rec-pill.on .rec-main { color: var(--text); }
 .rec-pill.on .rec-dot { background: var(--rec); color: var(--rec); animation: breathe 2.2s var(--ease) infinite; }
 .rec-pill.on.speaking .rec-dot { background: var(--ok); color: var(--ok); }
+.rec-pill.on.paused .rec-dot { background: var(--warn); color: var(--warn); animation: none; }
 .rec-pill.off .rec-dot { background: var(--warn); }
 .rec-pill.ro .rec-main { padding-right: 12px; }
 .rec-time { color: var(--text-2); font-variant-numeric: tabular-nums; }

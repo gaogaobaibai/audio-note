@@ -672,7 +672,8 @@ class Runtime:
             "api_key": bool(self.cfg.mimo.api_key),
             "service": {"running": self.service_running(), "read_only": bool(other), "scheduler": self.scheduler_running(),
                         "recording": self.recording(),
-                        "is_speaking": bool(getattr(rec, "is_speaking", False)) if rec else False},
+                        "is_speaking": bool(getattr(rec, "is_speaking", False)) if rec else False,
+                        "paused_for_playback": bool(getattr(rec, "paused_for_playback", False)) if rec else False},
             "pending": counts.get("new", 0) + counts.get("processing", 0),
             "failed": counts.get("failed", 0),
             "jobs_running": [n for n, j in self.jobs.items() if j.running],
@@ -682,6 +683,7 @@ class Runtime:
 
     def status(self) -> dict[str, Any]:
         from .audio.loudness import min_speech_dbfs
+        from .audio.playback import guard_mode as playback_guard_mode
 
         cfg, db = self.cfg, self.db
         today = datetime.now().strftime("%Y-%m-%d")
@@ -724,6 +726,8 @@ class Runtime:
                 "scheduler": self.scheduler_running(),
                 "recording": self.recording(),
                 "is_speaking": bool(getattr(rec, "is_speaking", False)) if rec else False,
+                "paused_for_playback": bool(getattr(rec, "paused_for_playback", False)) if rec else False,
+                "playback_guard": playback_guard_mode(cfg),
                 "segments_written": int(getattr(rec, "segments_written", 0)) if rec else 0,
                 "speech_total_s": round(float(getattr(rec, "speech_total_s", 0.0)), 1) if rec else 0.0,
                 "recorder_started_at": rec.started_at.isoformat(timespec="seconds") if rec and getattr(rec, "started_at", None) else None,

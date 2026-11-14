@@ -32,6 +32,7 @@ a.utt-row:hover { background: var(--surface-2); text-decoration: none; }
 .hero-dot { width: 12px; height: 12px; margin-top: 8px; border-radius: 50%; background: var(--line-strong); flex: none; }
 .hero.on .hero-dot { background: var(--rec); color: var(--rec); animation: breathe 2.2s var(--ease) infinite; }
 .hero.on.speaking .hero-dot { background: var(--ok); color: var(--ok); }
+.hero.on.paused .hero-dot { background: var(--warn); color: var(--warn); animation: none; }
 .hero-title { font-size: var(--fs-xl); font-weight: 600; line-height: var(--lh-tight); letter-spacing: -.01em; }
 .hero-time { margin-left: var(--sp-3); color: var(--text-2); font-weight: 400; font-variant-numeric: tabular-nums; }
 .hero-detail { margin-top: 6px; color: var(--text-2); font-size: var(--fs-sm); line-height: 1.7; }

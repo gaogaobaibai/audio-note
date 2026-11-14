@@ -88,7 +88,7 @@ def test_status_shape_on_empty_db(rt: Runtime):
     assert st["models_missing"] == []                                    # the real models/ dir is configured
     svc = st["service"]
     assert svc == {"running": False, "read_only": False, "other_pid": None, "scheduler": False, "recording": False,
-                   "is_speaking": False, "segments_written": 0, "speech_total_s": 0.0, "recorder_started_at": None,
+                   "is_speaking": False, "paused_for_playback": False, "playback_guard": "all", "segments_written": 0, "speech_total_s": 0.0, "recorder_started_at": None,
                    "last_error": None, "device": None, "system_audio": False, "system_device": None,
                    "system_active": False, "system_name": None, "system_error": None}
     assert st["segments"] == {} and st["pending"] == 0 and st["failed"] == 0

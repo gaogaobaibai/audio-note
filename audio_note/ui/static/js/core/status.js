@@ -123,7 +123,8 @@ export function startStatusLoop() {
   busOn("live:recording", (ev) => {
     const st = store.get("status");
     if (st && st.service && ev && typeof ev.on === "boolean") {
-      const next = { ...st, service: { ...st.service, recording: ev.on, is_speaking: ev.on ? !!(ev.speaking ?? st.service.is_speaking) : false } };
+      const next = { ...st, service: { ...st.service, recording: ev.on, is_speaking: ev.on ? !!(ev.speaking ?? st.service.is_speaking) : false,
+        paused_for_playback: ev.on ? !!(ev.paused ?? st.service.paused_for_playback) : false } };
       store.set("status", next);
       emit("status", next, st);
     }

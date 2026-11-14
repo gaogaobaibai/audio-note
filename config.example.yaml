@@ -42,6 +42,7 @@ audio:
   system_audio: false            # 同时录系统声音（会议 / 通话里对方的声音，WASAPI loopback）；界面总览可一键开关
   system_device: null            # null = 默认输出设备；或输出设备序号 / 名称子串（`audio-note devices` 查看）
   system_gain: 1.0               # 系统声音混入时的音量倍数
+  playback_guard: all            # 在网页里播放录音时不把它再录进去：all = 麦克风和系统声音都暂停；system = 只丢系统声音（戴耳机时可以边听边说）；off = 关闭
   min_speech_dbfs: -40.0         # 最低音量（dBFS）：低于此音量的说话轮次视为远处 / 不清晰的声音，不转写、不入声纹；null = 关闭。
                                  # 记录页每句都显示音量（本人近讲约 -26，两米外的人约 -53），调门槛前先看看；`audio-note loudness` 看分布
 

@@ -13,7 +13,7 @@ An event is a plain dict:  {"seq": 17, "id": ..., "type": "segment", "ts": "2026
 publisher passed as `id=` (the segment / utterance / session the event is about); without one it equals `seq`.
 
 Event types (docs/SPEC_v1.md section 4.3):
-    recording {on, speaking?}      segment {id, status}            utterances {day, segment_id, ids}
+    recording {on, speaking?, paused?}  segment {id, status}            utterances {day, segment_id, ids}
     utterance {id, change}         job {name, state, result?, error?, source?}
     session {id, change}           inbox {open, kind?}             memory {change}       daily {day}
     speakers {change}              lexicon {change}                config {}             profile {name}

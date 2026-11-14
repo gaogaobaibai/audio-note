@@ -230,10 +230,12 @@ def person_get(name: str, rt: RT) -> dict[str, Any]:
 def memory_forget(rt: RT, body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
     """Forget a day / a time range / a session / some sentences across every layer. `dry_run` defaults to
     true: the answer then only says what WOULD be removed. A real run holds the scheduler lock, so it never
-    overlaps the pipeline working on the same rows."""
+    overlaps the pipeline working on the same rows. `purge_backups: false` keeps the database backups that still
+    hold the sentences (e.g. junk that is not private, where the pre-upgrade backup matters more)."""
     from ...memory.forget import forget
 
     dry = bool_arg(body.get("dry_run"), "dry_run", default=True)
+    purge = bool_arg(body.get("purge_backups"), "purge_backups", default=True)
     ids = body.get("utterance_ids")
     if ids is not None and (not isinstance(ids, list) or any(isinstance(x, bool) or not isinstance(x, int) for x in ids)):
         raise HTTPException(400, "utterance_ids 应为句子 id 的列表")
@@ -241,10 +243,10 @@ def memory_forget(rt: RT, body: dict[str, Any] = Body(default={})) -> dict[str, 
               utterance_ids=ids or None, session_id=int_arg(body.get("session_id"), "session_id", minimum=1))
     try:
         if dry:
-            return forget(rt.db, rt.cfg, dry_run=True, **kw)
+            return forget(rt.db, rt.cfg, dry_run=True, purge_backups=purge, **kw)
         with rewriting(rt):
             with rt.sched.lock:
-                report = forget(rt.db, rt.cfg, dry_run=False, **kw)
+                report = forget(rt.db, rt.cfg, dry_run=False, purge_backups=purge, **kw)
     except ValueError as e:
         raise HTTPException(400, str(e))
     for d in report["days"]:

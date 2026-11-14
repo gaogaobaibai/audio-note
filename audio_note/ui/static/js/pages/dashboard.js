@@ -24,7 +24,8 @@ function heroView(st) {
   if (s.read_only) return { cls: "ro", title: "只读模式", detail: html`服务正在另一个进程运行（pid ${s.other_pid}）。这里可以看记录和问答，录音和处理请在那个进程的界面操作。` };
   if (s.recording) {
     return {
-      cls: s.is_speaking ? "on speaking" : "on", title: s.is_speaking ? "正在录音 · 有人说话" : "正在录音 · 安静",
+      cls: s.paused_for_playback ? "on paused" : s.is_speaking ? "on speaking" : "on",
+      title: s.paused_for_playback ? "暂停中 · 正在播放录音" : s.is_speaking ? "正在录音 · 有人说话" : "正在录音 · 安静",
       detail: html`${fmtTime(s.recorder_started_at)} 开始 · 本次已保存 ${s.segments_written} 段，${fmtMin((s.speech_total_s || 0) / 60)}语音 · 麦克风：${s.device == null ? "系统默认" : String(s.device)}<br>${src}`,
     };
   }

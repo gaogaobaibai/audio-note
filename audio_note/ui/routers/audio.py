@@ -2,6 +2,7 @@
 
     GET  /api/audio/utterance/{uid}?pad=0.3
     GET  /api/audio/segment/{seg_id}?from=&to=
+    POST /api/playback {tab, playing}                      the page's player: "I am playing / stopped" (see audio/playback.py)
     POST /api/import?filename=import.wav&start=<ISO>      (raw audio body)
 """
 from __future__ import annotations
@@ -11,9 +12,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Body, HTTPException, Query, Request, Response
 
-from ..deps import RT, to_thread
+from ..deps import RT, bool_arg, int_arg, to_thread
 from ..serializers import wav_bytes
 
 router = APIRouter(prefix="/api")
@@ -52,6 +53,28 @@ def audio_utterance(uid: int, rt: RT, pad: float = 0.3) -> Response:
 def audio_segment(seg_id: int, rt: RT, start: float = Query(0.0, alias="from"), end: float = Query(0.0, alias="to")) -> Response:
     data = segment_audio(rt, int(seg_id), float(start), float(end))
     return Response(data, media_type="audio/wav", headers={"Cache-Control": "private, max-age=3600"})
+
+
+@router.post("/playback")
+def playback_report(rt: RT, body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+    """The page's player reports what it is doing, so the recorder leaves our own playback out of the recording.
+    When another process records (this page is read-only), the windows are mirrored to its data directory."""
+    from ...audio import playback
+
+    playing = bool_arg(body.get("playing"), "playing")
+    tab = body.get("tab")
+    if tab is not None and (isinstance(tab, bool) or not isinstance(tab, (str, int))):
+        raise HTTPException(400, "tab 应为文本")
+    seq = int_arg(body.get("seq"), "seq", minimum=0)
+    now = playback.GUARD.report(tab, playing, seq=seq)
+    try:
+        other = rt.other_pid()
+    except Exception:  # noqa: BLE001 - no lock information: assume this process records
+        other = None
+    if other:
+        playback.write_file(playback.file_path(rt.cfg.data_dir), playback.GUARD.windows())
+    return {"ok": True, "playing": now, "mode": playback.guard_mode(rt.cfg),
+            "heartbeat_s": playback.HEARTBEAT_S}
 
 
 @router.post("/import")

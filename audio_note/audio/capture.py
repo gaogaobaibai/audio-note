@@ -215,6 +215,10 @@ class MixedCapture:
         self.system_samples = 0      # loopback samples mixed in so far (diagnostics)
         self.lead_drops = 0
         self.last_channels: tuple[float, float] | None = None   # (mic_rms, system_rms) of the last block read
+        #: drop_system(block wall time) -> True: leave the system audio of that block out (the page is playing a
+        #: recording, see audio/playback.py); whatever loopback audio is queued is thrown away with it
+        self.drop_system: Any = None
+        self.system_dropped_samples = 0
 
     # the recorder only looks at these
     @property
@@ -263,6 +267,16 @@ class MixedCapture:
         finally:
             self.mic.__exit__(*exc)
 
+    def _dropping(self) -> bool:
+        cb = self.drop_system
+        if cb is None:
+            return False
+        try:
+            return bool(cb(self.mic.last_block_wall or time.time()))
+        except Exception as e:  # noqa: BLE001 - a broken guard must not stop the recording
+            log.debug("drop_system failed: %s", e)
+            return False
+
     def read(self, timeout: float = 1.0) -> np.ndarray | None:
         block = self.mic.read(timeout)
         if block is None or self.system is None:
@@ -270,6 +284,11 @@ class MixedCapture:
             return block
         mic_rms = _rms(block, len(block))
         fresh = self.system.read_available()
+        if self._dropping():
+            self.system_dropped_samples += len(fresh) + len(self._buf)
+            self._buf = np.zeros(0, dtype=np.float32)
+            self.last_channels = (mic_rms, 0.0)
+            return block
         if len(fresh):
             self._buf = np.concatenate([self._buf, fresh]) if len(self._buf) else fresh
         if len(self._buf) > self.max_lead:

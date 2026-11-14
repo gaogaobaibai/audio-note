@@ -19,6 +19,10 @@ with ``last_channels`` = (mic_rms, system_rms). The recorder keeps one entry per
 absolute sample position, for as long as the gate may still put that block into a segment (open
 segment or pre-roll ring), and stores the pairs of the blocks overlapping each emitted segment in
 segments.channel_rms / channel_block_s. Microphone-only capture leaves them NULL.
+
+Self-playback: while the page plays a recording (audio/playback.py), the blocks captured meanwhile are left out
+so the clip is not recorded again: audio.playback_guard "all" feeds silence instead of the block (and drops the
+system audio), "system" only drops the system audio. ``paused_for_playback`` tells the page ("all" only).
 """
 from __future__ import annotations
 
@@ -34,6 +38,7 @@ import numpy as np
 from .. import events as events_mod
 from ..config import Config
 from ..db import DB
+from . import playback
 from .capture import MicCapture, open_capture
 from .storage import PartialWriter, finalize_segment, recover_partials, stale_partials
 from .vad import SAMPLE_RATE, WINDOW, GateConfig, SileroVAD, SpeechGate
@@ -80,6 +85,14 @@ class Recorder:
         self.on_segment: Any = None
         # (start sample, n samples, mic_rms, system_rms) per delivered block, oldest first; only while mixing
         self._channels: deque[tuple[int, int, float, float]] = deque()
+        # self-playback guard: the page's reports in this process, and those a read-only page in another process
+        # mirrored to the data directory
+        self.playback_mode = playback.guard_mode(cfg)
+        self.playback: Any = playback.GUARD
+        self.playback_file: Any = playback.FileWindows(playback.file_path(cfg.data_dir))
+        self.paused_for_playback = False
+        self.playback_muted_s = 0.0
+        self._muted: deque[tuple[int, int]] = deque()   # absolute sample ranges the guard silenced, oldest first
 
     # wall-clock time of an absolute sample index
     def _time_of(self, sample: int) -> datetime:
@@ -119,10 +132,13 @@ class Recorder:
                 log.warning("system audio: %s", mic.system_error)
             elif getattr(mic, "system_active", False):
                 log.info("recording microphone + system audio (%s)", getattr(mic, "system_name", "?"))
+            if self.playback_mode != "off" and hasattr(mic, "drop_system"):
+                mic.drop_system = self._playback_covers
             self.stream_t0 = datetime.now()
             self._consumed = 0
             self._delivered = 0
             self._channels.clear()
+            self._muted.clear()
             first_block = True
             last_log = time.time()
             last_recover = time.time()
@@ -137,7 +153,8 @@ class Recorder:
                         self._check_stall(mic)
                         continue
                     self.last_block_at = time.time()
-                    self._note_channels(getattr(mic, "last_channels", None), len(block))
+                    block, pair = self._apply_playback_guard(mic, block)
+                    self._note_channels(pair, len(block))
                     self._delivered += len(block)
                     self._reanchor(getattr(mic, "last_block_wall", 0.0) or self.last_block_at, force=first_block)
                     first_block = False
@@ -149,8 +166,10 @@ class Recorder:
                     self._prune_channels()
                     if time.time() - last_log > 300:
                         last_log = time.time()
-                        log.info("recorder alive: %d segments, %.0fs speech, overflows=%d dropped=%d reanchors=%d",
-                                 self.segments_written, self.speech_total_s, mic.overflows, mic.dropped, self.reanchors)
+                        log.info("recorder alive: %d segments, %.0fs speech, overflows=%d dropped=%d reanchors=%d "
+                                 "left out while the page played audio=%.0fs",
+                                 self.segments_written, self.speech_total_s, mic.overflows, mic.dropped, self.reanchors,
+                                 self.playback_muted_s)
             finally:
                 # never lose the open segment, whatever ended the loop
                 for seg in self.gate.flush():
@@ -159,7 +178,9 @@ class Recorder:
 
     # --- per-window work -------------------------------------------------------
     def _feed_window(self, w: np.ndarray) -> None:
-        p = self.vad.prob(w)
+        p = self.vad.prob(w)   # always: the VAD's state keeps following the stream
+        if self._muted and self._window_muted(self._consumed):
+            p = 0.0            # silenced by the playback guard: silence, whatever the VAD makes of a block edge
         self.last_prob = p
         was_active = self.gate.active
         segs = self.gate.push(w, p)
@@ -176,7 +197,50 @@ class Recorder:
             self._emit(seg)
         if self.gate.active != self.is_speaking:
             self.is_speaking = self.gate.active
-            self.events.publish("recording", on=True, speaking=bool(self.is_speaking))
+            self.events.publish("recording", on=True, speaking=bool(self.is_speaking), paused=bool(self.paused_for_playback))
+
+    # --- self-playback guard ---------------------------------------------------
+    def _playback_covers(self, wall: float) -> bool:
+        """Was the block captured at wall-clock time `wall` playing out of the page? Never raises."""
+        if self.playback_mode == "off":
+            return False
+        try:
+            return bool(self.playback.covers(wall) or self.playback_file.covers(wall))
+        except Exception as e:  # noqa: BLE001 - the guard must never stop the recording
+            log.debug("playback guard failed: %s", e)
+            return False
+
+    def _apply_playback_guard(self, mic: Any, block: np.ndarray) -> tuple[np.ndarray, Any]:
+        """(block to feed, its channel pair). "all": a block captured while the page played audio becomes silence
+        (the capture already dropped its system audio); "system" leaves the microphone alone."""
+        pair = getattr(mic, "last_channels", None)
+        if self.playback_mode != "all":
+            return block, pair
+        muted = self._playback_covers(getattr(mic, "last_block_wall", 0.0) or self.last_block_at)
+        if muted != self.paused_for_playback:
+            self.paused_for_playback = muted
+            log.debug("page %s playing audio: recording %s", "started" if muted else "stopped", "paused" if muted else "resumed")
+            try:
+                self.events.publish("recording", on=True, speaking=bool(self.is_speaking), paused=muted)
+            except Exception as e:  # noqa: BLE001
+                log.debug("recording event not published: %s", e)
+        if not muted:
+            return block, pair
+        self.playback_muted_s += len(block) / SAMPLE_RATE
+        # absolute samples [delivered, delivered + n) are muted: their VAD windows count as silence (see _feed_window)
+        a, b = self._delivered, self._delivered + len(block)
+        if self._muted and self._muted[-1][1] == a:
+            self._muted[-1] = (self._muted[-1][0], b)
+        else:
+            self._muted.append((a, b))
+        return np.zeros_like(block), ((0.0, 0.0) if pair is not None else None)
+
+    def _window_muted(self, start: int) -> bool:
+        """Does the VAD window starting at absolute sample `start` overlap a muted block? Forgets older ranges."""
+        m = self._muted
+        while m and m[0][1] <= start:
+            m.popleft()
+        return bool(m) and m[0][0] < start + WINDOW
 
     # --- channel levels (mic + system audio) -----------------------------------
     def _note_channels(self, pair: Any, n: int) -> None:

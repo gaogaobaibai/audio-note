@@ -201,7 +201,8 @@ def test_events_once_sends_hello_with_a_status_snapshot_and_ends(app: FastAPI, r
     assert hello["type"] == "hello" and hello["seq"] == 1 and hello["inbox"] == {"open": 1} and hello["gap"] is False and hello["replay"] == 0
     st = hello["status"]
     assert st["version"] == audio_note.__version__ and st["schema_version"] == 2 and st["pending"] == 1 and st["failed"] == 0 and st["inbox_open"] == 1
-    assert st["service"] == {"running": False, "read_only": False, "scheduler": False, "recording": False, "is_speaking": False}
+    assert st["service"] == {"running": False, "read_only": False, "scheduler": False, "recording": False, "is_speaking": False,
+                            "paused_for_playback": False}
     assert st["jobs_running"] == [] and st["deferred"] is None and st["api_key"] is False
     assert rt.events.subscribers == 0                                      # the subscription was released
 

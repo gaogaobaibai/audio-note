@@ -50,6 +50,8 @@ function recView(st) {
   if (!st || store.get("online") === false) return { cls: store.get("online") === false ? "off" : "", text: store.get("online") === false ? "连接断开" : "连接中…", time: "", toggle: null };
   const s = st.service || {};
   if (s.read_only) return { cls: "ro", text: "只读", time: "", toggle: null, lock: true };
+  // the page is playing a recording: the recorder leaves it out (audio.playback_guard), say so instead of "录音中"
+  if (s.recording && s.paused_for_playback) return { cls: "on paused", text: "播放中·暂停录", time: elapsed(st), toggle: "stop" };
   if (s.recording) return { cls: s.is_speaking ? "on speaking" : "on", text: s.is_speaking ? "有人说话" : "录音中", time: elapsed(st), toggle: "stop" };
   return { cls: "", text: "未录音", time: "", toggle: "start" };
 }
@@ -108,7 +110,7 @@ function recDetails(anchor) {
     const s = st.service || {};
     const rows = [];
     if (s.read_only) rows.push(notice({ kind: "info", compact: true, body: `服务正在另一个进程运行（pid ${s.other_pid}）。这里可以看记录和问答；录音和处理请在那个进程的界面操作。` }));
-    else if (s.recording) rows.push(html`<div class="pop-line"><strong>${s.is_speaking ? "正在录音 · 有人说话" : "正在录音 · 安静"}</strong></div>
+    else if (s.recording) rows.push(html`<div class="pop-line"><strong>${s.paused_for_playback ? "暂停中 · 正在播放录音" : s.is_speaking ? "正在录音 · 有人说话" : "正在录音 · 安静"}</strong></div>
       <div class="pop-line t2">${fmtTime(s.recorder_started_at)} 开始 · 已保存 ${s.segments_written} 段，${fmtMin((s.speech_total_s || 0) / 60)}语音</div>`);
     else rows.push(html`<div class="pop-line"><strong>没有在录音</strong></div><div class="pop-line t2">开始后只保存有人说话的片段，每 ${st.process_interval_min} 分钟自动转写一次。</div>`);
     if (s.last_error && !s.recording) rows.push(notice({ kind: "danger", compact: true, body: `录音线程出错：${s.last_error}` }));

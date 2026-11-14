@@ -56,6 +56,9 @@ DEFAULTS: dict[str, Any] = {
         "system_audio": False,         # also capture what the speakers / headphones play (meetings, calls): WASAPI loopback
         "system_device": None,         # None = default output device; or an output device index / name substring
         "system_gain": 1.0,            # level of the system audio in the mix
+        # while the page plays a recording, leave it out of the new recording: all = microphone + system audio,
+        # system = only the system audio (headphones: you can keep talking), off (audio/playback.py)
+        "playback_guard": "all",
         "min_speech_dbfs": -40.0,      # speech turns quieter than this (dBFS) are far / unclear: not transcribed, not enrolled; null = off
     },
     "storage": {

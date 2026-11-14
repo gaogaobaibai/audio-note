@@ -32,6 +32,8 @@ export const SECTIONS = [
       { path: "audio.system_audio", type: "bool", label: "同时录系统声音", help: "把扬声器 / 耳机里放出来的声音（会议、通话的对方）和麦克风一起录。用耳机效果最好，外放时对方的声音会被录两次。" },
       { path: "audio.system_device", type: "select", dyn: "sysDevices", label: "录哪个输出设备" },
       { path: "audio.system_gain", type: "number", label: "系统声音音量倍数", help: "对方声音太小就调大。", min: 0.05, max: 50, step: 0.1 },
+      { path: "audio.playback_guard", type: "select", label: "在这里听录音时", options: [["all", "暂停录音（推荐）"], ["system", "只不录系统声音（戴耳机时）"], ["off", "照常录"]],
+        help: "在网页里播放以前的录音（核对说话人、打标记）时，不把放出来的声音当成新的对话再录一遍。外放时麦克风也会听到，所以默认整段暂停；戴耳机想边听边说可以选第二项。" },
       { path: "audio.vad_threshold", type: "number", label: "语音检测阈值", help: "0–1，越高越保守（环境嘈杂时调高）。", min: 0, max: 1, step: 0.05, advanced: true },
       { path: "audio.min_silence_s", type: "number", label: "结束片段的静音秒数", min: 0.2, max: 60, step: 0.1, advanced: true },
       { path: "audio.max_segment_s", type: "number", label: "单个片段最长秒数", min: 10, max: 3600, step: 10, advanced: true },

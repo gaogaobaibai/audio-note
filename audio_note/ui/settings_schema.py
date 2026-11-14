@@ -25,7 +25,7 @@ EDITABLE: dict[str, set[str]] = {
     "mimo": {"api_key", "base_url", "chat_model", "analysis_model", "asr_model", "asr_language", "asr_concurrency",
              "listen_model", "asr_prompt", "asr_prompt_max_terms"},
     "audio": {"device", "vad_threshold", "min_silence_s", "min_speech_s", "max_segment_s", "gain", "codec",
-              "system_audio", "system_device", "system_gain", "min_speech_dbfs"},
+              "system_audio", "system_device", "system_gain", "min_speech_dbfs", "playback_guard"},
     "storage": {"cleanup_enabled", "keep_audio_days", "max_disk_gb"},
     "speakers": {"identify_threshold", "cluster_threshold", "unknown_label", "num_threads",
                  "voice_group_threshold", "infer_relations", "relation_min_utterances", "relation_min_confidence",
@@ -51,6 +51,7 @@ SECRET_KEYS = {("mimo", "api_key"), ("push", "feishu", "webhook"), ("push", "fei
 _CHOICES: dict[tuple[str, ...], tuple[str, ...]] = {
     ("mimo", "asr_language"): ("auto", "zh", "en"),
     ("audio", "codec"): ("opus", "flac", "wav"),
+    ("audio", "playback_guard"): ("all", "system", "off"),
     ("memory", "strategy"): ("agentic", "prefetch", "rag"),
     ("memory", "retrieval"): ("fts", "vector", "hybrid"),
     ("memory", "hybrid_keywords"): ("content", "strict", "loose", "off"),
